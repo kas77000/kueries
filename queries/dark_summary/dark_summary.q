@@ -4,58 +4,56 @@
 / One function.  Summarises what we executed in DARK venues on a given day,
 / broken down by venue: shares done and notional converted to USD.
 /
-/   q)\l queries/dark_summary/dark_summary.q
-/   q)h:hopen`:orderserver:5010
-/   q)darkSummary[h;.z.D]        / today
-/   q)darkSummary[h;.z.D-1]      / yesterday
+/ Runs entirely on the ORDER SERVER - it reads workorder and target_stock and
+/ nothing else.  No handle, no qatt.  (The jp_no_print and limit_up_down
+/ scripts take a handle only because they straddle two processes: order tables
+/ on one side, realtime qatt on the other.  This one does not.)
 /
-/ Pass 0i for h if workorder / target_stock are in this same process.
+/   q)\l queries/dark_summary/dark_summary.q
+/   q)darkSummary .z.D        / today
+/   q)darkSummary .z.D-1      / yesterday
+/
+/ If you ever want it from another process, send it over as usual:
+/   q)h(darkSummary;.z.D)
 /
 / Columns
 /   venue           workorder`venue
 /   orders          child orders that filled in that venue
 /   syms            distinct stocks traded there
 /   shares          sum of workorder`make
-/   notional_usd    sum of make * avg_fill_price * fxlast
-/   pct_notional    share of the day's total dark notional
-/   missing_fx      fills with no fxlast - temporary, see note 3
+/   notional_usd    sum of make * avg_fill_price * fxlast, unrounded
+/   pct_notional    share of the day's total dark notional, rounded to 2dp
 /
 / A venue is DARK when its name contains DARK or DRK.  Every child order
 / executed in the dark carries that in the venue name, so the match is the
 / classification.
 / =============================================================================
 
-darkSummary:{[h;dt]
+darkSummary:{[dt]
   / venue name patterns that mean dark.  Matched case insensitively.
   dk:("*DARK*";"*DRK*");
-  / --- on the order server: dark fills for the day, plus the fx rate.
-  / fxlast lives in target_stock, not workorder, so it has to be joined on
-  / per parent order.
-  f:{[d;dk]
-    w:select date,id_server,id_target,sym,venue,make,avg_fill_price
-      from workorder
-      where date=d, make>0, any (upper venue) like/: dk;
-    if[0=count w; :w];
-    ids:exec distinct id_target from w;
-    / one row per target, so no aggregation needed
-    x:`date`id_server`id_target xkey select date,id_server,id_target,
-        fxlast,currency
-      from target_stock where date=d, id_target in ids;
-    w lj x
-    };
-  r:$[0<h; h(f;dt;dk); f[dt;dk]];
-  if[0=count r; :r];
+  / dark fills for the day
+  w:select date,id_server,id_target,sym,venue,make,avg_fill_price
+    from workorder
+    where date=dt, make>0, any (upper venue) like/: dk;
+  if[0=count w; :w];
+  / fxlast lives in target_stock, not workorder, so join it on per parent
+  / order.  One row per target, so no aggregation needed.
+  ids:exec distinct id_target from w;
+  x:`date`id_server`id_target xkey select date,id_server,id_target,
+      fxlast,currency
+    from target_stock where date=dt, id_target in ids;
   / executed notional in local ccy, then in USD.  fxlast is local -> USD.
-  r:update notional_usd:make*avg_fill_price*fxlast from r;
+  r:update notional_usd:make*avg_fill_price*fxlast from w lj x;
   s:0!select
       orders:count i,
       syms:count distinct sym,
       shares:sum make,
-      notional_usd:sum notional_usd,
-      missing_fx:sum null fxlast    / temporary - see note 3, delete this line
+      notional_usd:sum notional_usd
     by venue from r;
-  `notional_usd xdesc update pct_notional:100*notional_usd%sum notional_usd
-    from s
+  / notional stays as it is; only the percentage is rounded, to 2dp
+  s:update pct_notional:100*notional_usd%sum notional_usd from s;
+  `notional_usd xdesc update pct_notional:0.01*"j"$100*pct_notional from s
  };
 
 / -----------------------------------------------------------------------------
@@ -73,18 +71,14 @@ darkSummary:{[h;dt]
 /
 / 3. FX.  fxlast is local -> USD, so notional_usd multiplies by it.
 /
-/    missing_fx is in the output on purpose while you confirm fxlast really is
-/    always populated.  It matters because q's sum treats null as zero: a fill
-/    with no rate would add shares but no notional, so the venue would quietly
-/    under-report rather than error.  missing_fx makes that visible instead.
+/ 4. ROUNDING.  Only pct_notional is rounded, to 2dp, and only at the end.
+/    "j"$ rounds to nearest, it does not truncate.  notional_usd is left at
+/    full precision so nothing downstream inherits a rounded figure.
 /
-/    Once it has read 0 for long enough to trust, delete the marked line in the
-/    select and the column disappears - nothing else depends on it.
-/
-/ 4. Only rows with make>0 are counted, so orders is child orders that actually
+/ 5. Only rows with make>0 are counted, so orders is child orders that actually
 /    filled, not child orders sent.  Drop the make>0 constraint if you want
 /    fill rates rather than an execution summary.
 /
-/ 5. pct_notional is each venue's share of the DARK total only, not of all
+/ 6. pct_notional is each venue's share of the DARK total only, not of all
 /    trading that day - this function never looks at lit venues.
 / -----------------------------------------------------------------------------
