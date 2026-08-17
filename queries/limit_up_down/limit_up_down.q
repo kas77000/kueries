@@ -19,7 +19,9 @@
 /   q)h:hopen`:orderserver:5010
 /   q)limitUpDown[h;20]
 /
-/ Pass 0i for h if target / target_state are in this same process.
+/ target, target_state and target_stock must be reachable.  If they are NOT in
+/ the process you are connected to, h has to be an open handle to the order
+/ server - otherwise you will get 'target.  Pass 0i only if they are local.
 / Narrow to a market with the country / region columns in the result, e.g.
 /   q)select from limitUpDown[h;20] where country=`JP
 /   q)select from limitUpDown[h;20] where sym like "*.JP"
@@ -53,7 +55,9 @@ limitUpDown:{[h;mins]
       from target_stock where date=d, id_target in ids;
     select from ((t lj s) lj x) where not null state
     };
-  o:$[null h; f[d;nl]; h(f;d;nl)];
+  / 0<h so that 0i, 0Ni and a real handle all behave.  `null h` alone would
+  / send 0i down the IPC branch, and handle 0 is the current process.
+  o:$[0<h; h(f;d;nl); f[d;nl]];
   if[0=count o; :o];
   / reference price: adjusted close, falling back to the unadjusted one
   o:update ref:orgclose^adjclose from o;

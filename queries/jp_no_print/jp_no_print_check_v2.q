@@ -9,7 +9,10 @@
 /   q)h:hopen`:orderserver:5010
 /   q)jpNoPrint h
 /
-/ If target / target_state happen to be in this same process, pass 0i.
+/ target and target_state must be reachable.  If they are NOT in the process
+/ you are connected to, h has to be an open handle to the order server - the
+/ query cannot see them otherwise, and you will get 'target.
+/ If they ARE in this same process, pass 0i.
 / =============================================================================
 
 jpNoPrint:{[h]
@@ -26,7 +29,9 @@ jpNoPrint:{[h]
     s:`date`id_server`id_target xkey select from (0!s) where state=`activated;
     select from (t lj s) where not null state
     };
-  o:$[null h; f d; h(f;d)];
+  / 0<h so that 0i, 0Ni and a real handle all behave.  `null h` alone would
+  / send 0i down the IPC branch, and handle 0 is the current process.
+  o:$[0<h; h(f;d); f d];
   / --- locally: drop anything the tick feed has already seen
   syms:exec distinct sym from o;
   seen:exec distinct sym from qatt where sym in syms;
