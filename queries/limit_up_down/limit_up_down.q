@@ -27,9 +27,11 @@
 /   q)select from limitUpDown[h;20] where sym like "*.JP"
 / =============================================================================
 
-limitUpDown:{[h;mins]
+/ lookback is in minutes.  NOT named mins - that is the q keyword for running
+/ minimums, and using it as a parameter gives a type error.
+limitUpDown:{[h;lookback]
   now:.z.T;
-  t0:now-60000*mins;
+  t0:now-60000*lookback;
   d:.z.D;
   / Markets with NO daily price limit - a one sided or locked quote there is a
   / thin book, a stale quote, a halt or an auction imbalance, never a limit.
@@ -139,7 +141,7 @@ limitUpDown:{[h;mins]
 /
 / 5. forMins is how long the stock has been in limit state - measured from its
 /    last normal two sided quote, or from its first quote of the day if it has
-/    never been normal today.  Everything returned has forMins > mins.
+/    never been normal today.  Everything returned has forMins > lookback.
 /
 / 6. lastNormal null means the stock has been one sided or locked since its
 /    very first quote.  That will also pick up names one sided right through a
