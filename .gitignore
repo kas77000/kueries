@@ -1,9 +1,6 @@
 # Internal / not for publication: kdb table schemas and reference data
 no_git/
 
-# Source screenshots
-kdb-tables-pics/
-
 # q artefacts
 *.log
 *.qdb
