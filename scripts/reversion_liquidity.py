@@ -13,13 +13,14 @@ data, for DARK executions only.
   Table 3.3  Venue tiering / ranking on 1s reversion and quote stability
              venue, Reversion, Stability, Score, Tier
 
-Talks to TWO kdb processes over PyKX:
+Talks to TWO kdb processes over PyKX.  Both are HISTORICAL, not the realtime
+ones, and their host:port are fixed - so they are constants below rather than
+arguments.  Set them once, before first use.
 
-  --order-server   workorder, execution, target_stock   (historical)
-  --qatt-server    qatt                                 (historical)
+  ORDER_SERVER   workorder, execution, target_stock
+  QATT_SERVER    qatt
 
   python scripts/reversion_liquidity.py \
-      --order-server orderhist:5010 --qatt-server qatthist:5011 \
       --start 2026-04-01 --end 2026-06-30 --country AU
 
 PyKX runs in unlicensed mode - SyncQConnection against a remote process needs
@@ -56,6 +57,24 @@ from itertools import combinations
 
 import numpy as np
 import pandas as pd
+
+# -----------------------------------------------------------------------------
+# CONNECTIONS.  Edit these.  Both are the HISTORICAL processes, not the
+# realtime ones - qatt in particular exists in both flavours and only the
+# historical one carries a date column.
+#
+# USER / PASSWORD stay None for an open process; set them if the servers want
+# credentials.  Do not commit a real password - if these servers ever need one,
+# read it from the environment here instead.
+# -----------------------------------------------------------------------------
+
+ORDER_SERVER = "CHANGEME:5010"
+QATT_SERVER = "CHANGEME:5011"
+USER = None
+PASSWORD = None
+
+_PLACEHOLDER = "CHANGEME"
+
 
 # -----------------------------------------------------------------------------
 # q sources.  Sent as text + typed args; see module docstring.
@@ -201,6 +220,11 @@ def parse_hostport(s):
 def connect(hostport, user=None, password=None):
     """Open a PyKX connection.  pykx is imported here, not at module level, so
     the pure-python half of this file stays importable without it."""
+    if hostport.startswith(_PLACEHOLDER):
+        raise SystemExit(
+            f"{hostport!r} is still the placeholder.  Set ORDER_SERVER and "
+            f"QATT_SERVER near the top of {__file__}."
+        )
     try:
         import pykx
     except ImportError:
@@ -602,8 +626,8 @@ def daterange(d0, d1):
 
 
 def run(args):
-    ho = connect(args.order_server, args.user, args.password)
-    hq = connect(args.qatt_server, args.user, args.password)
+    ho = connect(ORDER_SERVER, USER, PASSWORD)
+    hq = connect(QATT_SERVER, USER, PASSWORD)
     country = args.country or ""
 
     fill_acc, child_acc, kept = None, None, []
@@ -662,10 +686,6 @@ def main(argv=None):
         description="Dark venue liquidity and reversion tiering",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--order-server", help="host:port for workorder/execution/target_stock")
-    p.add_argument("--qatt-server", help="host:port for historical qatt")
-    p.add_argument("--user")
-    p.add_argument("--password")
     p.add_argument("--start", type=dt.date.fromisoformat)
     p.add_argument("--end", type=dt.date.fromisoformat)
     p.add_argument("--country", default="", help="target_stock country, e.g. AU; blank for all")
@@ -684,8 +704,7 @@ def main(argv=None):
 
     if args.self_test:
         return self_test()
-    missing = [n for n in ("order_server", "qatt_server", "start", "end")
-               if getattr(args, n) is None]
+    missing = [n for n in ("start", "end") if getattr(args, n) is None]
     if missing:
         p.error("required unless --self-test: " + ", ".join("--" + m.replace("_", "-")
                                                             for m in missing))
@@ -849,6 +868,24 @@ def test_min_fills_only_affects_tiering():
     tier = build_tiering(acc, min_fills=50, tiers="auto")
     assert "SMALL" in liq.index, "3.1 must keep every venue"
     assert "SMALL" not in tier.index, "3.3 must drop the thin venue"
+
+
+def test_server_constants():
+    """Once edited, the two connection constants must parse as host:port.
+
+    Worth a test because this script is written on a machine with no kdb and
+    run on one that has it: a typo here would otherwise surface as a connection
+    failure on the far side, long after the edit.  Still holding the
+    placeholder is fine and is not a failure - connect() catches that with its
+    own message."""
+    for name, val in (("ORDER_SERVER", ORDER_SERVER), ("QATT_SERVER", QATT_SERVER)):
+        if val.startswith(_PLACEHOLDER):
+            print(f"        ({name} not set yet)")
+            continue
+        try:
+            parse_hostport(val)
+        except ValueError as exc:
+            raise AssertionError(f"{name}={val!r}: {exc}")
 
 
 def test_parse_hostport():

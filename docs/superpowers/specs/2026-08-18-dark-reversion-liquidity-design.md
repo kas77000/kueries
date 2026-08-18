@@ -82,10 +82,18 @@ server. Only `pykx`, `pandas` and `numpy` are required.
 
 ```
 python scripts/reversion_liquidity.py \
-    --order-server host:port --qatt-server host:port \
     --start 2026-04-01 --end 2026-06-30 --country AU \
     [--min-fills 1000] [--tiers auto] [--out-dir DIR] [--half-spread]
 ```
+
+The two host:port pairs are fixed for the life of the script, so they are
+`ORDER_SERVER` and `QATT_SERVER` constants at the top of the file rather than
+arguments - along with `USER` and `PASSWORD`, which stay `None` for an open
+process. They ship holding a `CHANGEME` placeholder that `connect` refuses,
+naming the file to edit, so an unset constant fails immediately and legibly
+instead of timing out. `--self-test` additionally checks that an edited
+constant still parses as host:port, since a typo would otherwise only surface
+as a connection failure on the machine that actually runs this.
 
 `--country` matches `target_stock`.`country`; omit it for all countries.
 Both tables are printed; `--out-dir` also writes `liquidity.csv` and
@@ -256,7 +264,8 @@ against what already exists:
 
 ## Deliberately not in scope
 
-- Table 3.2, which is not in the supplied images.
+- Table 3.2, the distribution of executed size%adv. Confirmed unrelated to
+  these two tables and out of scope.
 - The Vocabulary section benchmark definitions, which are referenced by the
   report but not supplied. Where a definition was ambiguous the choice is
   recorded above and flagged in the script notes.
