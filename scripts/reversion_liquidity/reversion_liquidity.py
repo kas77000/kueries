@@ -83,9 +83,10 @@ _PLACEHOLDER = "CHANGEME"
 # Dark fills for one date.  Returns one row per fill, carrying the venue from
 # the child order and adv/fxlast from the stock.
 #
-# ctry is a CHAR VECTOR, not a symbol - "AU", or "" for every country.  Passing
-# it as chars and casting with `$ on this side avoids depending on how PyKX
-# converts a Python str, which differs between licensed and unlicensed mode.
+# ctry is a CHAR VECTOR, not a symbol - "AU", or "" for every country - and is
+# sent as BYTES from python for that reason.  PyKX turns a python str into a q
+# SYMBOL, and `$ on a symbol is a 'type error, so passing args.country straight
+# through fails on every date.  See run().
 #
 # workorder is reduced to one row per id_work with `last` before anything is
 # joined to it.  If workorder already holds exactly one row per child order
@@ -628,7 +629,10 @@ def daterange(d0, d1):
 def run(args):
     ho = connect(ORDER_SERVER, USER, PASSWORD)
     hq = connect(QATT_SERVER, USER, PASSWORD)
-    country = args.country or ""
+    # BYTES, not str: PyKX sends a python str as a q symbol, and the q casts
+    # with `$, which is a 'type error on a symbol.  b"" is an empty char
+    # vector, so `0=count ctry` still selects every country.
+    country = (args.country or "").encode()
 
     fill_acc, child_acc, kept = None, None, []
     for day in daterange(args.start, args.end):
@@ -896,6 +900,37 @@ def test_parse_hostport():
         except ValueError:
             continue
         raise AssertionError(f"{bad!r} should not parse")
+
+
+def test_country_reaches_q_as_chars():
+    """The country filter must arrive as a char vector, never a str.
+
+    PyKX sends a python str as a q SYMBOL, and the q casts it with `$, which is
+    a 'type error on a symbol - so a str here fails on every single date rather
+    than on the first thing anyone would look at.  Worth pinning: it is
+    invisible without a server, and it is what run() spent a release getting
+    wrong."""
+    sent = []
+
+    class Result:                      # what _to_pandas expects back
+        def pd(self):
+            return pd.DataFrame()
+
+    class Handle:
+        def __call__(self, qsql, *args):
+            sent.append(args)
+            return Result()
+
+    fetch_day(Handle(), Handle(), dt.date(2026, 4, 1), "AU".encode())
+    assert sent, "fetch_day sent nothing"
+    for args in sent:
+        ctry = args[1]
+        assert isinstance(ctry, bytes), (
+            f"country reached q as {type(ctry).__name__}, which PyKX converts "
+            f"to a symbol; send bytes so it arrives as chars")
+    # and the every-country case has to stay an EMPTY char vector, so the
+    # `0=count ctry` branch in the q still fires
+    assert b"" == "".encode()
 
 
 def self_test():
