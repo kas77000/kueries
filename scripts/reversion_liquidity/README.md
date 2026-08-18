@@ -1,19 +1,10 @@
-# scripts
-
-Python analytics that need more than a q session — clustering, z-scores,
-anything where the answer is a statistic rather than a query result. They reach
-kdb through PyKX rather than being run inside a q process.
-
-| Script | Produces | Reads |
-| --- | --- | --- |
-| `reversion_liquidity.py` | Bernstein report tables 3.1 and 3.3, dark venues | order server + qatt, both historical |
-
----
-
-# reversion_liquidity.py
+# reversion_liquidity
 
 Reproduces two tables from the Bernstein dark pool report against our own data,
-for **dark executions only**:
+for **dark executions only**. Reads the order server and `qatt`, both
+historical, through PyKX — it is a Python script rather than a `.q` because the
+answers are statistics (pooled z-scores, k-means tiers) rather than query
+results.
 
 - **Table 3.1 Liquidity** — per venue: `%Notional`, `Spread`, `Adv`,
   `Fill%adv`, `Fill Rate`, `Duration`
@@ -33,7 +24,7 @@ both flavours and only the historical one carries a `date` column. Then:
 
 ```
 pip install pykx
-python scripts/reversion_liquidity.py --start 2026-04-01 --end 2026-06-30 --country AU
+python scripts/reversion_liquidity/reversion_liquidity.py --start 2026-04-01 --end 2026-06-30 --country AU
 ```
 
 `pykx` unlicensed mode is enough. All q evaluation happens server-side, so no q
@@ -278,7 +269,7 @@ Reversion.
 ## Verifying it
 
 ```
-python scripts/reversion_liquidity.py --self-test
+python scripts/reversion_liquidity/reversion_liquidity.py --self-test
 ```
 
 Everything except the three q constants is pure Python and covered offline —
@@ -320,4 +311,4 @@ whole quarter.
 
 Design rationale, and why each ambiguous definition was resolved the way it
 was, is in
-[`docs/superpowers/specs/2026-08-18-dark-reversion-liquidity-design.md`](../docs/superpowers/specs/2026-08-18-dark-reversion-liquidity-design.md).
+[`docs/superpowers/specs/2026-08-18-dark-reversion-liquidity-design.md`](../../docs/superpowers/specs/2026-08-18-dark-reversion-liquidity-design.md).

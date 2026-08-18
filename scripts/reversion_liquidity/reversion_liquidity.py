@@ -20,14 +20,14 @@ arguments.  Set them once, before first use.
   ORDER_SERVER   workorder, execution, target_stock
   QATT_SERVER    qatt
 
-  python scripts/reversion_liquidity.py \
+  python scripts/reversion_liquidity/reversion_liquidity.py \
       --start 2026-04-01 --end 2026-06-30 --country AU
 
 PyKX runs in unlicensed mode - SyncQConnection against a remote process needs
 no q licence and no QHOME, because all q evaluation happens on the server.
 pykx is imported lazily inside connect(), so --self-test runs anywhere.
 
-  python scripts/reversion_liquidity.py --self-test
+  python scripts/reversion_liquidity/reversion_liquidity.py --self-test
 
 HOW THE WORK IS SPLIT
 

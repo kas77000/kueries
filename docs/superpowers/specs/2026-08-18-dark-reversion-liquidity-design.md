@@ -10,7 +10,7 @@ Reproduce two tables from the Bernstein Electronic Trading dark pool report
 
 Deliverable: one Python script driving two kdb connections through PyKX.
 
-- `scripts/reversion_liquidity.py`
+- `scripts/reversion_liquidity/reversion_liquidity.py`
 
 The q lambdas live as commented module level string constants inside that file.
 PyKX sends them as source text plus **typed arguments** - dates and symbols stay
@@ -81,7 +81,7 @@ server. Only `pykx`, `pandas` and `numpy` are required.
 ### CLI
 
 ```
-python scripts/reversion_liquidity.py \
+python scripts/reversion_liquidity/reversion_liquidity.py \
     --start 2026-04-01 --end 2026-06-30 --country AU \
     [--min-fills 1000] [--tiers auto] [--out-dir DIR] [--half-spread]
 ```
