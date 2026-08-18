@@ -1,0 +1,210 @@
+{
+  "kind": "kdbmonitor-export",
+  "version": 2,
+  "exported_at": null,
+  "connections": [],
+  "alerts": [],
+  "dashboards": [
+    {
+      "id": null,
+      "name": "Dark venue execution",
+      "description": "What we executed in dark venues over the chosen period: shares done and notional in USD, broken down by venue, with each venue's share of the dark total. Reads the same in real time and over a date range. Shares of the DARK book only - nothing here looks at a lit venue. Source of truth is dark_summary_kmonitor.q; regenerate this file with build_dashboard.py rather than editing it.",
+      "group": "Execution quality",
+      "refresh_secs": 60,
+      "periods": "both",
+      "orientation": "landscape",
+      "source": "kdb",
+      "time_context": {
+        "mode": "realtime"
+      },
+      "parameters": [],
+      "datasets": [
+        {
+          "name": "dark_by_venue",
+          "env": "OMS",
+          "time_mode": "inherit",
+          "time_context": null,
+          "mode": "raw",
+          "table": "",
+          "filters": [],
+          "raw_qsql": "/ darkSummary, over the chosen period: shares done and notional in USD, by dark\n/ venue, with each venue's share of the dark total.\n{[dk]\n  / --- SOURCING.  Identical in both blocks of this file; change it in both. ---\n  / One definition of the dark-fill pull, parameterised by the dates wanted.\n  / workorder and target_stock both carry a date column on the RDB and on the\n  / HDB, so the same lambda runs on either server - which is what makes the\n  / stitch a matter of choosing dates rather than writing the query twice.\n  mk:{[dts;dk]\n    / make>0 keeps this an EXECUTION report - children sent to a dark venue and\n    / never filled are not here.  See dark_routed_executed.q for that split.\n    w:select date,id_server,id_target,sym,venue,make,avg_fill_price\n      from workorder where date in dts, make>0, any (upper venue) like/: dk;\n    / fxlast lives in target_stock, not workorder, so join it on per parent\n    / order.  One row per target, so no aggregation needed.\n    ids:exec distinct id_target from w;\n    x:`date`id_server`id_target xkey select date,id_server,id_target,fxlast\n      from target_stock where date in dts, id_target in ids;\n    / executed notional in local ccy, then in USD.  fxlast is local -> USD.\n    select date,venue,sym,make,notional_usd:make*avg_fill_price*fxlast\n      from w lj x\n   };\n  r:{{#realtime}}mk[enlist .z.D;dk]{{/realtime}}{{#historical}}{[dk;mk]\n      want:{{date_from}}+til 1+{{date_to}}-{{date_from}};\n      / Has the HDB been written down for today?  Asked of workorder as a\n      / whole, not of dark fills: a day with no dark activity must not read as\n      / a day that is missing.  Costs one column of one partition, and only\n      / when that partition exists at all.\n      hasToday:0<count select date from workorder where date=.z.D;\n      / Today comes off the RDB only when the HDB has not got it.  If it has,\n      / it is already inside the range and stitching would double count.\n      stitch:(.z.D in want) and not hasToday;\n      r:mk[$[stitch; want except .z.D; want]; dk];\n      if[stitch;\n        c:hopen {{conn:OMS:realtime}};\n        t:c(mk;enlist .z.D;dk);\n        hclose c;\n        r:r uj t];\n      r\n     }[dk;mk]{{/historical}};\n  / --- END SOURCING ---\n  s:0!select\n      orders:count i,\n      syms:count distinct sym,\n      shares:sum make,\n      notional_usd:sum notional_usd\n    by venue from r;\n  / notional stays as it is; only the percentage is rounded, to 2dp\n  s:update pct_notional:100*notional_usd%sum notional_usd from s;\n  `notional_usd xdesc update pct_notional:0.01*\"j\"$100*pct_notional from s\n }[(\"*DARK*\";\"*DRK*\")]",
+          "extra_connections": [],
+          "transforms": [],
+          "max_rows": 5000,
+          "static": false,
+          "source": "kdb",
+          "shape": null,
+          "file_label": ""
+        },
+        {
+          "name": "dark_by_day",
+          "env": "OMS",
+          "time_mode": "inherit",
+          "time_context": null,
+          "mode": "raw",
+          "table": "",
+          "filters": [],
+          "raw_qsql": "/ The same rows, aggregated by date instead of by venue.  Everything down to\n/ END SOURCING is word for word the block above - if you change the definition\n/ of a dark fill, or the stitch, change it in both.  Delete this dataset and\n/ the row of widgets that reads it if you only want the venue view; it is a\n/ second pass over the same slice of workorder.\n{[dk]\n  / --- SOURCING.  Identical in both blocks of this file; change it in both. ---\n  mk:{[dts;dk]\n    w:select date,id_server,id_target,sym,venue,make,avg_fill_price\n      from workorder where date in dts, make>0, any (upper venue) like/: dk;\n    ids:exec distinct id_target from w;\n    x:`date`id_server`id_target xkey select date,id_server,id_target,fxlast\n      from target_stock where date in dts, id_target in ids;\n    select date,venue,sym,make,notional_usd:make*avg_fill_price*fxlast\n      from w lj x\n   };\n  r:{{#realtime}}mk[enlist .z.D;dk]{{/realtime}}{{#historical}}{[dk;mk]\n      want:{{date_from}}+til 1+{{date_to}}-{{date_from}};\n      hasToday:0<count select date from workorder where date=.z.D;\n      stitch:(.z.D in want) and not hasToday;\n      r:mk[$[stitch; want except .z.D; want]; dk];\n      if[stitch;\n        c:hopen {{conn:OMS:realtime}};\n        t:c(mk;enlist .z.D;dk);\n        hclose c;\n        r:r uj t];\n      r\n     }[dk;mk]{{/historical}};\n  / --- END SOURCING ---\n  `date xasc 0!select\n      venues:count distinct venue,\n      orders:count i,\n      syms:count distinct sym,\n      shares:sum make,\n      notional_usd:sum notional_usd\n    by date from r\n }[(\"*DARK*\";\"*DRK*\")]",
+          "extra_connections": [],
+          "transforms": [],
+          "max_rows": 5000,
+          "static": false,
+          "source": "kdb",
+          "shape": null,
+          "file_label": ""
+        }
+      ],
+      "rows": [
+        {
+          "widgets": [
+            {
+              "type": "kpi",
+              "dataset": "dark_by_venue",
+              "title": "Dark notional (USD)",
+              "spec": {
+                "column": "notional_usd",
+                "agg": "sum",
+                "fmt": ",.0f"
+              },
+              "width": 1.0
+            },
+            {
+              "type": "kpi",
+              "dataset": "dark_by_venue",
+              "title": "Shares executed",
+              "spec": {
+                "column": "shares",
+                "agg": "sum",
+                "fmt": ",.0f"
+              },
+              "width": 1.0
+            },
+            {
+              "type": "kpi",
+              "dataset": "dark_by_venue",
+              "title": "Venues used",
+              "spec": {
+                "column": "venue",
+                "agg": "count",
+                "fmt": ",.0f"
+              },
+              "width": 1.0
+            },
+            {
+              "type": "kpi",
+              "dataset": "dark_by_venue",
+              "title": "Largest venue share",
+              "spec": {
+                "column": "pct_notional",
+                "agg": "max",
+                "fmt": ".2f",
+                "suffix": "%"
+              },
+              "width": 1.0
+            }
+          ],
+          "height_in": 0.9,
+          "gap_above_in": 0.0,
+          "col_gap_in": 0.1
+        },
+        {
+          "widgets": [
+            {
+              "type": "pie",
+              "dataset": "dark_by_venue",
+              "title": "Where the dark notional went",
+              "spec": {
+                "by": "venue",
+                "value": "notional_usd",
+                "donut": true
+              },
+              "width": 1.0
+            },
+            {
+              "type": "table",
+              "dataset": "dark_by_venue",
+              "title": "By venue",
+              "spec": {
+                "columns": [
+                  "venue",
+                  "orders",
+                  "syms",
+                  "shares",
+                  "notional_usd",
+                  "pct_notional"
+                ],
+                "labels": {
+                  "venue": "Venue",
+                  "orders": "Fills",
+                  "syms": "Stocks",
+                  "shares": "Shares",
+                  "notional_usd": "Notional (USD)",
+                  "pct_notional": "Share"
+                },
+                "formats": {
+                  "shares": ",.0f",
+                  "orders": ",.0f",
+                  "syms": ",.0f",
+                  "notional_usd": ",.0f",
+                  "pct_notional": ".2f"
+                }
+              },
+              "width": 1.5
+            }
+          ],
+          "height_in": 3.6,
+          "gap_above_in": 0.15,
+          "col_gap_in": 0.15
+        },
+        {
+          "widgets": [
+            {
+              "type": "bar",
+              "dataset": "dark_by_day",
+              "title": "Dark notional per day (USD)",
+              "spec": {
+                "x": "date",
+                "y": "notional_usd"
+              },
+              "width": 1.5
+            },
+            {
+              "type": "table",
+              "dataset": "dark_by_day",
+              "title": "By day",
+              "spec": {
+                "columns": [
+                  "date",
+                  "venues",
+                  "orders",
+                  "syms",
+                  "shares",
+                  "notional_usd"
+                ],
+                "labels": {
+                  "date": "Date",
+                  "venues": "Venues",
+                  "orders": "Fills",
+                  "syms": "Stocks",
+                  "shares": "Shares",
+                  "notional_usd": "Notional (USD)"
+                },
+                "formats": {
+                  "venues": ",.0f",
+                  "orders": ",.0f",
+                  "syms": ",.0f",
+                  "shares": ",.0f",
+                  "notional_usd": ",.0f"
+                }
+              },
+              "width": 1.0
+            }
+          ],
+          "height_in": 3.0,
+          "gap_above_in": 0.15,
+          "col_gap_in": 0.15
+        }
+      ]
+    }
+  ]
+}
