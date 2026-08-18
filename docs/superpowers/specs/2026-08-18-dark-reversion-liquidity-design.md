@@ -61,7 +61,7 @@ hq -> QATT SERVER (historical)
       aj against qatt twice: at the fill, and at fill + 1s
       returns: qbid0, qask0, mid0, qbid1, qask1, mid1 per fill
 
-local combines the two, rolls up by venue, writes two CSVs
+local combines the two, rolls up by venue, returns the tables
 ```
 
 Both hops send serialized lambdas over the handle, matching
@@ -72,11 +72,19 @@ process.
 Signature:
 
 ```q
-revLiq[ho;hq;d0;d1;country]     / revLiq[ho;hq;2026.04.01;2026.06.30;`AU]
+revLiq[ho;hq;d0;d1;country]        / revLiq[ho;hq;2026.04.01;2026.06.30;`AU]
+revLiqSave[ho;hq;d0;d1;country;dir]  / same, then writes the two CSVs to dir
 ```
 
 country matches `target_stock`.`country`; pass the null symbol for all
 countries.
+
+`revLiq` returns a dictionary of three items rather than writing anything:
+`liquidity` (Table 3.1), `revstats` (the sufficient statistics), and `dropped`
+(the diagnostic counts below). Returning tables keeps it consistent with every
+other function in this repo and usable from a q session without a filesystem.
+`revLiqSave` is a thin wrapper that calls it and saves the two CSVs, so the
+directory is a concern of the wrapper only.
 
 ### Why fills go to the quote server
 
@@ -141,8 +149,17 @@ stable: (qbid1 = qbid0) and (qask1 = qask0)
   move in the second after its fill.
 - Normalization is by the **full** spread. The caption does not specify;
   half-spread is a one character edit on that line.
-- Fills with `qask0 <= qbid0`, a null mid1, or a zero spread are dropped from
-  reversion, and counted in a dropped diagnostic rather than silently lost.
+- **The two metrics have different usable populations, so they are counted
+  separately.** A fill with a null mid1 is unusable for both. A fill with
+  `qask0 <= qbid0` (crossed, locked, or one sided) has no meaningful spread to
+  normalize by, so it is dropped from reversion - but its touches are still
+  comparable a second later, so it is kept for stability. Collapsing both onto a
+  single n would silently misweight one of the two z-scores, so `revstats`
+  carries `n_rev` and `n_stable` as distinct columns.
+- Fills excluded from either metric are counted per venue in the `dropped`
+  table (`venue, no_quote, bad_spread`) rather than silently lost, so a venue
+  whose numbers rest on a small surviving fraction of its fills is visible
+  rather than merely plausible.
 - No winsorizing. Spread normalized reversion has a fat tail when the spread is
   one tick; clipping is documented as a one-liner but is not applied by default.
 
@@ -151,7 +168,7 @@ stable: (qbid1 = qbid0) and (qask1 = qask0)
 kdb returns **sufficient statistics** per venue, not finished z-scores:
 
 ```
-venue, n_fills, sum_rev, sumsq_rev, sum_stable
+venue, n_rev, sum_rev, sumsq_rev, n_stable, sum_stable
 ```
 
 Python reconstructs the pooled mean and standard deviation exactly from these,
@@ -163,20 +180,21 @@ against the quote server.
 Pooled reconstruction:
 
 ```
-mean  = sum(sum_rev) / sum(n_fills)
-var   = sum(sumsq_rev) / sum(n_fills) - mean^2
-z_ven = (sum_rev[v]/n[v] - mean) / sqrt(var)
+mean  = sum(sum_rev) / sum(n_rev)
+var   = sum(sumsq_rev) / sum(n_rev) - mean^2
+z_ven = (sum_rev[v]/n_rev[v] - mean) / sqrt(var)
 ```
 
-and the same for stable, which is a 0/1 variable so sumsq_stable = sum_stable
-and only one column is needed.
+and the same for stable over `n_stable`. stable is a 0/1 variable, so
+`sumsq_stable = sum_stable` identically and no fourth column is needed - the
+pooled variance is `p(1-p)` where `p = sum(sum_stable)/sum(n_stable)`.
 
 ### q outputs
 
 Two CSVs written to a caller supplied directory:
 
 - `liquidity.csv` - the six columns of Table 3.1, per venue, unrounded.
-- `reversion_stats.csv` - venue, n_fills, sum_rev, sumsq_rev, sum_stable.
+- `reversion_stats.csv` - venue, n_rev, sum_rev, sumsq_rev, n_stable, sum_stable.
 
 Rounding happens only in Python, at render time. Nothing downstream inherits a
 rounded figure, matching the convention in `dark_summary.q`.
