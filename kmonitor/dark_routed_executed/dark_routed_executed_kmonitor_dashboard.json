@@ -1,0 +1,230 @@
+{
+  "kind": "kdbmonitor-export",
+  "version": 2,
+  "exported_at": null,
+  "connections": [],
+  "alerts": [],
+  "dashboards": [
+    {
+      "id": null,
+      "name": "Dark routed vs executed",
+      "description": "Where our dark flow was ROUTED against where it actually EXECUTED, by venue, for one country or the whole book. The two pies share a shape but not a denominator - the gap between them is the point, and fill_rate names it. Reads the same in real time and over a date range. Source of truth is dark_routed_executed_kmonitor.q; regenerate this file with build_dashboard.py rather than editing it.",
+      "group": "Execution quality",
+      "refresh_secs": 60,
+      "periods": "both",
+      "orientation": "landscape",
+      "source": "kdb",
+      "time_context": {
+        "mode": "realtime"
+      },
+      "parameters": [
+        {
+          "name": "country",
+          "label": "Country",
+          "kind": "column",
+          "choices": [],
+          "dataset": "dark_routed",
+          "column": "country",
+          "default": "ALL",
+          "q_type": "",
+          "help": "ALL is the whole dark book. Picking a market re-cuts the pies and both tables from rows already in hand \u2014 it does not go back to the server.",
+          "required": false,
+          "pattern": "",
+          "pattern_message": "",
+          "minimum": "",
+          "maximum": "",
+          "integer": false,
+          "weekdays_only": false
+        }
+      ],
+      "datasets": [
+        {
+          "name": "dark_routed",
+          "env": "OMS",
+          "time_mode": "inherit",
+          "time_context": null,
+          "mode": "raw",
+          "table": "",
+          "filters": [],
+          "raw_qsql": "{[dk]\n  / dark children for a list of dates.  Both tables carry date on the RDB and\n  / the HDB, so this one lambda runs on either server.\n  mk:{[dts;dk]\n    / no make>0 filter: the children that never filled are what makes routed\n    / differ from executed\n    w:select date,id_server,id_target,sym,venue,size,price,make,avg_fill_price,\n        transmit_lastprice\n      from workorder where date in dts, any (upper venue) like/: dk;\n    ids:exec distinct id_target from w;\n    x:`date`id_server`id_target xkey select date,id_server,id_target,fxlast\n      from target_stock where date in dts, id_target in ids;\n    r:w lj x;\n    / routed quantity is valued at the price the child was sent with, falling\n    / back to the last trade at transmit time for market and pegged orders\n    r:update px_routed:transmit_lastprice^?[price>0;price;0n] from r;\n    / country is the SYM SUFFIX - 7203.JP is JP, Singapore is SP\n    r:update country:`$last each \".\" vs/: string sym from r;\n    / without this a sym with no suffix returns itself and lands in the picker\n    r:update country:?[sym like \"*.*\";country;`unknown] from r;\n    select date, country, venue, sym, size, make,\n        notional_routed:size*px_routed*fxlast,\n        notional_executed:make*avg_fill_price*fxlast\n      from r\n   };\n  r:{{#realtime}}mk[enlist .z.D;dk]{{/realtime}}{{#historical}}{[dk;mk]\n      want:{{date_from}}+til 1+{{date_to}}-{{date_from}};\n      / has the HDB been written down for today?  asked of workorder as a\n      / whole, so a day with no dark fills does not read as a day that is gone\n      hasToday:0<count select date from workorder where date=.z.D;\n      / today comes off the RDB only when the HDB has not got it - otherwise\n      / the range already covers it and stitching would double count\n      stitch:(.z.D in want) and not hasToday;\n      r:mk[$[stitch; want except .z.D; want]; dk];\n      if[stitch;\n        c:hopen {{conn:OMS:realtime}};\n        t:c(mk;enlist .z.D;dk);\n        hclose c;\n        r:r uj t];\n      r\n     }[dk;mk]{{/historical}};\n  / every fill counted twice, once under its country and once under `ALL, so\n  / one group-by yields both and count distinct sym stays exact for each\n  r:r uj update country:`ALL from r;\n  s:0!select\n      orders_routed:count i,\n      orders_filled:sum make>0,\n      syms:count distinct sym,\n      shares_routed:sum size,\n      shares_executed:sum make,\n      notional_routed:sum notional_routed,\n      notional_executed:sum notional_executed\n    by country,venue from r;\n  / shares are WITHIN a country, so a frame filtered to one market already\n  / adds to 100 and the dashboard has nothing left to work out\n  s:update\n      pct_routed:100*notional_routed%sum notional_routed,\n      pct_executed:100*notional_executed%sum notional_executed\n    by country from s;\n  / null rather than infinite where a venue routed nothing valuable\n  s:update\n      fill_rate:?[0<notional_routed;100*notional_executed%notional_routed;0n]\n    from s;\n  / notionals stay as they are; only the percentages are rounded\n  s:update\n      pct_routed:0.01*\"j\"$100*pct_routed,\n      pct_executed:0.01*\"j\"$100*pct_executed,\n      fill_rate:0.01*\"j\"$100*fill_rate\n    from s;\n  s:`notional_routed xdesc s;\n  / `ALL first, stated rather than left to the alphabet: that ordering is what\n  / makes it the picker's first entry and the value the dashboard opens on\n  (select from s where country=`ALL),select from s where country<>`ALL\n }[(\"*DARK*\";\"*DRK*\")]",
+          "extra_connections": [],
+          "transforms": [
+            {
+              "kind": "filter",
+              "params": {
+                "column": "country",
+                "op": "=",
+                "value": "{{param:country}}"
+              }
+            }
+          ],
+          "max_rows": 5000,
+          "static": false,
+          "source": "kdb",
+          "shape": null,
+          "file_label": ""
+        }
+      ],
+      "rows": [
+        {
+          "widgets": [
+            {
+              "type": "kpi",
+              "dataset": "dark_routed",
+              "title": "Routed (USD)",
+              "spec": {
+                "column": "notional_routed",
+                "agg": "sum",
+                "fmt": ",.0f"
+              },
+              "width": 1.0
+            },
+            {
+              "type": "kpi",
+              "dataset": "dark_routed",
+              "title": "Executed (USD)",
+              "spec": {
+                "column": "notional_executed",
+                "agg": "sum",
+                "fmt": ",.0f"
+              },
+              "width": 1.0
+            },
+            {
+              "type": "kpi",
+              "dataset": "dark_routed",
+              "title": "Venues",
+              "spec": {
+                "column": "venue",
+                "agg": "nunique",
+                "fmt": ",.0f"
+              },
+              "width": 1.0
+            },
+            {
+              "type": "kpi",
+              "dataset": "dark_routed",
+              "title": "Best venue fill rate",
+              "spec": {
+                "column": "fill_rate",
+                "agg": "max",
+                "fmt": ".2f",
+                "suffix": "%"
+              },
+              "width": 1.0
+            }
+          ],
+          "height_in": 0.9,
+          "gap_above_in": 0.0,
+          "col_gap_in": 0.1
+        },
+        {
+          "widgets": [
+            {
+              "type": "pie",
+              "dataset": "dark_routed",
+              "title": "Routed %",
+              "spec": {
+                "by": "venue",
+                "value": "notional_routed",
+                "donut": true
+              },
+              "width": 1.0
+            },
+            {
+              "type": "pie",
+              "dataset": "dark_routed",
+              "title": "Executed %",
+              "spec": {
+                "by": "venue",
+                "value": "notional_executed",
+                "donut": true
+              },
+              "width": 1.0
+            }
+          ],
+          "height_in": 3.4,
+          "gap_above_in": 0.15,
+          "col_gap_in": 0.2
+        },
+        {
+          "widgets": [
+            {
+              "type": "table",
+              "dataset": "dark_routed",
+              "title": "Routed",
+              "spec": {
+                "columns": [
+                  "venue",
+                  "orders_routed",
+                  "syms",
+                  "shares_routed",
+                  "notional_routed",
+                  "pct_routed"
+                ],
+                "labels": {
+                  "venue": "Venue",
+                  "orders_routed": "Orders",
+                  "syms": "Stocks",
+                  "shares_routed": "Shares",
+                  "notional_routed": "Notional (USD)",
+                  "pct_routed": "Share %"
+                },
+                "formats": {
+                  "orders_routed": ",.0f",
+                  "syms": ",.0f",
+                  "shares_routed": ",.0f",
+                  "notional_routed": ",.0f",
+                  "pct_routed": ".2f"
+                }
+              },
+              "width": 1.0
+            },
+            {
+              "type": "table",
+              "dataset": "dark_routed",
+              "title": "Executed",
+              "spec": {
+                "columns": [
+                  "venue",
+                  "orders_filled",
+                  "shares_executed",
+                  "notional_executed",
+                  "pct_executed",
+                  "fill_rate"
+                ],
+                "labels": {
+                  "venue": "Venue",
+                  "orders_filled": "Fills",
+                  "shares_executed": "Shares",
+                  "notional_executed": "Notional (USD)",
+                  "pct_executed": "Share %",
+                  "fill_rate": "Fill rate %"
+                },
+                "formats": {
+                  "orders_filled": ",.0f",
+                  "shares_executed": ",.0f",
+                  "notional_executed": ",.0f",
+                  "pct_executed": ".2f",
+                  "fill_rate": ".2f"
+                },
+                "highlight": [
+                  {
+                    "column": "fill_rate",
+                    "op": "<=",
+                    "value": 0,
+                    "color": "critical"
+                  }
+                ]
+              },
+              "width": 1.0
+            }
+          ],
+          "height_in": 3.2,
+          "gap_above_in": 0.15,
+          "col_gap_in": 0.2
+        }
+      ]
+    }
+  ]
+}

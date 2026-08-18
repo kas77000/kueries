@@ -14,6 +14,7 @@ can be copied wherever KdbMonitor wants it without dragging the others along.
 | --- | --- | --- | --- |
 | `limit_up_down/` | Limit up/down — orders on pinned stocks | `queries/limit_up_down/limit_up_down_v2.q` | OMS + quote server |
 | `dark_summary/` | Dark venue execution | `queries/dark_summary/dark_summary.q` | OMS only |
+| `dark_routed_executed/` | Dark routed vs executed, by country | `queries/dark_summary/dark_routed_executed.q` | OMS only |
 
 Each folder has its own README with the install steps and what its numbers mean.
 
