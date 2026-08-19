@@ -23,9 +23,11 @@ As transcribed from the sheet.
 | **SS-Other Issue** | | | NotOK | | | | | | |
 
 Transcribed as it stands. Four cells are blank or "need to chk" — Taiwan, China
-and India short sells, and Indonesia entirely. **A blank on our sheet is not a
-blank in the market**, so §5.1 establishes the real rules for Taiwan, China and
-India from their regulators. Indonesia is out of scope (§2).
+and India short sells, and Indonesia entirely. **Short sell checks run only on the
+five markets whose rule is confirmed**: Hong Kong, Japan, Korea, Malaysia and
+Thailand. The other three are `RULE_UNKNOWN` by choice, not by omission — §5.1
+records what their rules appear to be and why they are not yet enforced.
+Indonesia is out of scope entirely (§2).
 
 The notes under the table are the anomaly definitions, and each maps to a check
 in §5:
@@ -355,70 +357,62 @@ Two classes, kept apart because the notes mix them:
 | `LULD_CLIENT_LIMIT` | all | split not more aggressive than parent `limit_price` | violation |
 | `LULD_OFFSET` | CN JP | offset in ticks from the unfavourable band | deviation |
 | `SS_HK_ASK` | HK | `price >= qask` at `t_transmit`; a market-order short sell fails by construction | violation |
-| `SS_UPTICK` | JP KR MY **CN** | `price > lastPrice`, or `>=` when `qatt.trdTick` shows the last tick was up. China falls back to the previous close when the stock has not yet traded (§5.1) | violation |
+| `SS_UPTICK` | JP KR MY | `price > lastPrice`, or `>=` when `qatt.trdTick` shows the last tick was up | violation |
 | `SS_TH_LTP1` | TH | `price = lastPrice + ticksize` | deviation; violation if *below* |
 | `SS_KR_CLAMP` | KR | an uptick price exceeding the band must be capped at the band, not sent through | violation |
 | `SS_HK_CHASE` | HK | resting split, ask moved away > `--chase-ticks` for > `--chase-secs`, `count_chaseprice = 0`, no replacement child | violation |
-| `SS_TW_PREVCLOSE` | TW | `price >= previous close`, conditional — see §5.1 | violation |
-| `SS_IN_SQUAREOFF` | IN | a `sellshort` parent offset by a same-day buy in the same sym — India forbids institutional intraday square-off. **India has no price rule at all** (§5.1) | violation |
-| `RULE_UNKNOWN` | eligibility lists (§5.1) | counted as **unverifiable**, never as passing | — |
+| `RULE_UNKNOWN` | **CN TW IN short sells** | counted as **unverifiable**, never as passing. Deliberately not checked — see §5.1 | — |
 
-### 5.1 The rules our sheet left blank
+### 5.1 Markets we deliberately do not check for short sell
 
-Taiwan, China and India are blank or "need to chk" on the sheet. They are not
-blank at their exchanges, and an algo has to follow the market's rule whether or
-not we wrote it down. Established from the regulators:
+**Taiwan, China and India emit `RULE_UNKNOWN` and no short sell check runs on
+them.** Their LULD bands are unaffected — those are solid (§11.5) and `LULD_CAP`
+runs there as normal. This section is the *reason*, and the head start for
+whenever the desk decides to enable them.
 
-**China — an uptick rule, so it folds into `SS_UPTICK`.** SSE and SZSE margin
-trading rules require that a short sale (融券卖出) be declared at a price **not
-lower than the latest transaction price**, falling back to the **previous close**
-when the stock has not yet traded that day. Same shape as Japan, Korea and
-Malaysia, so China joins the existing check; only the no-trade fallback is new.
-Separately, short selling is confined to the exchanges' designated eligible list
-(标的证券), which we do not have — that half stays `RULE_UNKNOWN`.
+The rules below were researched from the regulators. They are **not implemented**,
+because a short sell finding is a compliance assertion and the confidence here is
+not compliance-grade: China and Taiwan come from exchange rules and regulator
+releases — secondary sources — and short selling rules in both markets have been
+changed repeatedly under market stress. Enforcing a rule we are not certain of
+would put fabricated violations next to real ones and cost the whole report its
+credibility, which is the §10.7 principle applied to rules rather than to bands.
 
-**Taiwan — a previous-close floor, not a tick rule.** This is the one the sheet
-would most likely have got wrong by analogy. SBL short sales must be entered at a
-price **equal to or higher than the previous day's closing price** — measured
-against the *previous close*, never the last trade. It is also **conditional**:
+**China — an uptick rule.** SSE and SZSE margin trading rules require a short sale
+(融券卖出) be declared at a price **not lower than the latest transaction price**,
+falling back to the **previous close** where the stock has not yet traded. Same
+shape as Japan, Korea and Malaysia, so enabling it is `SS_UPTICK` plus a no-trade
+fallback. Short selling is also confined to the exchanges' designated eligible
+list (标的证券), which we do not have.
 
-- it bites when the previous day's close fell **more than 3.5%** (or, where no
-  trade occurred, the lowest sell order at close was down more than 3.5%)
-- margin-eligible shares are **exempt** from the price constraint, unless the
-  previous close was at **limit down**, or the security's price was the lowest
-  recorded sell order at close with no trade executed
-- TWSE and TPEx publish the **daily exemption list** (available from 2013-09-23,
-  CSV)
+**Taiwan — a previous-close floor, not a tick rule.** The one most likely to be
+got wrong by analogy. SBL short sales must be entered **at or above the previous
+day's closing price** — the *previous close*, never the last trade — and it is
+conditional:
+
+- it bites when the previous close fell **more than 3.5%** (or, absent a trade,
+  the lowest sell order at close was down more than 3.5%)
+- margin-eligible shares are **exempt**, unless the previous close was at **limit
+  down**, or the price was the lowest recorded sell order at close with no trade
+- TWSE and TPEx publish the **daily exemption list** (CSV, from 2013-09-23)
 
 We already compute the previous close for §3, so the floor and the −3.5% trigger
-are free. The exemption list is external: `--ss-exempt-file` accepts it, and
-without it a breach on an exempt-eligible name is reported as a **deviation**
-rather than a violation, so a missing list understates severity instead of
-manufacturing it.
+would be free, and the exemption list is the only external piece.
 
 **India — there is no price rule.** Verified against SEBI's *Broad framework for
-short selling* in full. All nine clauses cover definition, permitted investors,
-the naked-shorting ban, gross settlement, deterrents, SLB, F&O eligibility,
-disclosure and position reporting. **None constrains the price at which a short
-sale may be entered** — India has no uptick rule and never adopted one. So the
-only price check India gets is `LULD_CAP`, and asserting a tick rule there would
-have produced pure noise.
+short selling*, read in full. Its nine clauses cover definition, permitted
+investors, the naked-shorting ban, gross settlement, deterrents, SLB, F&O
+eligibility, disclosure and position reporting. **None constrains the price at
+which a short sale may be entered** — India never adopted an uptick rule. This is
+the most useful finding in the section: it means no amount of further work will
+produce a price check for India, and any future attempt to add one is a mistake.
 
-What India does impose, and what is checkable in our data:
+What India does impose, if it is ever enabled, is clause 4 — no institutional
+intraday square-off — checkable as a `sellshort` parent offset by a same-day buy
+in the same sym.
 
-| SEBI clause | check | in our data? |
-|---|---|---|
-| 4 — no institutional intraday square-off | `SS_IN_SQUAREOFF`: a `sellshort` parent offset by a same-day buy in the same sym | **yes** — `target` grouped by date, sym, portfolio |
-| 8 — institutions disclose upfront at order placement | `side=sellshort` at entry *is* that disclosure; cross-check against `execution.rule80` | yes, as a consistency check |
-| 7 — only F&O-segment securities eligible | needs the F&O list | no — `RULE_UNKNOWN` |
-| 3 — naked shorting / delivery | settlement data | no — out of scope |
-
-**Confidence.** India is from the SEBI primary document. China and Taiwan are from
-exchange rules and regulator releases, secondary sources, and short selling rules
-in both markets have been changed repeatedly under market stress. Treat §5.1 as
-researched-and-plausible, not as compliance-signed-off: **confirm with the desk
-before any finding here is escalated.** Each rule is one table entry, so a
-correction is a one-line change plus its tests.
+**To enable any of these** takes one entry in the rule table, its fixtures in the
+self-test, and a line in §11.5. The blocker is desk confirmation, not engineering.
 
 ### 5.2 Two reference markets, deliberately
 
@@ -574,9 +568,6 @@ counters plus the finding rows, and drops the split rows.
 --checks             comma list of rule/detector ids, or 'all' (default)
 --band-file          CSV of known bands that overrides every computed layer
                      (§3.3); partial coverage is fine
---ss-exempt-file     CSV of Taiwan securities exempt from the short sell price
-                     constraint (§5.1); without it an exempt-eligible breach is
-                     reported as a deviation rather than a violation
 --pin-mins           minimum pin duration before the no-split family fires
                      (default 5)
 --approach-pct       band proximity for LULD_APPROACH_BACKOFF (default 1.0)
@@ -669,11 +660,12 @@ one-line change that reverses it.
    is inconsistent across markets but always populated for India and Korea, so
    `{IN, KR}` use it and nobody else does. Widening the set is a data question,
    and `--diagnose` prints the null rates that answer it.
-6. **A blank cell on our sheet is not a blank at the exchange.** Taiwan, China and
-   India were researched from their regulators rather than left unverifiable
-   (§5.1), because an algo has to follow the market's rule whether or not we wrote
-   it down. Those three carry lower confidence than the sheet's own five and are
-   flagged as needing desk confirmation — but a researched rule beats no rule.
+6. **Short sell checks run only where the rule is confirmed** — the five markets
+   our own sheet states. Taiwan, China and India were researched (§5.1) and
+   deliberately left unenforced: a short sell finding is a compliance assertion,
+   and secondary sources on markets that revise their rules under stress are not
+   a basis for making one. They report `RULE_UNKNOWN`, which is honest, rather
+   than passing, which would be false.
 7. **Where a band or eligibility list must be guessed, guess in the direction that
    under-reports.** Wide bands, downgraded severities. A missed violation is a gap;
    a fabricated one against a legal price is what makes the whole report
@@ -721,14 +713,13 @@ before -- `ipo` and `tsid` are now understood -- but `segment`, `stype`, `etf`,
 | what | missing | why it cannot be derived | effect when absent |
 |---|---|---|---|
 | **China** ST / \*ST status (±5%) | the stock **name** | carried in the name, not the code | band assumed wide → false negatives only (§1.2) |
-| **China** eligible list (标的证券) | exchange list | short selling is confined to it | `RULE_UNKNOWN` for eligibility; the price check still runs |
-| **Taiwan** daily exemption list | TWSE / TPEx CSV | published daily, from 2013-09-23 | breach on an exempt-eligible name → **deviation**, not violation |
-| **India** F&O segment list | exchange list | only F&O names may be shorted | `RULE_UNKNOWN` for eligibility; `SS_IN_SQUAREOFF` still runs |
+| **CN, TW, IN** short sell rules | desk confirmation, not data | researched in §5.1 but not compliance-grade | `RULE_UNKNOWN` — no short sell check runs |
+| **Taiwan** daily exemption list | TWSE / TPEx CSV | needed only if TW is ever enabled | n/a today |
 | **Korea** caution / warning designations | exchange, intraday | largely moot — KR reads its band from `target_oms` | none material |
 
-`--band-file` (§3.3) and `--ss-exempt-file` (§5.1) are what these are for. Every
-one of them **downgrades a finding rather than suppressing it**, so a missing list
-understates severity instead of manufacturing it.
+`--band-file` (§3.3) covers the band gaps, and **downgrades a finding rather than
+suppressing it**, so a missing list understates severity instead of manufacturing
+it. The short sell gaps are not files — they are a decision.
 
 **Re-admitting Indonesia** (§2) needs the IDX auto-rejection tier table plus the
 effective date of each revision. With that it is one market-table entry and one
@@ -769,18 +760,15 @@ itself a defect worth finding.
 | **Hong Kong** | no band rule exists | n/a — short sell checks only |
 | **China ST names** | unresolvable without a name feed | `assumed` wide, self-correcting on any day they pin (§1.2) |
 
-**Short sell — all eight in-scope markets now have a rule.**
+**Short sell — five of eight markets are checked.**
 
-| | rule | source |
+| | rule | status |
 |---|---|---|
-| **HK** | Always Ask | our sheet |
-| **JP, KR, MY** | UpTick (Trend) | our sheet |
-| **TH** | LTP + 1 tick | our sheet |
-| **CN** | uptick vs latest trade, prev close fallback | §5.1, exchange rules |
-| **TW** | previous-close floor, conditional on −3.5% and the exemption list | §5.1, TWSE |
-| **IN** | no price rule; same-day square-off ban instead | §5.1, SEBI primary |
+| **HK** | Always Ask | checked |
+| **JP, KR, MY** | UpTick (Trend) | checked |
+| **TH** | LTP + 1 tick | checked |
+| **CN, TW, IN** | researched but not enforced (§5.1) | `RULE_UNKNOWN` |
 
-What remains is not a data problem and not a rules problem. It is three
-eligibility lists — China's 标的证券, Taiwan's daily exemption list, India's F&O
-segment — each of which downgrades a finding's severity when absent rather than
-suppressing it.
+Every short sell finding the script emits therefore rests on a rule from our own
+sheet. Taiwan, China and India are visible in the scorecard as unchecked rather
+than silently passing, so the gap is legible without being asserted.
