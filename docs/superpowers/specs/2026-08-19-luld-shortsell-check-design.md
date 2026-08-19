@@ -665,11 +665,21 @@ one-line change that reverses it.
 4. **The opportunity detectors ship in the same script**, behind `--checks`. They
    share the whole band-resolution pipeline, and splitting them would duplicate
    the expensive half.
-5. **`target_oms` is not used**, on the finding that its data is inconsistent. It
-   is the strongest band source if that is ever fixed.
-6. **Markets without a rule are `RULE_UNKNOWN`, not a pass.** Indonesia, China,
-   Taiwan and India short sells are blank on the sheet; counting them as
-   compliant would be the worst available answer.
+5. **`target_oms` is read behind a two-market allowlist**, not globally. Its data
+   is inconsistent across markets but always populated for India and Korea, so
+   `{IN, KR}` use it and nobody else does. Widening the set is a data question,
+   and `--diagnose` prints the null rates that answer it.
+6. **A blank cell on our sheet is not a blank at the exchange.** Taiwan, China and
+   India were researched from their regulators rather than left unverifiable
+   (§5.1), because an algo has to follow the market's rule whether or not we wrote
+   it down. Those three carry lower confidence than the sheet's own five and are
+   flagged as needing desk confirmation — but a researched rule beats no rule.
+7. **Where a band or eligibility list must be guessed, guess in the direction that
+   under-reports.** Wide bands, downgraded severities. A missed violation is a gap;
+   a fabricated one against a legal price is what makes the whole report
+   ignorable (§1.2).
+8. **Indonesia is excluded rather than carried as unverifiable.** A market that can
+   only ever emit `RULE_UNKNOWN` adds a row to every table and no information.
 
 ---
 
@@ -708,14 +718,21 @@ before -- `ipo` and `tsid` are now understood -- but `segment`, `stype`, `etf`,
 
 ### 11.3 Still genuinely external
 
-| market | missing | why it cannot be derived |
-|---|---|---|
-| **Indonesia** | IDX auto-rejection tiers + effective dates | a price-tier step table, revised repeatedly and asymmetric in some periods. Not on the `target_oms` allowlist, and no observable rescue like Japan's. |
-| **China** | ST / \*ST status (+/-5%) | carried in the stock **name**, not the code. No prefix implies it. |
-| **Korea** | investment caution / warning designations | exchange-assigned, changes intraday. Largely moot now the published band is used for KR. |
+| what | missing | why it cannot be derived | effect when absent |
+|---|---|---|---|
+| **China** ST / \*ST status (±5%) | the stock **name** | carried in the name, not the code | band assumed wide → false negatives only (§1.2) |
+| **China** eligible list (标的证券) | exchange list | short selling is confined to it | `RULE_UNKNOWN` for eligibility; the price check still runs |
+| **Taiwan** daily exemption list | TWSE / TPEx CSV | published daily, from 2013-09-23 | breach on an exempt-eligible name → **deviation**, not violation |
+| **India** F&O segment list | exchange list | only F&O names may be shorted | `RULE_UNKNOWN` for eligibility; `SS_IN_SQUAREOFF` still runs |
+| **Korea** caution / warning designations | exchange, intraday | largely moot — KR reads its band from `target_oms` | none material |
 
-`--band-file` (§3.3) is what these are for. Indonesia reports `RULE_UNKNOWN`
-until it is supplied.
+`--band-file` (§3.3) and `--ss-exempt-file` (§5.1) are what these are for. Every
+one of them **downgrades a finding rather than suppressing it**, so a missing list
+understates severity instead of manufacturing it.
+
+**Re-admitting Indonesia** (§2) needs the IDX auto-rejection tier table plus the
+effective date of each revision. With that it is one market-table entry and one
+tier function; the rest of the pipeline already handles it.
 
 ### 11.4 The exact answer, if it can ever be exported
 
