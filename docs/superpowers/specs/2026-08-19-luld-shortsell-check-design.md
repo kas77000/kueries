@@ -42,16 +42,60 @@ in §5:
 ### 1.1 Corrections to the table
 
 The percentage is not one number per market, and applying the table literally
-manufactures violations:
+manufactures violations.
 
-- **China** — ±10% is main board only. STAR (`688*`) and ChiNext (`300*`) are
-  ±20%; ST / \*ST names ±5%; day-one listings unlimited.
-- **Korea** — ±30% is KOSPI/KOSDAQ. KONEX is ±15%.
-- **Taiwan** — ±10%, but no limit for the first 5 days of a new listing.
+**China — the band is a function of the board, and the board is in the symbol
+prefix.** This is fully derivable, so it is a rule, not a gap:
 
-Board is derived from the symbol prefix where it can be; everything else is
-marked `assumed` and its confidence is carried into the report rather than
-hidden.
+| prefix | board | band | in force from |
+|---|---|---|---|
+| `600` `601` `603` `605` | SSE main | ±10% | |
+| `688` `689` | **STAR** (科创板) | **±20%** | 2019-07-22 |
+| `000` `001` | SZSE main | ±10% | |
+| `002` `003` | SZSE main (former SME board, merged 2021) | ±10% | |
+| `300` `301` | **ChiNext** (创业板) | **±20%** | 2020-08-24 — **±10% before that date** |
+| `900` / `200` | SSE / SZSE B shares | ±10% | |
+| `430` `83x` `87x` `920` | Beijing (BSE) | ±30% | |
+
+Two riders on that table:
+
+- **ChiNext's ±20% is date-effective.** It was ±10% until 24 August 2020, so the
+  rule carries an effective date rather than a bare percentage. Any audit range
+  straddling it would otherwise be wrong on one side.
+- **STAR and ChiNext have no price limit for the first five trading days** after
+  listing; main board day one is special-cased too. `target_stock.ipo` supplies
+  the listing date.
+
+**Korea** — ±30% is KOSPI/KOSDAQ, KONEX is ±15%. Moot in practice: KR reads its
+band from `target_oms` (§3), which already reflects whichever applies.
+
+**Taiwan** — ±10%, but no limit for the first 5 days of a new listing (`ipo`).
+
+### 1.2 The one China case the prefix cannot reach, and why it is safe
+
+**ST / \*ST names are ±5% on the main board**, and that status lives in the stock
+*name*, not the code — nothing in `target_stock` carries it. An ST name therefore
+gets an assumed ±10% band: **twice as wide as the truth**.
+
+That error runs in the safe direction, and the distinction matters enough to
+state once:
+
+- a band assumed **too wide** produces **false negatives** — real violations
+  between 5% and 10% are missed
+- a band assumed **too narrow** produces **false positives** — fabricated
+  violations against legal prices
+
+Only the second kind destroys trust in the report, so where the band must be
+guessed, it is guessed wide. ST names are also self-correcting on any day they
+actually hit their limit: the observed pin lands at ±5%, contradicts the ±10%
+computed band, and §3.1 resolves it from observation. The residual exposure is
+narrow — ST names, main board only, on days they approach but never touch ±5%.
+
+Note that ST status does **not** reduce the band on STAR or ChiNext; those stay
+±20%. So this gap is confined to `600`/`601`/`603`/`605`/`000`/`001`/`002`/`003`.
+
+Everything not covered by a prefix rule is marked `assumed`, and its confidence
+travels with it into the report rather than being hidden.
 
 ---
 
@@ -244,13 +288,18 @@ the scalar `target_stock.ticksize` is the fallback.
 This replaces a scalar tick with the real grid, which is what makes the inward
 rounding in §3.1 exact rather than approximate.
 
-**One open question, cheap to settle and worth more than the grid itself.** A-share
-ticks are a uniform 0.01 CNY, so China having *two* ids probably does not encode
-tick size at all — more likely SH vs SZ, or main board vs STAR/ChiNext. A crosstab
-of `tsid` against symbol prefix (`600*` `601*` `603*` vs `000*` `002*` vs `300*` vs
-`688*`) settles it. **If it separates main board from STAR/ChiNext, `tsid` is the
-board discriminator**, and China's +/-10% vs +/-20% correction (§1.1) is solved
-without needing `segment`. `--diagnose` prints this crosstab.
+**A crosstab worth printing, as a check rather than a source.** A-share ticks are
+a uniform 0.01 CNY, so China having *two* ids probably does not encode tick size
+at all — more likely SH vs SZ, or main board vs STAR/ChiNext. `--diagnose` prints
+`tsid` against symbol prefix (`600*` `601*` `603*` vs `000*` `002*` vs `300*` vs
+`688*`).
+
+This is no longer needed to *determine* the board — §1.1 derives that from the
+prefix directly. Its value is as an **independent second signal**: if `tsid`
+partitions China the same way the prefix rule does, two unrelated sources agree
+and the board mapping is confirmed. If they disagree, one of them is wrong about
+a stock and the crosstab says which — a cheap correctness check on the most
+consequential band rule in the script.
 
 ---
 
@@ -569,10 +618,10 @@ guessing -- but each one converts a market from approximate to exact.
 
 ### 11.2 Still worth having, cheap
 
-**A `tsid` x symbol-prefix crosstab for China.** If `10058` / `10216` separates
-main board from STAR/ChiNext, `tsid` is the board discriminator and China's
-+/-10% vs +/-20% is exact rather than prefix-inferred. `--diagnose` prints it;
-one run settles it.
+**A `tsid` x symbol-prefix crosstab for China.** Not needed to determine the
+board — §1.1 does that from the prefix — but it is a free second opinion on the
+mapping. Agreement confirms it; disagreement names the stock that breaks it.
+`--diagnose` prints it.
 
 **Per-market `target_oms` population rates.** The allowlist is `{IN, KR}` on your
 word. If JP, MY or TH turn out to be populated too, each one moves from computed
