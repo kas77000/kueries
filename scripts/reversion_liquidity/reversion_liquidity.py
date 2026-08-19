@@ -13,6 +13,11 @@ data, for DARK executions only.
   Table 3.3  Venue tiering / ranking on 1s reversion and quote stability
              venue, Reversion, Stability, Score, Tier
 
+--decompose adds a third table splitting Reversion into the two effects it is
+made of - Capture, where in the touch the fill happened, and Drift, where the
+mid went in the second after.  --out-dir writes the tables to report.xlsx, and
+--pdf typesets them the way the report typesets them.
+
 Talks to TWO kdb processes over PyKX.  Both are HISTORICAL, not the realtime
 ones, and their host:port are fixed - so they are constants below rather than
 arguments.  Set them once, before first use.
@@ -229,6 +234,7 @@ FILL_ACC = [
     "w_adv", "wsum_adv",
     "w_filladv", "wsum_filladv",
     "n_rev", "sum_rev", "sumsq_rev",
+    "n_dec", "sum_capture", "sum_drift",
     "n_stable", "sum_stable",
     "no_quote", "bad_spread",
 ]
@@ -355,6 +361,24 @@ def fill_metrics(df, half_spread=False):
     )
     df["rev2"] = df["rev"] ** 2
 
+    # The two halves of that reversion, on the same mask and the same divisor,
+    # so Capture + Drift == rev row by row:
+    #
+    #   capture  where in the touch the fill happened.  0 at mid, +0.5 at the
+    #            passive touch, -0.5 at the aggressive one.  A property of the
+    #            price we got.
+    #   drift    where the mid went in the second after.  A property of what
+    #            the market did next, i.e. leakage.
+    #
+    # Reversion alone cannot tell "prices me well" from "does not leak"; these
+    # two can.  Both are reported only under --decompose.
+    df["capture"] = np.where(
+        good_spread, df["sidesign"] * (mid0 - df["fillprice"]) / denom, np.nan
+    )
+    df["drift"] = np.where(
+        good_spread, df["sidesign"] * (mid1 - mid0) / denom, np.nan
+    )
+
     # Strict stability: BOTH touches unchanged.  A venue is charged for any
     # touch move in the second after its fill.
     df["stable"] = np.where(has_quote, ((bid1 == bid0) & (ask1 == ask0)) * 1.0, np.nan)
@@ -397,6 +421,11 @@ def aggregate_fills(df):
         n_rev=("rev", "count"),
         sum_rev=("rev", "sum"),
         sumsq_rev=("rev2", "sum"),
+        # same mask as rev, so n_dec == n_rev; kept separate so a future change
+        # to either mask shows up as a mismatch instead of a silent reweighting
+        n_dec=("capture", "count"),
+        sum_capture=("capture", "sum"),
+        sum_drift=("drift", "sum"),
         n_stable=("stable", "count"),
         sum_stable=("stable", "sum"),
         no_quote=("no_quote", "sum"),
@@ -482,6 +511,39 @@ def pooled_z(fill_acc):
     out["n_rev"] = fill_acc["n_rev"]
     out["n_stable"] = fill_acc["n_stable"]
     return out
+
+
+def build_decomposition(fill_acc):
+    """Reversion split into the two things it is made of, in spread units.
+
+    Reversion is a single number that answers two different questions at once.
+    Adding and subtracting mid0 separates them:
+
+        rev = sidesign*(mid1 - fillprice)/spread
+            = sidesign*(mid0 - fillprice)/spread   <- Capture: the price I got
+            + sidesign*(mid1 - mid0)/spread        <- Drift:   where it went next
+
+    A venue can post a good Reversion by pricing well (Capture) or by not
+    leaking (Drift), and the two call for completely different responses.  Same
+    population as Reversion - every venue appears, thin ones included, with n
+    alongside so a two-fill venue at the top is visible as such.
+    """
+    out = pd.DataFrame(index=fill_acc.index)
+    out["Capture"] = _safe_div(fill_acc["sum_capture"], fill_acc["n_dec"])
+    out["Drift"] = _safe_div(fill_acc["sum_drift"], fill_acc["n_dec"])
+    out["Reversion"] = _safe_div(fill_acc["sum_rev"], fill_acc["n_rev"])
+    out["n"] = fill_acc["n_rev"]
+    out.index.name = "Venue"
+    return out.sort_values("Reversion", ascending=False)
+
+
+def build_dropped(fill_acc):
+    """Fills the quote based metrics could not use, per venue."""
+    d = fill_acc[["n_fill", "no_quote", "bad_spread"]].copy()
+    d["% no quote"] = 100.0 * d["no_quote"] / d["n_fill"]
+    d["% crossed"] = 100.0 * d["bad_spread"] / d["n_fill"]
+    d.index.name = "Venue"
+    return d
 
 
 # -----------------------------------------------------------------------------
@@ -625,28 +687,263 @@ def build_tiering(fill_acc, min_fills, tiers):
 # Rendering
 # -----------------------------------------------------------------------------
 
+# One decimal spec per table, used by the terminal, the workbook and the PDF
+# alike, so the three can never disagree about how a column is written.  The
+# liquidity figures match the report column for column.
+LIQUIDITY_FMT = (
+    ("%Notional", "{:.1f}"), ("Spread", "{:.1f}"), ("Adv", "{:.1f}"),
+    ("Fill%adv", "{:.2f}"), ("Fill Rate", "{:.1f}"), ("Duration", "{:.0f}"),
+)
+TIERING_FMT = (
+    ("Reversion", "{:.2f}"), ("Stability", "{:.2f}"),
+    ("Score", "{:.2f}"), ("Tier", "{:.0f}"),
+)
+DECOMPOSITION_FMT = (
+    ("Capture", "{:.3f}"), ("Drift", "{:.3f}"),
+    ("Reversion", "{:.3f}"), ("n", "{:,.0f}"),
+)
+DROPPED_FMT = (
+    ("n_fill", "{:,.0f}"), ("no_quote", "{:,.0f}"), ("bad_spread", "{:,.0f}"),
+    ("% no quote", "{:.1f}"), ("% crossed", "{:.1f}"),
+)
+
+
+def format_table(t, fmt):
+    """Numeric frame -> every cell a string, NaN as blank.  Column order comes
+    from fmt, so a table always presents the same way whatever built it."""
+    cols = [c for c, _ in fmt]
+    d = pd.DataFrame(index=t.index)
+    for c, spec in fmt:
+        d[c] = t[c].map(lambda v, s=spec: "" if pd.isna(v) else s.format(v))
+    return d[cols]
+
+
 def render_liquidity(t):
-    d = t.copy()
-    for c, n in [("%Notional", 1), ("Spread", 1), ("Adv", 1),
-                 ("Fill%adv", 2), ("Fill Rate", 1), ("Duration", 0)]:
-        d[c] = d[c].map(lambda v, n=n: "" if pd.isna(v) else f"{v:.{n}f}")
-    return d.to_string()
+    return format_table(t, LIQUIDITY_FMT).to_string()
 
 
 def render_tiering(t):
-    d = t[["Reversion", "Stability", "Score", "Tier"]].copy()
-    for c in ("Reversion", "Stability", "Score"):
-        d[c] = d[c].map(lambda v: "" if pd.isna(v) else f"{v:.2f}")
-    return d.to_string()
+    return format_table(t, TIERING_FMT).to_string()
 
 
-def render_dropped(fill_acc):
-    d = fill_acc[["n_fill", "no_quote", "bad_spread"]].copy()
-    d["% no quote"] = (100.0 * d["no_quote"] / d["n_fill"]).map(lambda v: f"{v:.1f}")
-    d["% crossed"] = (100.0 * d["bad_spread"] / d["n_fill"]).map(lambda v: f"{v:.1f}")
-    d = d.astype({"n_fill": int, "no_quote": int, "bad_spread": int})
-    d.index.name = "Venue"
-    return d.to_string()
+def render_decomposition(t):
+    return format_table(t, DECOMPOSITION_FMT).to_string()
+
+
+def render_dropped(t):
+    return format_table(t, DROPPED_FMT).to_string()
+
+
+# -----------------------------------------------------------------------------
+# Output files
+#
+# Both writers take the SAME numeric frames the terminal renders, so the three
+# can only ever differ in presentation.  Neither dependency is imported until
+# the corresponding flag is used - the script still runs, and still self-tests,
+# on a machine that has neither.
+# -----------------------------------------------------------------------------
+
+def write_xlsx(path, sheets):
+    """One workbook, one sheet per table.
+
+    Written as NUMBERS, not as the rendered strings: a spreadsheet you cannot
+    sort or chart is a screenshot with extra steps.  Excel applies the display
+    rounding, the cell keeps full precision."""
+    engine = None
+    for cand in ("openpyxl", "xlsxwriter"):
+        try:
+            __import__(cand)
+            engine = cand
+            break
+        except ImportError:
+            continue
+    if engine is None:
+        raise SystemExit(
+            "writing .xlsx needs an Excel engine.  pip install openpyxl")
+    with pd.ExcelWriter(path, engine=engine) as xw:
+        for name, frame in sheets:
+            frame.to_excel(xw, sheet_name=name)
+
+
+# A4 portrait in POINTS, which is what the rest of the layout is measured in -
+# font sizes, rule weights and column gaps are all typographic units, so the
+# page is too, and the only conversion is the one into figure fractions.
+PDF_PAGE = (595.28, 841.89)
+PDF_FS = 10.0            # body size
+PDF_LEAD = 1.45          # baseline to baseline, x font size
+PDF_COLGAP = 20.0        # between columns
+PDF_MARGIN = 64.0        # page margin
+PDF_TABLEGAP = 46.0      # between two tables on one page
+
+
+def _pdf_mismapped(strings, font):
+    """The characters this font renders as the WRONG glyph.
+
+    cmr10 is a TeX font and carries the OT1 encoding with it: underscore comes
+    out as a raised dot, braces as dashes, backslash as an opening quote.  It
+    does this SILENTLY - the glyph exists, it is simply not the one that was
+    asked for, so nothing warns and the wrong venue name reaches the page.
+    Venue names are symbols out of kdb and will contain underscores, so this
+    has to be tested rather than assumed.
+
+    Compared against DejaVu Serif, which matplotlib also ships and which maps
+    ASCII correctly - so there is no hardcoded table here to fall out of date.
+    """
+    import matplotlib.font_manager as fm
+    from matplotlib.ft2font import FT2Font
+    a = FT2Font(fm.findfont(fm.FontProperties(family=font)))
+    b = FT2Font(fm.findfont(fm.FontProperties(family="DejaVu Serif")))
+    bad = set()
+    for ch in {c for s in strings for c in str(s)}:
+        if (a.get_glyph_name(a.get_char_index(ord(ch)))
+                != b.get_glyph_name(b.get_char_index(ord(ch)))):
+            bad.add(ch)
+    return bad
+
+
+def _pdf_font(strings=()):
+    """Computer Modern, so the page is set in the report's own face rather than
+    merely a serif - unless the text contains something CM would mis-render, in
+    which case the whole document falls back and says so.  A PDF in the right
+    font with the wrong venue names is worse than one in the wrong font."""
+    import matplotlib.font_manager as fm
+    have = {f.name for f in fm.fontManager.ttflist}
+    if "cmr10" not in have:
+        return "DejaVu Serif"
+    bad = _pdf_mismapped(strings, "cmr10")
+    if bad:
+        log("  pdf: Computer Modern mis-maps " + " ".join(sorted(bad))
+            + " (TeX OT1 encoding), so the tables are set in DejaVu Serif")
+        return "DejaVu Serif"
+    return "cmr10"
+
+
+def _pdf_widths(strings, font, fs):
+    """String widths in points.
+
+    Measured off the glyph outlines rather than a renderer, so the answer does
+    not depend on a backend, a DPI or a screen being present."""
+    from matplotlib.font_manager import FontProperties
+    from matplotlib.textpath import TextPath
+    fp = FontProperties(family=font, size=fs)
+    out = []
+    for s in strings:
+        s = str(s)
+        out.append(0.0 if not s.strip()
+                   else TextPath((0, 0), s, size=fs, prop=fp).get_extents().width)
+    return out
+
+
+def _pdf_geometry(index_header, columns, rows, font, fs=PDF_FS):
+    """Column widths from the widest cell in each column, so the table fits its
+    contents instead of a guess.  Returns (index width, column widths, total
+    width, total height), all in points."""
+    idx_w = max(_pdf_widths([index_header] + [r[0] for r in rows], font, fs))
+    col_w = [max(_pdf_widths([c] + [r[1][j] for r in rows], font, fs))
+             for j, c in enumerate(columns)]
+    width = idx_w + sum(col_w) + PDF_COLGAP * len(col_w)
+    lead = fs * PDF_LEAD
+    height = lead * (len(rows) + 1) + lead * 1.6
+    return idx_w, col_w, width, height
+
+
+def _pdf_draw(fig, x0, y_top, idx_w, col_w, index_header, columns, rows,
+              font, fs=PDF_FS):
+    """One booktabs table.  Heavy top and bottom rule, light rule under the
+    header, no vertical rules and no row lines - that is the whole style, and
+    the reason the report's tables read as cleanly as they do.
+
+    Returns the y of the bottom rule, in points."""
+    from matplotlib.lines import Line2D
+    W, H = PDF_PAGE
+    lead = fs * PDF_LEAD
+    width = idx_w + sum(col_w) + PDF_COLGAP * len(col_w)
+
+    edges, x = [], x0 + idx_w
+    for w in col_w:
+        x += PDF_COLGAP + w
+        edges.append(x)
+
+    def text(xp, yp, s, ha):
+        fig.text(xp / W, yp / H, s, ha=ha, va="baseline",
+                 fontfamily=font, fontsize=fs, color="black")
+
+    def rule(yp, lw):
+        fig.add_artist(Line2D([x0 / W, (x0 + width) / W], [yp / H, yp / H],
+                              lw=lw, color="black", solid_capstyle="butt",
+                              transform=fig.transFigure))
+
+    y = y_top
+    rule(y, 0.9)                                  # toprule
+    y -= lead * 0.78
+    text(x0, y, index_header, "left")
+    for e, c in zip(edges, columns):
+        text(e, y, c, "right")
+    y -= lead * 0.36
+    rule(y, 0.45)                                 # midrule
+    y -= lead * 0.88
+    for name, vals in rows:
+        text(x0, y, name, "left")
+        for e, v in zip(edges, vals):
+            text(e, y, v, "right")
+        y -= lead
+    y += lead - lead * 0.52
+    rule(y, 0.9)                                  # bottomrule
+    return y
+
+
+def write_pdf(path, tables):
+    """The tables and nothing else: no title, no caption, no letterhead.
+
+    tables is a list of (index_header, numeric frame, format spec)."""
+    try:
+        from matplotlib.backends.backend_pdf import FigureCanvasPdf, PdfPages
+        from matplotlib.figure import Figure
+    except ImportError:
+        raise SystemExit("writing .pdf needs matplotlib.  pip install matplotlib")
+
+    W, H = PDF_PAGE
+    laid = []
+    for header, frame, fmt in tables:
+        d = format_table(frame, fmt)
+        rows = [(str(ix), list(r)) for ix, r in zip(d.index, d.values)]
+        laid.append((header, list(d.columns), rows))
+    # every string that will be typeset, so the font is chosen knowing all of it
+    font = _pdf_font([s for header, cols, rows in laid
+                      for s in [header] + cols + [r[0] for r in rows]
+                      + [v for r in rows for v in r[1]]])
+
+    def new_page():
+        # a bare Figure with a pdf canvas: no pyplot, so no backend is selected
+        # and nothing tries to find a display
+        fig = Figure(figsize=(W / 72.0, H / 72.0))
+        FigureCanvasPdf(fig)
+        fig.patch.set_facecolor("white")
+        return fig
+
+    with PdfPages(path) as pdf:
+        fig, y = None, 0.0
+        for header, columns, rows in laid:
+            fs = PDF_FS
+            idx_w, col_w, tw, th = _pdf_geometry(header, columns, rows, font, fs)
+            avail = W - 2 * PDF_MARGIN
+            if tw > avail:
+                # our venue names are longer than the report's, and a table
+                # wider than the page loses its right hand columns off the edge
+                # without saying so.  Shrink to fit instead.
+                fs = max(6.0, fs * avail / tw)
+                idx_w, col_w, tw, th = _pdf_geometry(header, columns, rows, font, fs)
+            if fig is None or y - th < PDF_MARGIN:
+                if fig is not None:
+                    pdf.savefig(fig)
+                fig = new_page()
+                y = H - PDF_MARGIN
+            y = _pdf_draw(fig, (W - tw) / 2.0, y, idx_w, col_w,
+                          header, columns, rows, font, fs)
+            y -= PDF_TABLEGAP
+        if fig is None:                    # nothing to typeset; still emit a page
+            fig = new_page()
+        pdf.savefig(fig)
 
 
 # -----------------------------------------------------------------------------
@@ -778,6 +1075,11 @@ def run(args):
 
     liquidity = build_liquidity(fill_acc, child_acc)
     tiering = build_tiering(fill_acc, args.min_fills, args.tiers)
+    dropped = build_dropped(fill_acc)
+    decomposition = build_decomposition(fill_acc) if args.decompose else None
+    # build_tiering returns a frame with no Tier column when nothing cleared
+    # --min-fills, so everything downstream asks this rather than len()
+    tiered = "Tier" in tiering.columns
 
     print(f"\nDark venues {args.start} to {args.end}"
           + (f", country {args.country}" if args.country else "")
@@ -785,26 +1087,50 @@ def run(args):
     print("\nTable 3.1: Liquidity\n")
     print(render_liquidity(liquidity))
     print("\nTable 3.3: Venue tiering on 1s reversion and quote stability\n")
-    if len(tiering) == 0:
+    if not tiered:
         print(f"  no venue reached --min-fills {args.min_fills}")
     else:
         print(render_tiering(tiering))
         if len(tiering) < len(liquidity):
-            dropped = sorted(set(liquidity.index) - set(tiering.index))
+            missing = sorted(set(liquidity.index) - set(tiering.index))
             print(f"\n  below --min-fills {args.min_fills}, not tiered: "
-                  + ", ".join(dropped))
+                  + ", ".join(missing))
+    if decomposition is not None:
+        unit = "half spreads" if args.half_spread else "spreads"
+        print(f"\nReversion decomposition: Capture + Drift = Reversion, "
+              f"per fill, in {unit}\n")
+        print(render_decomposition(decomposition))
     print("\nFills excluded from the quote based metrics\n")
-    print(render_dropped(fill_acc))
+    print(render_dropped(dropped))
 
     if args.out_dir:
         import os
         os.makedirs(args.out_dir, exist_ok=True)
-        liquidity.to_csv(os.path.join(args.out_dir, "liquidity.csv"))
-        tiering.to_csv(os.path.join(args.out_dir, "tiering.csv"))
+        sheets = [("Liquidity", liquidity)]
+        if tiered:
+            sheets.append(("Tiering", tiering))
+        if decomposition is not None:
+            sheets.append(("Decomposition", decomposition))
+        sheets.append(("Excluded", dropped))
+        book = os.path.join(args.out_dir, "report.xlsx")
+        write_xlsx(book, sheets)
+        print(f"\nwritten to {book}")
         if args.keep_fills and kept:
-            pd.concat(kept).to_csv(os.path.join(args.out_dir, "fills.csv"),
-                                   index=False)
-        print(f"\nwritten to {args.out_dir}")
+            # stays a CSV on purpose: a quarter of dark fills runs past Excel's
+            # 1,048,576 row ceiling, and a sheet truncates there in silence
+            fills_csv = os.path.join(args.out_dir, "fills.csv")
+            pd.concat(kept).to_csv(fills_csv, index=False)
+            print(f"written to {fills_csv}")
+
+    if args.pdf:
+        tables = [("Venue", liquidity, LIQUIDITY_FMT)]
+        if tiered:
+            # the report leaves this table's venue column unheaded
+            tables.append(("", tiering, TIERING_FMT))
+        if decomposition is not None:
+            tables.append(("Venue", decomposition, DECOMPOSITION_FMT))
+        write_pdf(args.pdf, tables)
+        print(f"\nwritten to {args.pdf}")
 
 
 def main(argv=None):
@@ -822,7 +1148,13 @@ def main(argv=None):
                    help="normalise reversion by half the spread instead of the full spread")
     p.add_argument("--keep-fills", action="store_true",
                    help="also retain fill level rows; will exhaust memory on a long range")
-    p.add_argument("--out-dir", help="also write liquidity.csv and tiering.csv here")
+    p.add_argument("--decompose", action="store_true",
+                   help="also show reversion split into Capture (where in the "
+                        "touch the fill happened) and Drift (where the mid went "
+                        "in the second after)")
+    p.add_argument("--out-dir", help="also write report.xlsx here, one sheet per table")
+    p.add_argument("--pdf", help="also write the tables to this .pdf, typeset the "
+                                 "way the report typesets them")
     p.add_argument("--diagnose", action="store_true",
                    help="query the FIRST date only and show where its rows are "
                         "lost, stage by stage; use when a range reports nothing")
@@ -1061,6 +1393,153 @@ def test_country_reaches_q_as_chars():
     assert b"" == "".encode()
 
 
+def test_decomposition_adds_up():
+    """Capture + Drift == Reversion, per fill and per venue.
+
+    That identity is the entire claim the decomposition makes.  If it ever
+    stops holding, the two columns are explaining something that is not the
+    reversion they sit next to."""
+    rng = np.random.default_rng(4)
+    m = fill_metrics(_synth_fills(rng, 120, ["A", "B", "C"]))
+    ok = m["rev"].notna()
+    assert ok.sum() > 100, ok.sum()
+    assert np.allclose(m.loc[ok, "capture"] + m.loc[ok, "drift"],
+                       m.loc[ok, "rev"], rtol=1e-12, atol=1e-12)
+    dec = build_decomposition(aggregate_fills(m))
+    assert np.allclose(dec["Capture"] + dec["Drift"], dec["Reversion"],
+                       rtol=1e-9, atol=1e-12)
+    assert list(dec["Reversion"]) == sorted(dec["Reversion"], reverse=True)
+
+
+def test_decomposition_shares_the_reversion_mask():
+    """Both halves must drop out exactly where reversion drops out.  A crossed
+    quote has no spread to divide by, so neither half means anything there -
+    and if the masks ever drifted apart, the two columns would quietly stop
+    adding up to the column beside them."""
+    rng = np.random.default_rng(5)
+    m = fill_metrics(_synth_fills(rng, 40, ["A"]))
+    assert np.isnan(m.loc[0, "capture"]) and np.isnan(m.loc[0, "drift"])
+    assert np.isnan(m.loc[1, "capture"]) and np.isnan(m.loc[1, "drift"])
+    a = aggregate_fills(m).loc["A"]
+    assert a["n_dec"] == a["n_rev"] == 38, (a["n_dec"], a["n_rev"])
+
+
+def test_half_spread_scales_the_decomposition():
+    """--half-spread halves the divisor, so all three double together."""
+    rng = np.random.default_rng(6)
+    df = _synth_fills(rng, 60, ["A"])
+    full, half = fill_metrics(df), fill_metrics(df, half_spread=True)
+    ok = full["rev"].notna()
+    for c in ("rev", "capture", "drift"):
+        assert np.allclose(half.loc[ok, c], 2.0 * full.loc[ok, c],
+                           rtol=1e-12, atol=1e-12), c
+
+
+def _synth_tables(seed=7):
+    """The four finished tables, from synthetic fills - no kdb needed."""
+    rng = np.random.default_rng(seed)
+    acc = aggregate_fills(fill_metrics(_synth_fills(rng, 300, ["A", "B", "C"])))
+    child = pd.DataFrame(columns=CHILD_ACC, dtype=float)
+    return (build_liquidity(acc, child), build_tiering(acc, 10, "auto"),
+            build_decomposition(acc), build_dropped(acc))
+
+
+def test_formatting_is_shared():
+    """Terminal, workbook and PDF all format through format_table, so table 3.1
+    must come out in the decimals the report prints."""
+    liq = _synth_tables()[0]
+    d = format_table(liq, LIQUIDITY_FMT)
+    assert list(d.columns) == [c for c, _ in LIQUIDITY_FMT]
+    assert len(d["%Notional"].iloc[0].split(".")[1]) == 1     # 1dp, as published
+    assert len(d["Fill%adv"].iloc[0].split(".")[1]) == 2      # 2dp
+    # a NaN must render blank, never the string 'nan'
+    liq2 = liq.copy()
+    liq2.loc[liq2.index[0], "Spread"] = np.nan
+    assert format_table(liq2, LIQUIDITY_FMT)["Spread"].iloc[0] == ""
+
+
+def test_xlsx_round_trips():
+    """The workbook must hold NUMBERS, not the rendered strings - otherwise it
+    is a screenshot that happens to open in Excel."""
+    try:
+        import openpyxl                                        # noqa: F401
+    except ImportError:
+        print("        (no Excel engine installed, skipped)")
+        return
+    import os
+    import tempfile
+    liq, tier, dec, drop = _synth_tables()
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "report.xlsx")
+        write_xlsx(p, [("Liquidity", liq), ("Tiering", tier),
+                       ("Decomposition", dec), ("Excluded", drop)])
+        book = pd.read_excel(p, sheet_name=None, index_col=0)
+    assert list(book) == ["Liquidity", "Tiering", "Decomposition", "Excluded"], list(book)
+    back = book["Liquidity"]
+    assert list(back.index) == list(liq.index)
+    assert back["%Notional"].dtype.kind == "f", back["%Notional"].dtype
+    assert np.allclose(back["%Notional"].values, liq["%Notional"].values)
+    assert np.allclose(book["Decomposition"]["Capture"].values, dec["Capture"].values)
+
+
+def test_pdf_geometry_fits_its_contents():
+    """Columns are sized off their widest cell, so a long venue name widens the
+    table instead of colliding with the numbers."""
+    try:
+        import matplotlib                                      # noqa: F401
+    except ImportError:
+        print("        (matplotlib not installed, skipped)")
+        return
+    font = _pdf_font()
+    rows = [("Centrepoint", ["-0.15"]), ("A_VERY_LONG_DARK_VENUE_NAME", ["0.19"])]
+    idx_w, col_w, w, h = _pdf_geometry("Venue", ["Reversion"], rows, font)
+    longest = max(_pdf_widths([r[0] for r in rows], font, PDF_FS))
+    assert idx_w >= longest - 1e-9, (idx_w, longest)
+    assert col_w[0] >= max(_pdf_widths(["Reversion"], font, PDF_FS)) - 1e-9
+    assert w > idx_w + col_w[0]
+    assert h > PDF_FS * len(rows)
+
+
+def test_pdf_font_falls_back_on_tex_encoding():
+    """cmr10 maps underscore to a raised dot, and nothing warns about it.  Venue
+    names arrive from kdb as symbols, so ASX_CENTREPOINT_DARK would reach the
+    page as ASX-dot-CENTREPOINT-dot-DARK unless the writer notices first."""
+    try:
+        import matplotlib                                      # noqa: F401
+    except ImportError:
+        print("        (matplotlib not installed, skipped)")
+        return
+    import matplotlib.font_manager as fm
+    if "cmr10" not in {f.name for f in fm.fontManager.ttflist}:
+        print("        (no cmr10 installed, skipped)")
+        return
+    assert _pdf_mismapped(["Centrepoint", "MS Pool", "-0.15", "Fill%adv"],
+                          "cmr10") == set()
+    assert _pdf_mismapped(["ASX_CENTREPOINT_DARK"], "cmr10") == {"_"}
+    assert _pdf_font(["Centrepoint", "-0.15"]) == "cmr10"
+    assert _pdf_font(["ASX_CENTREPOINT_DARK", "-0.15"]) == "DejaVu Serif"
+
+
+def test_pdf_is_written():
+    """End to end: a real PDF file with a page in it."""
+    try:
+        import matplotlib                                      # noqa: F401
+    except ImportError:
+        print("        (matplotlib not installed, skipped)")
+        return
+    import os
+    import tempfile
+    liq, tier, dec, _ = _synth_tables()
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "report.pdf")
+        write_pdf(p, [("Venue", liq, LIQUIDITY_FMT), ("", tier, TIERING_FMT),
+                      ("Venue", dec, DECOMPOSITION_FMT)])
+        blob = open(p, "rb").read()
+    assert blob[:5] == b"%PDF-", blob[:16]
+    assert b"/Pages" in blob
+    assert len(blob) > 2000, len(blob)
+
+
 def self_test():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
@@ -1130,4 +1609,47 @@ if __name__ == "__main__":
 #    holds a row per state change it is the difference between right and a
 #    silently multiplied fill count.  It does mean the child order count here
 #    can differ from dark_routed_executed.q's orders_routed, which counts rows.
+#
+# 9. WHAT --decompose IS FOR.  Reversion answers two questions at once, and the
+#    published column cannot tell them apart:
+#
+#        rev = sidesign*(mid1 - fillprice)/spread
+#            = Capture + Drift
+#
+#    Capture is a property of the price we got - 0 at mid, +0.5 at the passive
+#    touch.  Drift is a property of what the market did next, i.e. leakage.  A
+#    venue can post a respectable Reversion by pricing well while leaking, or by
+#    pricing badly and not leaking, and the two call for opposite responses.
+#    Note this cuts across the report's own definition rather than extending it:
+#    the tiering in table 3.3 is untouched, and stays on Reversion alone.
+#
+#    Both halves share the good_spread mask and the divisor, so the identity
+#    holds under --half-spread too - see test_decomposition_adds_up.
+#
+# 10. THE OUTPUT FILES carry the same numbers the terminal prints, formatted
+#    through the same specs, so the three can only differ in presentation.
+#
+#    report.xlsx holds NUMBERS, not the rendered strings, so it can be sorted
+#    and charted; Excel does the display rounding.  --keep-fills still writes
+#    fills.csv rather than a sheet, because a quarter of dark fills runs past
+#    Excel's 1,048,576 row ceiling and a sheet truncates there in silence.
+#
+#    The PDF is the tables and nothing else - no title, no caption, no
+#    letterhead.  It is set in Computer Modern (matplotlib ships cmr10), with
+#    booktabs rules and right aligned numerics, which is what makes it sit
+#    beside the report's own pages.  Deliberately NOT reproduced: the publisher
+#    header.  Our numbers under someone else's masthead is a forgery the moment
+#    it leaves the desk, and the tables were the part worth matching anyway.
+#
+# 11. CM CANNOT ALWAYS BE USED, and the failure is silent.  cmr10 is a TeX font
+#    carrying the OT1 encoding: it renders _ as a raised dot, {} as dashes and
+#    backslash as an opening quote.  A glyph exists in every case, so nothing
+#    warns - ASX_CENTREPOINT_DARK simply reaches the page with dots in it.
+#    Venue names are kdb symbols and routinely contain underscores, so
+#    _pdf_font checks every string it is about to typeset and moves the whole
+#    document to DejaVu Serif if any character would be mis-mapped, saying so on
+#    stderr.  The right font with the wrong venue names is the worse trade.
+#
+#    DejaVu is wider than CM, so a table that fitted in CM may not; write_pdf
+#    scales a too-wide table down rather than letting columns run off the page.
 # -----------------------------------------------------------------------------

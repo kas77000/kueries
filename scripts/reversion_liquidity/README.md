@@ -9,6 +9,11 @@ results.
 - **Table 3.1 Liquidity** — per venue: `%Notional`, `Spread`, `Adv`,
   `Fill%adv`, `Fill Rate`, `Duration`
 - **Table 3.3 Tiering** — per venue: `Reversion`, `Stability`, `Score`, `Tier`
+- **Reversion decomposition** (`--decompose`, ours not theirs) — per venue:
+  `Capture`, `Drift`, `Reversion`, `n`
+
+The tables print to stdout, and can also be written to a workbook (`--out-dir`)
+or typeset as a PDF (`--pdf`). See [Outputs](#outputs).
 
 ## Running it
 
@@ -35,8 +40,10 @@ licence and no `QHOME` are needed locally.
 --min-fills    minimum usable fills before a venue is TIERED (default 1000)
 --tiers        'auto' (silhouette) or an integer k
 --half-spread  normalise reversion by half the spread instead of the full spread
+--decompose    also show Reversion split into Capture and Drift
 --keep-fills   also retain fill level rows (will exhaust memory on a long range)
---out-dir      also write liquidity.csv and tiering.csv
+--out-dir      also write report.xlsx here, one sheet per table
+--pdf          also typeset the tables to this .pdf
 --diagnose     query the FIRST date only and show where its rows are lost,
                stage by stage; use when a range reports nothing
 --quiet        no per-date progress on stderr; the report still prints
@@ -97,9 +104,10 @@ sums.
   fold()              add into the running accumulator, drop the fills
                  ───────────────────────────────
                         after the loop
-  build_liquidity()   → Table 3.1
-  pooled_z()          → Reversion, Stability, Score
-  build_tiering()     → Tier
+  build_liquidity()      → Table 3.1
+  pooled_z()             → Reversion, Stability, Score
+  build_tiering()        → Tier
+  build_decomposition()  → Capture, Drift          (--decompose)
 ```
 
 ### Step 1 — dark child orders and their fills (`Q_FILLS`, order server)
@@ -295,6 +303,85 @@ stability. Nothing is winsorized and nothing is silently discarded, so a venue
 whose numbers rest on a small surviving fraction of its fills is **visible**
 rather than merely plausible. Check this before reading anything into a venue's
 Reversion.
+
+## The reversion decomposition (`--decompose`)
+
+Reversion answers two questions at once, and the single published number cannot
+tell them apart. Add and subtract the fill-time mid and it separates:
+
+```
+rev = sidesign*(mid1 - fillprice)/spread
+
+    = sidesign*(mid0 - fillprice)/spread     Capture — the price I got
+    + sidesign*(mid1 - mid0)/spread          Drift   — where it went next
+```
+
+`Capture` is a property of **the fill**: 0 at mid, +0.5 at the passive touch,
+−0.5 at the aggressive one. `Drift` is a property of **what the market did in
+the second afterwards** — leakage. A venue can post a respectable Reversion by
+pricing well while leaking, or by pricing badly and not leaking, and those two
+call for opposite responses.
+
+```
+Reversion decomposition: Capture + Drift = Reversion, per fill, in spreads
+
+             Capture   Drift  Reversion       n
+Centrepoint    0.008  -0.011     -0.003  61,043
+MS Pool        0.021  -0.004      0.017  84,201
+JPMX          -0.002  -0.014     -0.016  23,118
+```
+
+Both halves are masked and divided exactly as `rev` is, so the identity holds
+row by row, venue by venue, and under `--half-spread` too — that is what
+`test_decomposition_adds_up` pins.
+
+This **extends** the report rather than reinterpreting it: table 3.3 is
+untouched, and the tiering still runs on Reversion alone. Every venue appears
+here, thin ones included, with `n` alongside so a two-fill venue at the top of
+the sort is visible as one.
+
+## Outputs
+
+Everything goes to stdout by default. The two file outputs carry the same
+numbers through the same format specs, so they can only differ from the
+terminal in presentation.
+
+**`--out-dir DIR`** writes `report.xlsx`, one sheet per table — `Liquidity`,
+`Tiering`, `Excluded`, and `Decomposition` when `--decompose` is on. Cells hold
+**numbers, not the rendered strings**, so the workbook can be sorted and
+charted; Excel applies the display rounding. Needs `openpyxl` (or
+`xlsxwriter`), imported only when the flag is used.
+
+This **replaces** the old `liquidity.csv` / `tiering.csv`. `--keep-fills` still
+writes `fills.csv` alongside, deliberately: a quarter of dark fills runs past
+Excel's 1,048,576-row ceiling, and a sheet truncates there without saying so.
+
+**`--pdf PATH`** typesets the tables the way the report typesets them — set in
+Computer Modern (matplotlib ships `cmr10`), booktabs rules, numerics right
+aligned, venue column left. The page holds **the tables and nothing else**: no
+title, no caption, no letterhead. Column widths come from the widest cell, and
+a table too wide for the page is scaled down to fit rather than losing its
+right-hand columns off the edge. Needs `matplotlib`, imported only when the
+flag is used.
+
+One catch worth knowing about, because it is silent. `cmr10` is a TeX font and
+carries the OT1 encoding with it: it renders `_` as a raised dot, `{}` as
+dashes, `\` as an opening quote. A glyph exists in each case, so nothing warns
+— `ASX_CENTREPOINT_DARK` just arrives on the page with dots in it. Venue names
+are kdb symbols and routinely contain underscores, so the writer checks every
+string it is about to set and moves the **whole document** to DejaVu Serif if
+any character would be mis-mapped:
+
+```
+  pdf: Computer Modern mis-maps _ (TeX OT1 encoding), so the tables are set in DejaVu Serif
+```
+
+The right font with the wrong venue names is the worse trade. If you want the
+Computer Modern look back, the venue names have to lose their underscores.
+
+Not reproduced: the publisher's masthead. Our numbers under someone else's
+letterhead is a forgery the moment the file leaves the desk, and the tables
+were the part worth matching.
 
 ## Verifying it
 
