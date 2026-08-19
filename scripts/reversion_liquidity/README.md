@@ -37,8 +37,38 @@ licence and no `QHOME` are needed locally.
 --half-spread  normalise reversion by half the spread instead of the full spread
 --keep-fills   also retain fill level rows (will exhaust memory on a long range)
 --out-dir      also write liquidity.csv and tiering.csv
+--diagnose     query the FIRST date only and show where its rows are lost,
+               stage by stage; use when a range reports nothing
+--quiet        no per-date progress on stderr; the report still prints
 --self-test    run the built-in tests; needs no kdb connection
 ```
+
+Progress goes to **stderr**, one line per date, and is on by default — a run
+that makes two IPC calls per date should not look identical to one that has
+hung. The report goes to stdout, so `> out.txt` keeps the two apart.
+
+### When a range reports nothing
+
+`no dark fills across N dates` means every date came back empty, and the useful
+question is *which filter emptied it*. Re-run the same command with
+`--diagnose`:
+
+```
+  workorder_rows        482,913
+  dark_venue_rows        30,514     6.3% of previous
+  of_those_filled        28,880    94.6% of previous
+  stock_rows              1,044     3.6% of previous
+  after_country               0     0.0% of previous   <- everything dropped here
+
+  countries on 2026-04-01, by dark parent orders:
+    JP    610      HK    240      SG     74
+
+  --country AU is not among them, which is why the range came back empty.
+```
+
+It reads `target_stock.country`. If that column is sparse, or spells markets
+differently from the exchange suffix on `sym`, `--country` matches nothing and
+every date is silently empty — the diagnostic is what tells you so.
 
 ## How the data is produced
 

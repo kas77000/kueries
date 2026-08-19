@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import sys
+import time
 from itertools import combinations
 
 import numpy as np
@@ -184,6 +185,39 @@ Q_QUOTES = """
   q0:aj[`sym`time; select sym, time:tm from f; qt];
   q1:aj[`sym`time; select sym, time:tm+00:00:01.000 from f; qt];
   ([] qbid0:q0`qbid; qask0:q0`qask; qbid1:q1`qbid; qask1:q1`qask)
+ }
+"""
+
+# Where a day's rows go, stage by stage, for --diagnose.  An empty report is
+# almost always one of these dropping to zero, and which one it is decides what
+# to do about it - there is nothing in "no dark fills in range" to act on.
+Q_DIAG = """
+{[d;ctry]
+  dk:("*DARK*";"*DRK*");
+  a:count select from workorder where date=d;
+  w:select date,id_server,id_work,id_target,venue,make
+    from workorder where date=d, any (upper venue) like/: dk;
+  b:count w;
+  c:count select from w where make>0;
+  ids:exec distinct id_target from w;
+  x:select date,id_server,id_target,country from target_stock
+    where date=d, id_target in ids;
+  e:count x;
+  f:$[0=count ctry; e; count select from x where country=`$ctry];
+  ([] stage:`workorder_rows`dark_venue_rows`of_those_filled`stock_rows`after_country;
+      n:(a;b;c;e;f))
+ }
+"""
+
+# The country values actually present, so a filter that matched nothing can be
+# compared against what was there to match.
+Q_COUNTRIES = """
+{[d]
+  w:select date,id_server,id_target from workorder
+    where date=d, any (upper venue) like/: ("*DARK*";"*DRK*");
+  ids:exec distinct id_target from w;
+  `n xdesc 0!select n:count i by country from target_stock
+    where date=d, id_target in ids
  }
 """
 
@@ -626,33 +660,121 @@ def daterange(d0, d1):
         d += dt.timedelta(days=1)
 
 
+# -----------------------------------------------------------------------------
+# Progress.  Goes to stderr and is flushed line by line, so a long range says
+# what it is doing WHILE it does it and the report on stdout stays pipeable.
+# On by default - a run that queries two servers ninety times should not look
+# identical to a run that has hung.  --quiet turns it off.
+# -----------------------------------------------------------------------------
+
+QUIET = False
+
+
+def log(msg=""):
+    if not QUIET:
+        print(msg, file=sys.stderr, flush=True)
+
+
+def _hms(secs):
+    return f"{secs:.1f}s" if secs < 60 else f"{int(secs)//60}m {int(secs)%60:02d}s"
+
+
+def diagnose(ho, day, ctry, country_label):
+    """Where one date's rows disappear, stage by stage.
+
+    An empty report is almost always one stage dropping to zero, and which one
+    decides what to do about it.  "no dark fills in range" says none of that."""
+    # all of this on stdout, header included: in this mode the funnel IS the
+    # output, and splitting it across two streams reorders it under a pipe
+    print(f"diagnosing {day}\n")
+    funnel = _to_pandas(ho(Q_DIAG, day, ctry))
+    width = max(len(str(s)) for s in funnel["stage"])
+    prev = None
+    for _, r in funnel.iterrows():
+        n = int(r["n"])
+        share = "" if not prev else f"   {100.0 * n / prev:5.1f}% of previous"
+        gone = "   <- everything dropped here" if n == 0 and prev else ""
+        print(f"  {str(r['stage']):<{width}}  {n:>12,}{share}{gone}")
+        prev = n
+    print()
+    if int(funnel["n"].iloc[0]) == 0:
+        print(f"  no workorder rows at all on {day} - a non-trading date, or a "
+              f"date the HDB does not hold.\n  Re-run --diagnose with a --start "
+              f"you know traded before reading anything into the rest.")
+        return 0
+    ctry_rows = _to_pandas(ho(Q_COUNTRIES, day))
+    if len(ctry_rows) == 0:
+        print("  no stock rows for that date, so no countries to compare against")
+    else:
+        print(f"  countries on {day}, by dark parent orders:")
+        for _, r in ctry_rows.head(20).iterrows():
+            got = str(r["country"])
+            mine = "   <- your --country" if country_label and got == country_label else ""
+            print(f"    {got:<12} {int(r['n']):>8,}{mine}")
+        if country_label and country_label not in [str(v) for v in ctry_rows["country"]]:
+            print(f"\n  --country {country_label} is not among them, which is why "
+                  f"the range came back empty.")
+    return 0
+
+
 def run(args):
+    global QUIET
+    QUIET = args.quiet
+
+    days = list(daterange(args.start, args.end))
+    log(f"reversion_liquidity  {args.start} to {args.end}  ({len(days)} dates)"
+        + (f", country {args.country}" if args.country else ", all countries"))
+    # logged BEFORE each connect, so a hang names the server it is hanging on
+    log(f"  order server  {ORDER_SERVER} ...")
     ho = connect(ORDER_SERVER, USER, PASSWORD)
+    log(f"  quote server  {QATT_SERVER} ...")
     hq = connect(QATT_SERVER, USER, PASSWORD)
     # BYTES, not str: PyKX sends a python str as a q symbol, and the q casts
     # with `$, which is a 'type error on a symbol.  b"" is an empty char
     # vector, so `0=count ctry` still selects every country.
     country = (args.country or "").encode()
 
+    if args.diagnose:
+        return diagnose(ho, days[0], country, args.country)
+
+    log("")
     fill_acc, child_acc, kept = None, None, []
-    for day in daterange(args.start, args.end):
+    n_ok = n_empty = n_failed = n_fills = 0
+    t_run = time.perf_counter()
+    for i, day in enumerate(days, start=1):
+        t0 = time.perf_counter()
+        tag = f"  [{i:>3}/{len(days)}] {day}"
         try:
             fills, child = fetch_day(ho, hq, day, country)
         except Exception as exc:                      # noqa: BLE001
-            print(f"  {day}: FAILED - {exc}", file=sys.stderr)
+            n_failed += 1
+            log(f"{tag}  FAILED - {exc}")
             continue
         child_acc = fold(child_acc, aggregate_child(child))
+        took = time.perf_counter() - t0
         if len(fills) == 0:
+            n_empty += 1
+            also = "" if len(child) else ", and no dark child orders either"
+            log(f"{tag}  no dark fills{also}   {took:5.1f}s")
             continue
+        n_ok += 1
+        n_fills += len(fills)
         m = fill_metrics(fills, half_spread=args.half_spread)
         fill_acc = fold(fill_acc, aggregate_fills(m))
         if args.keep_fills:
             kept.append(m)
-        if args.verbose:
-            print(f"  {day}: {len(fills)} fills", file=sys.stderr)
+        log(f"{tag}  {len(fills):>7,} fills, {len(child):>7,} children   {took:5.1f}s")
+
+    log("")
+    log(f"  {len(days)} dates in {_hms(time.perf_counter() - t_run)}: {n_ok} with "
+        f"fills ({n_fills:,} in total), {n_empty} empty, {n_failed} failed")
 
     if fill_acc is None or len(fill_acc) == 0:
-        raise SystemExit("no dark fills in range - nothing to report")
+        raise SystemExit(
+            f"\nno dark fills across {len(days)} dates"
+            + (f" for country {args.country}" if args.country else "")
+            + (f", and {n_failed} date(s) errored - see above" if n_failed else "")
+            + "\nrun the same command with --diagnose to see which filter empties it.")
 
     liquidity = build_liquidity(fill_acc, child_acc)
     tiering = build_tiering(fill_acc, args.min_fills, args.tiers)
@@ -701,7 +823,13 @@ def main(argv=None):
     p.add_argument("--keep-fills", action="store_true",
                    help="also retain fill level rows; will exhaust memory on a long range")
     p.add_argument("--out-dir", help="also write liquidity.csv and tiering.csv here")
-    p.add_argument("--verbose", action="store_true")
+    p.add_argument("--diagnose", action="store_true",
+                   help="query the FIRST date only and show where its rows are "
+                        "lost, stage by stage; use when a range reports nothing")
+    p.add_argument("--quiet", action="store_true",
+                   help="no per-date progress on stderr; the report still prints")
+    p.add_argument("--verbose", action="store_true",
+                   help=argparse.SUPPRESS)   # progress is on by default now
     p.add_argument("--self-test", action="store_true",
                    help="run the built-in tests; needs no kdb connection")
     args = p.parse_args(argv)
