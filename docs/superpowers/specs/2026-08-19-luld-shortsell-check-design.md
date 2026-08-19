@@ -73,8 +73,8 @@ as deviations, not violations, precisely because that config is not in the data.
 
 ## 3. Where the band comes from
 
-Three layers, best first, plus an optional fourth (§3.2). Every resolved band
-carries its provenance, and the report exposes it on every row.
+Three layers, best first, plus an operator-supplied override (§3.3). Every
+resolved band carries its provenance, and the report exposes it on every row.
 
 | layer | source | available |
 |---|---|---|
@@ -87,16 +87,15 @@ strongest source, but its data was checked and found inconsistent. It is
 **deliberately not used**. If it is ever fixed it slots in above `observed` and
 turns §6's `LULD_GUARD_INACTIVE` from an inference into a direct read.
 
-`mbref`'s `luld` table (`time; sym; atime; flag; limitup; limitdown`) is the
-feed-published band. LULD is a US NMS mechanism and the table may hold US names
-only, so the script **probes for it at startup** and uses it when populated for
-the market in question. Never required.
+`mbref`'s `luld` table (`time; sym; atime; flag; limitup; limitdown`) holds the
+feed-published band, but **we have no access to that server**, so it plays no
+part. Noted only so nobody re-derives it as an option.
 
 ### 3.1 Provenance and reconciliation
 
 | field | values |
 |---|---|
-| `band_src` | `observed` · `qatt_netchange` · `target_stock` · `mbref_luld` |
+| `band_src` | `override` · `observed` · `qatt_netchange` · `target_stock` |
 | `band_conf` | `confirmed` — an observed pin agrees with the computed band within one tick<br>`assumed` — never hit the band; computed only<br>`contradicted` — a pin, or the session `highPrice`/`lowPrice`, sits outside the computed band |
 
 **`contradicted` discards the computed band and suppresses that stock's LULD
@@ -145,6 +144,23 @@ three are handled by §3.1 rather than by widening the table:**
 India (scrip-specific 2/5/10/20% circuit filters) and Indonesia (IDX
 auto-rejection tiers, revised repeatedly) are the same problem and get the same
 treatment: computed where possible, `assumed`, and suppressed on contradiction.
+
+### 3.3 The override file
+
+Some bands cannot be derived from any data we have — India's per-scrip circuit
+filters most of all (see §11). Rather than block on them, `--band-file` takes a
+CSV that wins over every computed layer:
+
+```
+date,sym,limit_up,limit_dn,source
+2026.07.16,600584.CH,41.83,34.23,exchange
+```
+
+Partial coverage is fine: a stock present in the file uses it and gets
+`band_src=override`, `band_conf=confirmed`; a stock absent falls through to the
+normal chain. This makes reference data **pluggable as it arrives** instead of a
+precondition, and it is also how a single disputed case gets pinned for a
+re-run.
 
 ---
 
@@ -347,6 +363,8 @@ counters plus the finding rows, and drops the split rows.
 --start --end        date range (required)
 --country            restrict to one market; blank for all
 --checks             comma list of rule/detector ids, or 'all' (default)
+--band-file          CSV of known bands that overrides every computed layer
+                     (§3.3); partial coverage is fine
 --pin-mins           minimum pin duration before the no-split family fires
                      (default 5)
 --approach-pct       band proximity for LULD_APPROACH_BACKOFF (default 1.0)
@@ -440,3 +458,89 @@ one-line change that reverses it.
 6. **Markets without a rule are `RULE_UNKNOWN`, not a pass.** Indonesia, China,
    Taiwan and India short sells are blank on the sheet; counting them as
    compliant would be the worst available answer.
+
+---
+
+## 11. What is missing to get every band exactly right
+
+Ordered by value per unit of effort. The script ships useful without any of
+these — §3.1 already reports `assumed` and suppresses `contradicted` rather than
+guessing — but each one converts a market from approximate to exact.
+
+### 11.1 One `target_stock` sample (cheapest, removes the most gaps)
+
+Twenty rows spanning the nine markets, all 94 columns. Several columns look like
+they answer band questions directly and cannot be decoded from a name alone:
+
+| column | what it would settle |
+|---|---|
+| `segment` | board membership — STAR / ChiNext / KOSPI / KOSDAQ / KONEX / main. Settles the §1.1 corrections for CN and KR outright. |
+| `ipo`, `newtkr` | listing age — CN day-one has no limit, TW has none for 5 days |
+| `stype`, `etf`, `preferred` | security type — ETFs and preferreds carry different bands in CN, KR and JP |
+| `tstbl`, `tsid` | the **tick size table id**. Confirmed: `Stock.java` emits `\|tstbl:` from `_ticksizetableid`, and `kdb/load_ticksizeids.q` loads these per sym. Using the real grid instead of the scalar `ticksize` makes inward rounding exact. |
+| `orgclose` vs `adjclose` | which one an exchange uses as base after a corporate action — currently `orgclose^adjclose`, which is a guess |
+| `mrp`, `p2c`, `mos`, `tac` | unknown; may be relevant, may not |
+
+### 11.2 The engine's own price-limit rule (the exact answer)
+
+`Stock.java` holds an **`IFCPriceLimit`** per stock:
+
+```java
+public interface IFCPriceLimit {
+    String   id();
+    double[] priceLimits(IFCStock, OrderSideType, IFCQuote, double);
+    boolean  fromFeed();
+}
+```
+
+and `Stock.toString()` emits `|pricelimit:<id>|dn:<limitdn>|up:<limitup>`.
+
+This is the band the algo is actually held to, per stock, and `fromFeed()` says
+whether it came off the feed or was computed by a rule. The implementations are
+in an external jar not present in the `ai3` slice, and the per-stock assignment
+lives in the security master.
+
+**An export of the price-limit rule table plus its per-stock assignment would
+make the band exact for all nine markets at once**, and would change the question
+from "does the algo match the exchange's rule" — which is what this script can
+currently ask — to "does the algo match its own configured rule", which is the
+more useful one, since a mis-assigned `pricelimit` id is itself a defect worth
+finding.
+
+### 11.3 Genuinely external — no derivation exists
+
+| market | missing | why it cannot be derived |
+|---|---|---|
+| **India** | per-scrip circuit filters (2 / 5 / 10 / 20%) | assigned per scrip by the exchange; F&O names carry no individual filter at all, only a flexible 10% dynamic band. Nothing in `target_stock` implies which. **Hard blocker for IN.** |
+| **Indonesia** | IDX auto-rejection tiers + effective dates | a price-tier step table, revised repeatedly and asymmetric in some periods. Needs the rule set *and* when each version applied. |
+| **China** | ST / \*ST status (±5%) | carried in the stock **name**, not the code. No prefix implies it. |
+| **Korea** | 투자경고 / 투자위험 designations | exchange-assigned, changes intraday. Rarer, so lower priority. |
+
+These are exactly what `--band-file` (§3.3) exists for. India and Indonesia
+report as `RULE_UNKNOWN` until it is supplied.
+
+### 11.4 Solvable here, with work
+
+- **Japan expanded limits.** A name that closed at the band on a special quote
+  gets a widened limit the next day. This is derivable: read the **previous
+  session's** `qatt`, and if its close sat at the computed band edge, widen
+  today's band by the expansion rule. Needs one extra qatt query per date and the
+  exact expansion schedule. Until then, §3.1 catches these as `contradicted` and
+  suppresses them — safe, but it means JP coverage is thinnest on the most
+  volatile names.
+- **SQ days.** Derivable from a calendar — the second Friday of each month.
+- **Dynamic / intraday bands (TH, MY).** Both markets run a narrower intraday
+  band alongside the static ±30%. The static check is correct as far as it goes,
+  but breaches of the dynamic band are invisible to it. Scoping this needs the
+  dynamic rule per market.
+
+### 11.5 What ships without any of the above
+
+Exact: **Korea, Malaysia, Thailand, Taiwan, China main board** — a percentage of
+a previous close we can read, rounded to a grid we have.
+
+Approximate but honest: **Japan** — the step table is right for ordinary names
+and `contradicted` catches the expanded ones.
+
+Unverifiable and reported as such: **India, Indonesia**, plus CN ST names and KR
+KONEX until §11.1 or §11.3 lands.
