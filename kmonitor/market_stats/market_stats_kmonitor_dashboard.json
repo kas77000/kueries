@@ -1,0 +1,254 @@
+{
+  "kind": "kdbmonitor-export",
+  "version": 2,
+  "exported_at": null,
+  "connections": [],
+  "alerts": [],
+  "dashboards": [
+    {
+      "id": null,
+      "name": "Market Statistics",
+      "description": "Price, Volatility, Spread, Volume, Trade Size and Quote Size for one APAC market over a date range - per 10 minute bucket or per date, in shares or USD notional. Market wide: the universe is every name on the feed carrying the country suffix, not an index. Source of truth is market_stats_kmonitor.q; regenerate this file with build_dashboard.py rather than editing it.",
+      "group": "Market structure",
+      "refresh_secs": 60,
+      "periods": "both",
+      "orientation": "landscape",
+      "source": "kdb",
+      "time_context": {
+        "mode": "realtime"
+      },
+      "parameters": [
+        {
+          "name": "country",
+          "label": "Market",
+          "kind": "choice",
+          "choices": [
+            "AU",
+            "JP",
+            "HK",
+            "IN"
+          ],
+          "dataset": "",
+          "column": "",
+          "default": "HK",
+          "q_type": "symbol",
+          "help": "Add more suffixes to .ms.mkt in the queries file first.",
+          "required": true,
+          "pattern": "",
+          "pattern_message": "",
+          "minimum": "",
+          "maximum": "",
+          "integer": false,
+          "weekdays_only": false
+        },
+        {
+          "name": "unit",
+          "label": "Volume unit",
+          "kind": "choice",
+          "choices": [
+            "shares",
+            "notional"
+          ],
+          "dataset": "",
+          "column": "",
+          "default": "shares",
+          "q_type": "symbol",
+          "help": "Changes what Volume, Trade Size and Quote Size mean. Price, Volatility and Spread are always bps.",
+          "required": true,
+          "pattern": "",
+          "pattern_message": "",
+          "minimum": "",
+          "maximum": "",
+          "integer": false,
+          "weekdays_only": false
+        },
+        {
+          "name": "view",
+          "label": "View",
+          "kind": "choice",
+          "choices": [
+            "intraday",
+            "daily"
+          ],
+          "dataset": "",
+          "column": "",
+          "default": "intraday",
+          "q_type": "symbol",
+          "help": "intraday is one bar per 10 minutes; daily is one bar per date, computed over the whole day rather than averaged from the buckets.",
+          "required": true,
+          "pattern": "",
+          "pattern_message": "",
+          "minimum": "",
+          "maximum": "",
+          "integer": false,
+          "weekdays_only": false
+        }
+      ],
+      "datasets": [
+        {
+          "name": "fx",
+          "env": "OMS",
+          "time_mode": "inherit",
+          "time_context": null,
+          "mode": "raw",
+          "table": "",
+          "filters": [],
+          "raw_qsql": "/ fxlast per name, for the notional unit.  Empty and unused for shares - the\n/ query still runs, it just returns nothing to join.\n{[ctry]\n  sfx:\"*.\",string ctry;\n  select fxlast:last fxlast by date,sym from target_stock\n    where {{#historical}}date within ({{date_from}};{{date_to}}){{/historical}}{{#realtime}}date=.z.D{{/realtime}},\n      sym like sfx, fxlast>0\n }[{{param:country}}]",
+          "extra_connections": [],
+          "transforms": [],
+          "max_rows": 5000,
+          "static": false,
+          "source": "kdb",
+          "shape": null,
+          "file_label": ""
+        },
+        {
+          "name": "stats",
+          "env": "QUOTES",
+          "time_mode": "inherit",
+          "time_context": null,
+          "mode": "raw",
+          "table": "",
+          "filters": [],
+          "raw_qsql": "/ One row per bucket (intraday) or per date (daily), market wide.\n{[ctry;unit;view;fx]\n  / EVERY qatt ROW IS A TRANSACTION carrying the prevailing quote alongside it -\n  / there are no quote-only rows - so one scan yields all six metrics and the\n  / quote metrics are measured AT EXECUTION.  typ is unused: it holds \"U\" before\n  / the open and is empty for the session.\n  sfx:\"*.\",string ctry;\n  intraday:view=`intraday;\n  / shares -> plain mean across names; notional -> volume weighted\n  wgt:unit=`notional;\n  / auction vs continuous by the CLOCK.  ALL IN HKT, which is what qatt`time is;\n  / the comment gives each exchange's own local time.  Keep in step with .ms.sess\n  / in queries/market_stats/market_stats.q - the same table written twice.\n  /   AU 10:10/16:10 Sydney AEST    JP 09:00/15:25 Tokyo\n  /   HK 09:29/16:00 local          IN 09:15 Mumbai, 23:59 = no closing auction\n  base:(`AU`JP`HK`IN!((08:10;14:10);(08:00;14:25);(09:29;16:00);(11:45;23:59)))ctry;\n  / Sydney runs AEDT from the first Sunday in October to the first Sunday in\n  / April and Hong Kong never does, so AU shifts an hour twice a year.  kdb\n  / dates count from 2000.01.01, a Saturday, so date mod 7 is 1 on a Sunday.\n  fsun:{x+(1-x mod 7)mod 7};\n  sessOn:{[base;ctry;fsun;d]\n    y:string `year$d;\n    $[(ctry=`AU)&(d>=fsun \"D\"$y,\".10.01\")|d<fsun \"D\"$y,\".04.01\"; base-01:00; base]\n   }[base;ctry;fsun];\n  t:select date,time,sym,price,size,qbid,qask,qbsize,qasize from qatt\n    where {{#historical}}date within ({{date_from}};{{date_to}}), {{/historical}}\n      sym like sfx, price>0, size>0;\n  {{#realtime}}t:update date:.z.D from t;{{/realtime}}\n  t:update bkt:$[intraday;00:10 xbar time;00:00] from t;\n  fx:$[unit=`shares; ([] date:0#0Nd; sym:0#`; fxlast:0#0n); 0!fx];\n  fxd:$[count fx; med exec fxlast from fx; 1f];\n  t:update fxlast:fxd^fxlast from t lj `date`sym xkey fx;\n  t:update qty:$[unit=`shares; \"f\"$size; size*price*fxlast] from t;\n  t:update qqty:$[unit=`shares;0.5*\"f\"$qbsize+qasize;\n      0.5*fxlast*(qbsize*qbid)+qasize*qask] from t;\n  t:update spr:10000*(qask-qbid)%0.5*qask+qbid from t;\n  / bounds resolved PER DATE, so a range crossing the switch is right either side\n  dd:asc exec distinct date from t;\n  sb:sessOn each dd;\n  t:t lj `date xkey ([] date:dd; sopen:sb[;0]; sclose:sb[;1]);\n  t:update auction:(time<=sopen)|time>=sclose from t;\n  / ordered before prev, so a return is against the previous TRADE\n  t:`date`sym`time xasc t;\n  t:update ret:10000*(price%prev price)-1 by date,sym from t;\n  ps:0!select px:10000*((last price)%first price)-1, vol:dev ret,\n      spread:avg spr, tsz:avg qty, qsz:avg qqty, w:sum qty, ntrd:count i,\n      vcont:sum qty*not auction, vauct:sum qty*auction\n    by date,bkt,sym from t;\n  / volume sums; the rest are means over names, volume weighted for notional\n  r:0!select price_bps:$[wgt; w wavg px; avg px],\n      volatility_bps:$[wgt; w wavg vol; avg vol],\n      spread_bps:$[wgt; w wavg spread; avg spread],\n      trade_size:$[wgt; w wavg tsz; avg tsz],\n      quote_size:$[wgt; w wavg qsz; avg qsz],\n      volume_cont:sum vcont, volume_auct:sum vauct,\n      n_syms:count distinct sym, n_trades:sum ntrd\n    by date,bkt from ps;\n  r:update volume:volume_cont+volume_auct from r;\n  r:`date`bkt xasc r;\n  / one x axis column for both views, so the charts never change shape\n  r:update label:`$$[intraday; 5#'string bkt; string date] from r;\n  select label, date, price_bps, volatility_bps, spread_bps,\n      volume, volume_cont, volume_auct, trade_size, quote_size,\n      n_syms, n_trades\n    from r\n }[{{param:country}};{{param:unit}};{{param:view}};{{table:fx}}]",
+          "extra_connections": [],
+          "transforms": [],
+          "max_rows": 5000,
+          "static": false,
+          "source": "kdb",
+          "shape": null,
+          "file_label": ""
+        }
+      ],
+      "rows": [
+        {
+          "widgets": [
+            {
+              "type": "bar",
+              "dataset": "stats",
+              "title": "Price",
+              "spec": {
+                "x": "label",
+                "y": "price_bps"
+              },
+              "width": 1.0
+            },
+            {
+              "type": "bar",
+              "dataset": "stats",
+              "title": "Volatility",
+              "spec": {
+                "x": "label",
+                "y": "volatility_bps"
+              },
+              "width": 1.0
+            },
+            {
+              "type": "bar",
+              "dataset": "stats",
+              "title": "Spread",
+              "spec": {
+                "x": "label",
+                "y": "spread_bps"
+              },
+              "width": 1.0
+            }
+          ],
+          "height_in": 2.9,
+          "gap_above_in": 0.15,
+          "col_gap_in": 0.15
+        },
+        {
+          "widgets": [
+            {
+              "type": "bar",
+              "dataset": "stats",
+              "title": "Volume",
+              "spec": {
+                "x": "label",
+                "y": "volume"
+              },
+              "width": 1.0
+            },
+            {
+              "type": "bar",
+              "dataset": "stats",
+              "title": "Trade Size",
+              "spec": {
+                "x": "label",
+                "y": "trade_size"
+              },
+              "width": 1.0
+            },
+            {
+              "type": "bar",
+              "dataset": "stats",
+              "title": "Quote Size",
+              "spec": {
+                "x": "label",
+                "y": "quote_size"
+              },
+              "width": 1.0
+            }
+          ],
+          "height_in": 2.9,
+          "gap_above_in": 0.15,
+          "col_gap_in": 0.15
+        },
+        {
+          "widgets": [
+            {
+              "type": "table",
+              "dataset": "stats",
+              "title": "Values, including the continuous / auction split",
+              "spec": {
+                "columns": [
+                  "label",
+                  "price_bps",
+                  "volatility_bps",
+                  "spread_bps",
+                  "volume",
+                  "volume_cont",
+                  "volume_auct",
+                  "trade_size",
+                  "quote_size",
+                  "n_syms",
+                  "n_trades"
+                ],
+                "labels": {
+                  "label": "",
+                  "price_bps": "Price (bps)",
+                  "volatility_bps": "Vol (bps)",
+                  "spread_bps": "Spread (bps)",
+                  "volume": "Volume",
+                  "volume_cont": "Continuous",
+                  "volume_auct": "Auction",
+                  "trade_size": "Trade size",
+                  "quote_size": "Quote size",
+                  "n_syms": "Names",
+                  "n_trades": "Trades"
+                },
+                "formats": {
+                  "price_bps": ",.1f",
+                  "volatility_bps": ",.1f",
+                  "spread_bps": ",.2f",
+                  "volume": ",.0f",
+                  "volume_cont": ",.0f",
+                  "volume_auct": ",.0f",
+                  "trade_size": ",.0f",
+                  "quote_size": ",.0f",
+                  "n_syms": ",.0f",
+                  "n_trades": ",.0f"
+                }
+              },
+              "width": 1.0
+            }
+          ],
+          "height_in": 3.4,
+          "gap_above_in": 0.15,
+          "col_gap_in": 0.0
+        }
+      ]
+    }
+  ]
+}
