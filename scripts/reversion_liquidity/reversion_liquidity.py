@@ -50,6 +50,12 @@ ask for one day or a whole quarter.  See test_chunking_is_exact().
 A VENUE IS DARK when its name contains DARK or DRK, matched case insensitively.
 Identical to dark_summary.q and dark_routed_executed.q, so the three agree by
 construction rather than by coincidence.
+
+VENUES ARE GROUPED BY THE VENUE SHEET, not by their kdb symbol.  Several
+symbols can be one pool - CENTREPOINT_DARK and CENTREPOINT_CITI_DARK are both
+Centrepoint - and the report's tables name the pool, not the route into it.
+VENUE_GROUPS below is that sheet.  Edit it; it is the only thing that decides
+which rows share a line.
 =============================================================================
 """
 
@@ -83,6 +89,63 @@ _PLACEHOLDER = "CHANGEME"
 
 
 # -----------------------------------------------------------------------------
+# THE VENUE SHEET.  Edit this.
+#
+# (country, kdb venue) -> (name for the tables, short name for the pies)
+#
+# Several kdb symbols can be one pool, and the report names the pool: 3.1 and
+# 3.3 both say "Centrepoint" where our workorder table says CENTREPOINT_DARK
+# for one route into it and CENTREPOINT_CITI_DARK for another.  Every figure in
+# both tables is computed on the GROUP, so the two arrive as one row with one
+# notional, one spread and one reversion.
+#
+# Keyed on the country too, because the sheet is: JPMAP_DARK is JPMX in JP and
+# HK, while in AU the same pool is reached as JPMAP_MF_DARK.  A venue-name-only
+# table could not say that.
+#
+# The second name is the pie label - shorter, because a pie slice has no room -
+# and is used by scripts/dark_routed_executed, not here.  It is carried anyway
+# so the sheet is transcribed once.
+#
+# The sheet also has a "type" column, "Midpoint dark" on every row.  This
+# script only ever sees dark venues, so it is not a key.
+#
+# A pair that is NOT here keeps its raw kdb symbol as its row label and is
+# named on stdout just above the tables.  Nothing is dropped and nothing is
+# merged into the wrong pool by guessing.
+# -----------------------------------------------------------------------------
+
+VENUE_GROUPS = {
+    ("JP", "CITI_DARK"):             ("Citi",        "Citi"),
+    ("JP", "DAIWA_DARK"):            ("Daiwa",       "DAIWA"),
+    ("JP", "JPMAP_DARK"):            ("JPMX",        "JPMX"),
+    ("JP", "LNAL_DARK"):             ("LNAL",        "Liqnet"),
+    ("JP", "MS_DARK"):               ("MS Pool",     "MSPL"),
+    ("JP", "NOM_DARK"):              ("Nomura",      "Nomura"),
+    ("JP", "POSITNOW_DARK"):         ("Posit",       "Posit"),
+
+    ("HK", "CITI_DARK"):             ("Citi",        "Citi"),
+    ("HK", "CLSA_DARK"):             ("CLSA",        "CLSA"),
+    ("HK", "INSTINET_DARK"):         ("Instinet",    "Instnet"),
+    ("HK", "JPMAP_DARK"):            ("JPMX",        "JPMX"),
+    ("HK", "MS_DARK"):               ("MS Pool",     "MSPL"),
+    ("HK", "POSITNOW_DARK"):         ("Posit",       "Posit"),
+
+    # the published pie labels this slice Ctrpnt; the sheet says CentrePt and
+    # the sheet is what we follow
+    ("AU", "CENTREPOINT_CITI_DARK"): ("Centrepoint", "CentrePt"),
+    ("AU", "CENTREPOINT_DARK"):      ("Centrepoint", "CentrePt"),
+    ("AU", "CLSA_DARK"):             ("CLSA",        "CLSA"),
+    ("AU", "JPMAP_MF_DARK"):         ("JPMX",        "JPMX"),
+    ("AU", "MS_DARK"):               ("MS Pool",     "MSPL"),
+    ("AU", "POSITNOW_DARK"):         ("Posit",       "Posit"),
+}
+
+# the column the accumulators are grouped on, once the sheet has been applied
+GROUP_COL = "venue_group"
+
+
+# -----------------------------------------------------------------------------
 # q sources.  Sent as text + typed args; see module docstring.
 # -----------------------------------------------------------------------------
 
@@ -110,7 +173,8 @@ Q_FILLS = """
   x:select date,id_server,id_target,adv,fxlast,country
     from target_stock where date=d, id_target in ids;
   x:$[0=count ctry; x; select from x where country=`$ctry];
-  x:`date`id_server`id_target xkey delete country from x;
+  / country is KEPT, not deleted: the venue sheet is keyed on (country,venue)
+  x:`date`id_server`id_target xkey x;
   w:w ij x;
   wk:exec distinct id_work from w;
   e:select date,id_server,id_work,sym,fillprice,fillsize,sidesign,
@@ -118,10 +182,10 @@ Q_FILLS = """
     from execution
     where date=d, id_work in wk, fillsize>0;
   k:`date`id_server`id_work xkey
-    select date,id_server,id_work,venue,adv,fxlast from w;
+    select date,id_server,id_work,venue,country,adv,fxlast from w;
   f:e ij k;
   f:update tm:time^t_oes_xact from f;
-  `sym`tm xasc select date,sym,tm,venue,fillprice,fillsize,sidesign,
+  `sym`tm xasc select date,sym,tm,venue,country,fillprice,fillsize,sidesign,
       adv,fxlast,bidprice,askprice from f
  }
 """
@@ -150,7 +214,8 @@ Q_CHILD = """
   x:select date,id_server,id_target,fxlast,country
     from target_stock where date=d, id_target in ids;
   x:$[0=count ctry; x; select from x where country=`$ctry];
-  x:`date`id_server`id_target xkey delete country from x;
+  / country is KEPT, and grouped on below, so the sheet can be applied here too
+  x:`date`id_server`id_target xkey x;
   w:w ij x;
   w:update px_routed:transmit_lastprice^?[price>0;price;0n] from w;
   w:update notional_routed:size*px_routed*fxlast from w;
@@ -166,7 +231,7 @@ Q_CHILD = """
       fr_wnum:sum ?[ok;notional_routed*fill_pct;0f],
       duration_sum:sum dur,
       duration_n:sum not null dur
-    by venue from w
+    by country,venue from w
  }
 """
 
@@ -313,6 +378,47 @@ def fetch_day(ho, hq, day, country):
 
 
 # -----------------------------------------------------------------------------
+# Applying the venue sheet
+#
+# The two frames coming back from kdb carry the raw symbol and the country;
+# everything downstream works on the GROUP.  Both functions read the sheet and
+# neither mutates it, so the mapping is a pure lookup that the self-test can
+# exercise without a connection.
+# -----------------------------------------------------------------------------
+
+def venue_labels(df):
+    """The display group for every row of a fill or child frame.
+
+    A (country, venue) pair the sheet does not carry keeps its raw kdb symbol,
+    so a venue nobody has added yet is still its own row - visible, in the
+    right total, and obviously un-prettified - rather than vanishing or landing
+    in somebody else's pool.  unmapped_venues() names them.
+
+    A frame with no country column maps on ("", venue), which no sheet row
+    matches, so it falls through to the raw name.  That is what lets the
+    synthetic frames in the self-test stay independent of the sheet's
+    contents."""
+    venue = df["venue"].astype(str)
+    country = (df["country"].astype(str) if "country" in df.columns
+               else pd.Series("", index=df.index, dtype=object))
+    labels = [VENUE_GROUPS.get((c, v), (v, v))[0] for c, v in zip(country, venue)]
+    return pd.Series(labels, index=df.index, name=GROUP_COL)
+
+
+def unmapped_venues(df):
+    """The (country, venue) pairs in this frame that the sheet does not carry.
+
+    Collected per day and reported once, so a quarter of dates does not print
+    the same missing venue ninety times."""
+    if len(df) == 0 or "venue" not in df.columns:
+        return set()
+    venue = df["venue"].astype(str)
+    country = (df["country"].astype(str) if "country" in df.columns
+               else pd.Series("", index=df.index, dtype=object))
+    return {p for p in zip(country, venue) if p not in VENUE_GROUPS}
+
+
+# -----------------------------------------------------------------------------
 # Per fill metrics
 # -----------------------------------------------------------------------------
 
@@ -406,8 +512,8 @@ def fill_metrics(df, half_spread=False):
 
 
 def aggregate_fills(df):
-    """Fold one day of fills into per venue sums (index = venue)."""
-    g = df.groupby("venue", dropna=False)
+    """Fold one day of fills into per group sums (index = the sheet's name)."""
+    g = df.assign(**{GROUP_COL: venue_labels(df)}).groupby(GROUP_COL, dropna=False)
     out = g.agg(
         notional=("notional", "sum"),
         n_fill=("notional", "size"),
@@ -435,10 +541,17 @@ def aggregate_fills(df):
 
 
 def aggregate_child(df):
-    """Reindex the child order roll onto venue and drop to the sum columns."""
+    """Fold the child order roll onto the group and drop to the sum columns.
+
+    q returns this roll one row per (country, venue), so a group built out of
+    two symbols arrives as TWO rows.  They have to be summed: indexing on the
+    group instead would keep whichever row landed last and silently halve the
+    group's orders, its routed notional and the weights under its fill rate."""
     if len(df) == 0:
         return pd.DataFrame(columns=CHILD_ACC, dtype=float)
-    out = df.set_index("venue")
+    out = df.assign(**{GROUP_COL: venue_labels(df)})
+    cols = [c for c in CHILD_ACC if c in out.columns]
+    out = out.groupby(GROUP_COL, dropna=False)[cols].sum()
     return out.reindex(columns=CHILD_ACC).astype(float)
 
 
@@ -1036,6 +1149,7 @@ def run(args):
 
     log("")
     fill_acc, child_acc, kept = None, None, []
+    unmapped = set()
     n_ok = n_empty = n_failed = n_fills = 0
     t_run = time.perf_counter()
     for i, day in enumerate(days, start=1):
@@ -1047,6 +1161,7 @@ def run(args):
             n_failed += 1
             log(f"{tag}  FAILED - {exc}")
             continue
+        unmapped |= unmapped_venues(child)
         child_acc = fold(child_acc, aggregate_child(child))
         took = time.perf_counter() - t0
         if len(fills) == 0:
@@ -1056,6 +1171,7 @@ def run(args):
             continue
         n_ok += 1
         n_fills += len(fills)
+        unmapped |= unmapped_venues(fills)
         m = fill_metrics(fills, half_spread=args.half_spread)
         fill_acc = fold(fill_acc, aggregate_fills(m))
         if args.keep_fills:
@@ -1084,6 +1200,12 @@ def run(args):
     print(f"\nDark venues {args.start} to {args.end}"
           + (f", country {args.country}" if args.country else "")
           + (", half-spread normalised" if args.half_spread else ""))
+    if unmapped:
+        print(f"\n  {len(unmapped)} venue(s) are not in VENUE_GROUPS, so they keep "
+              f"their raw kdb name below.\n  Add them to the sheet near the top "
+              f"of this script to group them:")
+        for c, v in sorted(unmapped):
+            print(f'    ("{c}", "{v}"):')
     print("\nTable 3.1: Liquidity\n")
     print(render_liquidity(liquidity))
     print("\nTable 3.3: Venue tiering on 1s reversion and quote stability\n")
@@ -1212,8 +1334,12 @@ def test_kmeans_matches_brute_force():
     assert abs(cost) < 1e-12
 
 
-def _synth_fills(rng, n, venues):
-    """A fill frame with the awkward cases deliberately present."""
+def _synth_fills(rng, n, venues, country=None):
+    """A fill frame with the awkward cases deliberately present.
+
+    country defaults to absent, not blank: a frame with no country column maps
+    through the raw-name fallback, so the tests that predate the venue sheet
+    keep asserting on the names they pass in."""
     v = rng.choice(venues, n)
     bid0 = np.round(rng.uniform(10, 11, n), 2)
     ask0 = bid0 + np.round(rng.choice([0.01, 0.02, 0.05], n), 2)
@@ -1228,6 +1354,8 @@ def _synth_fills(rng, n, venues):
         "fxlast": np.full(n, 0.65),
         "qbid0": bid0, "qask0": ask0, "qbid1": bid1, "qask1": ask1,
     })
+    if country is not None:
+        df["country"] = country
     # a crossed quote: unusable for reversion, still usable for stability
     df.loc[0, "qask0"] = df.loc[0, "qbid0"] - 0.01
     # a missing post-quote: unusable for both
@@ -1538,6 +1666,125 @@ def test_pdf_is_written():
     assert blob[:5] == b"%PDF-", blob[:16]
     assert b"/Pages" in blob
     assert len(blob) > 2000, len(blob)
+
+
+def test_venue_sheet_is_consistent():
+    """The sheet is hand typed off a screenshot, so its shape is checked here
+    rather than trusted.
+
+    ONE SHORT CODE PER NAME is the one that matters beyond tidiness:
+    scripts/dark_routed_executed labels pie slices with the short code, so a
+    pool spelled two ways would draw as two slices of a pie that has one."""
+    short_of = {}
+    for key, val in VENUE_GROUPS.items():
+        assert isinstance(key, tuple) and len(key) == 2, key
+        country, venue = key
+        assert country.isalpha() and country == country.upper(), key
+        assert venue == venue.upper(), key
+        # both scripts only ever see venues matching this, so a typo here is a
+        # row that can never match anything
+        assert ("DARK" in venue) or ("DRK" in venue), key
+        assert len(val) == 2, (key, val)
+        name, short = val
+        assert name and short, (key, val)
+        assert short_of.setdefault(name, short) == short, (
+            f"{name} has two short codes: {short_of[name]} and {short}")
+
+
+def test_venues_in_one_group_become_one_row():
+    """CENTREPOINT_DARK and CENTREPOINT_CITI_DARK are two routes into one pool,
+    and the report shows one Centrepoint row.  Its notional has to be the sum
+    of both, not one of them."""
+    rng = np.random.default_rng(8)
+    a = _synth_fills(rng, 60, ["CENTREPOINT_DARK"], country="AU")
+    b = _synth_fills(rng, 40, ["CENTREPOINT_CITI_DARK"], country="AU")
+    acc = aggregate_fills(fill_metrics(pd.concat([a, b], ignore_index=True)))
+    assert list(acc.index) == ["Centrepoint"], list(acc.index)
+    assert acc.loc["Centrepoint", "n_fill"] == 100
+    apart = sum(aggregate_fills(fill_metrics(d))["notional"].sum() for d in (a, b))
+    assert abs(acc.loc["Centrepoint", "notional"] - apart) < 1e-6
+    # and %Notional is still the whole book, so one group alone is all of it
+    liq = build_liquidity(acc, pd.DataFrame(columns=CHILD_ACC, dtype=float))
+    assert abs(liq.loc["Centrepoint", "%Notional"] - 100.0) < 1e-12
+
+
+def test_the_sheet_is_keyed_on_country():
+    """JPMAP_DARK is JPMX in JP and in HK; in AU the same pool is reached as
+    JPMAP_MF_DARK.  All three are one row, and neither spelling maps in the
+    other's country - which is the whole reason the key is a pair."""
+    rng = np.random.default_rng(9)
+    df = pd.concat([_synth_fills(rng, 10, ["JPMAP_DARK"], country="JP"),
+                    _synth_fills(rng, 10, ["JPMAP_DARK"], country="HK"),
+                    _synth_fills(rng, 10, ["JPMAP_MF_DARK"], country="AU")],
+                   ignore_index=True)
+    assert list(aggregate_fills(fill_metrics(df)).index) == ["JPMX"]
+    crossed = pd.DataFrame({"country": ["JP", "AU"],
+                            "venue": ["JPMAP_MF_DARK", "JPMAP_DARK"]})
+    assert list(venue_labels(crossed)) == ["JPMAP_MF_DARK", "JPMAP_DARK"]
+    assert unmapped_venues(crossed) == {("JP", "JPMAP_MF_DARK"),
+                                        ("AU", "JPMAP_DARK")}
+
+
+def test_unmapped_venue_keeps_its_kdb_name():
+    """A venue the sheet has not caught up with must stay visible under its own
+    symbol.  Silently dropping it would take it out of %Notional too, so every
+    other row would quietly grow."""
+    rng = np.random.default_rng(10)
+    df = _synth_fills(rng, 20, ["BRAND_NEW_DARK"], country="AU")
+    acc = aggregate_fills(fill_metrics(df))
+    assert list(acc.index) == ["BRAND_NEW_DARK"], list(acc.index)
+    assert unmapped_venues(df) == {("AU", "BRAND_NEW_DARK")}
+    known = _synth_fills(rng, 5, ["MS_DARK"], country="AU")
+    assert unmapped_venues(known) == set()
+    assert list(aggregate_fills(fill_metrics(known)).index) == ["MS Pool"]
+
+
+def test_child_rows_sum_within_a_group():
+    """The child roll comes back one row per (country, venue), so a two venue
+    group arrives as two rows.  Indexing on the group instead of summing would
+    keep whichever landed last and halve the group's orders and weights."""
+    child = pd.DataFrame({
+        "country": ["AU", "AU"],
+        "venue": ["CENTREPOINT_DARK", "CENTREPOINT_CITI_DARK"],
+        "orders": [10.0, 30.0],
+        "routed_notional": [1000.0, 3000.0],
+        "fr_wsum": [1000.0, 3000.0],
+        "fr_wnum": [20000.0, 30000.0],
+        "duration_sum": [100.0, 200.0],
+        "duration_n": [10.0, 30.0],
+    })
+    acc = aggregate_child(child)
+    assert list(acc.index) == ["Centrepoint"], list(acc.index)
+    assert acc.loc["Centrepoint", "orders"] == 40.0
+    assert acc.loc["Centrepoint", "routed_notional"] == 4000.0
+
+    rng = np.random.default_rng(11)
+    f = aggregate_fills(fill_metrics(pd.concat(
+        [_synth_fills(rng, 20, ["CENTREPOINT_DARK"], country="AU"),
+         _synth_fills(rng, 20, ["CENTREPOINT_CITI_DARK"], country="AU")],
+        ignore_index=True)))
+    liq = build_liquidity(f, acc)
+    # notional weighted across BOTH venues: 50,000 / 4,000
+    assert abs(liq.loc["Centrepoint", "Fill Rate"] - 12.5) < 1e-9
+    # and duration is the pooled mean: 300 seconds over 40 orders
+    assert abs(liq.loc["Centrepoint", "Duration"] - 7.5) < 1e-9
+
+
+def test_grouping_is_exact_under_chunking():
+    """Grouping must not break the accumulator's day by day property: the sheet
+    is applied per day, so two venues in one group have to fold together the
+    same way whether they arrive on the same date or on different ones."""
+    rng = np.random.default_rng(12)
+    days = [_synth_fills(rng, 40, ["CENTREPOINT_DARK", "CENTREPOINT_CITI_DARK",
+                                   "MS_DARK"], country="AU") for _ in range(5)]
+    chunked = None
+    for d in days:
+        chunked = fold(chunked, aggregate_fills(fill_metrics(d)))
+    one_pass = aggregate_fills(fill_metrics(pd.concat(days, ignore_index=True)))
+    chunked, one_pass = chunked.sort_index(), one_pass.sort_index()
+    assert list(chunked.index) == ["Centrepoint", "MS Pool"], list(chunked.index)
+    for c in FILL_ACC:
+        assert np.allclose(chunked[c], one_pass[c], rtol=1e-12, atol=1e-9), c
 
 
 def self_test():

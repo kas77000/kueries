@@ -77,6 +77,57 @@ It reads `target_stock.country`. If that column is sparse, or spells markets
 differently from the exchange suffix on `sym`, `--country` matches nothing and
 every date is silently empty — the diagnostic is what tells you so.
 
+## The venue sheet
+
+A row of these tables is a **pool**, not a kdb symbol. `VENUE_GROUPS`, near the
+top of the script, is what says which is which — it maps **(country, kdb
+venue)** onto **(name for the tables, short name for the pies)**:
+
+```python
+("AU", "CENTREPOINT_DARK"):      ("Centrepoint", "CentrePt"),
+("AU", "CENTREPOINT_CITI_DARK"): ("Centrepoint", "CentrePt"),
+```
+
+The report's table 3.1 has one **Centrepoint** row at 88.6% where our
+`workorder` table has `CENTREPOINT_DARK` for one route into the pool and
+`CENTREPOINT_CITI_DARK` for another. Every figure in both tables — notional,
+spread, reversion, tier — is computed on the **group**, so the two arrive as
+one row rather than two half-sized ones.
+
+The key is a **pair** because the sheet is keyed that way: `JPMAP_DARK` is JPMX
+in JP and in HK, while in AU the same pool is reached as `JPMAP_MF_DARK`. A
+venue-name-only table could not say that. `country` therefore travels out of
+`target_stock` alongside `adv` and `fxlast` instead of being dropped after the
+join, and `Q_CHILD` aggregates `by country,venue`.
+
+The second name is a pie label and is unused here; it belongs to
+[`scripts/dark_routed_executed`](../dark_routed_executed/README.md), which
+carries **its own copy of this same sheet**. Each script folder stands on its
+own, so **a new venue has to be added in both.**
+`test_venue_sheet_is_consistent` in each script checks its own copy's shape —
+one short code per name, every venue actually dark — but nothing checks the two
+copies against each other.
+
+> The published pie labels the Centrepoint slice `Ctrpnt`; the sheet says
+> `CentrePt`, and the sheet is what this follows.
+
+### A venue that is not in the sheet
+
+Keeps its raw kdb symbol as its row label, and is named on **stdout**, above
+the tables, so `--quiet` cannot hide it:
+
+```
+  2 venue(s) are not in VENUE_GROUPS, so they keep their raw kdb name below.
+  Add them to the sheet near the top of this script to group them:
+    ("AU", "SOME_NEW_DARK"):
+    ("HK", "ANOTHER_DRK"):
+```
+
+Dropping it instead would take it out of `%Notional` too, so every other row
+would quietly grow; merging it by guesswork would put someone else's fills in a
+pool they did not trade in. Under its own `ALL_CAPS` name it is visible, in the
+right total, and obviously asking to be added.
+
 ## How the data is produced
 
 Nothing is computed over the whole range at once. The script walks **one date
@@ -125,7 +176,8 @@ between a correct fill count and a silently multiplied one.
 Those child orders are inner-joined to `target_stock` on
 `date,id_server,id_target` to pick up `adv`, `fxlast` and `country` — the inner
 join is also what applies `--country`, since a stock outside the filter simply
-has no row to match.
+has no row to match. `country` is **kept**, not dropped after the join: the
+venue sheet is keyed on `(country, venue)`, so it has to reach Python.
 
 Finally `execution` is pulled for those `id_work` values with `fillsize>0`, and
 joined back to get `venue`, `adv` and `fxlast` onto each fill. The fill
@@ -138,14 +190,15 @@ tm: time^t_oes_xact          / t_oes_xact, falling back to time
 `t_oes_xact` is the exchange transaction time. `time` is when the row landed in
 the OMS, which would smear the +1s lookup by the OMS latency.
 
-**Returns:** `date sym tm venue fillprice fillsize sidesign adv fxlast
+**Returns:** `date sym tm venue country fillprice fillsize sidesign adv fxlast
 bidprice askprice`, one row per fill, sorted by `sym,tm`.
 
 ### Step 2 — the child order roll (`Q_CHILD`, order server)
 
 `Fill Rate` and `Duration` are properties of a **child order**, not of a fill,
 so they are computed on a separate grain — and since they need no quotes, they
-are aggregated on the server and only one row per venue comes back.
+are aggregated on the server and only one row per `(country, venue)` comes
+back.
 
 ```q
 px_routed:       transmit_lastprice^?[price>0;price;0n]
@@ -161,6 +214,12 @@ orders that carry no usable limit.
 The weighted mean of `fill_pct` carries **its own weight sum** (`fr_wsum`)
 rather than reusing `routed_notional`, so a child order with no usable routed
 price cannot sit in a denominator it contributes no numerator to.
+
+Because the roll comes back one row per `(country, venue)`, a group built out
+of two symbols arrives as **two rows**, and `aggregate_child` sums them.
+Indexing on the group instead would keep whichever row landed last and halve
+the group's orders, its routed notional and the weights under its fill rate —
+`test_child_rows_sum_within_a_group` is there to catch that.
 
 ### Step 3 — the two quote lookups (`Q_QUOTES`, qatt server)
 
@@ -209,7 +268,8 @@ Collapsing them onto one `n` would quietly misweight one of the two z-scores;
 
 ### Step 5 — accumulate (`aggregate_fills`, `fold`)
 
-The day is grouped to per-venue sums and added into a running frame. Every
+The day is grouped to per-**pool** sums — the venue sheet is applied here, on
+the way in — and added into a running frame. Every
 accumulated column is a **plain sum**, so folding a day in is one frame
 addition:
 
@@ -237,7 +297,7 @@ a quarter, and a failure on day 40 of 60 has not discarded the first 39.
 ### Step 6 — Table 3.1 (`build_liquidity`)
 
 Pure division of the accumulated sums. This is where the two grains — fill and
-child order — finally meet, on venue.
+child order — finally meet, on the pool.
 
 | Column | From |
 | --- | --- |
@@ -389,18 +449,35 @@ were the part worth matching.
 python scripts/reversion_liquidity/reversion_liquidity.py --self-test
 ```
 
-Everything except the three q constants is pure Python and covered offline —
-the clustering against brute force, the chunking equivalence, the two separate
-fill populations, the weighted-mean denominators, and the Score arithmetic
-against the three published Bernstein rows. No kdb connection required, which
-matters because this is written on a machine that has none.
+23 tests. Everything except the three q constants is pure Python and covered
+offline — the clustering against brute force, the chunking equivalence, the two
+separate fill populations, the weighted-mean denominators, the venue grouping,
+and the Score arithmetic against the three published Bernstein rows. No kdb
+connection required, which matters because this is written on a machine that
+has none.
+
+The five that cover the venue sheet:
+
+- `test_venue_sheet_is_consistent` — one short code per name, every venue
+  actually dark, every country a bare upper-case code
+- `test_venues_in_one_group_become_one_row` — both Centrepoint symbols land in
+  one row whose notional is the sum of both
+- `test_the_sheet_is_keyed_on_country` — `JPMAP_DARK` maps in JP and HK but not
+  in AU, and `JPMAP_MF_DARK` the other way round
+- `test_unmapped_venue_keeps_its_kdb_name` — an unknown venue keeps its symbol,
+  stays in `%Notional`, and is reported
+- `test_child_rows_sum_within_a_group` — the two-row child roll sums instead of
+  overwriting, checked through `Fill Rate` and `Duration`
 
 The q half cannot be unit tested here, so it is checked by **reconciliation**
 against what already exists. For a single date:
 
 - executed notional per venue must equal `darkRoutedExecuted`'s
-  `notional_executed`
-- `%Notional` must equal its `pct_executed`
+  `notional_executed` — summed over the symbols in a pool, since the q does not
+  group
+- `%Notional` must equal its `pct_executed`, to a rounding: the q values a fill
+  as `make*avg_fill_price` per child order where this values it as
+  `fillsize*fillprice` per execution
 - a venue taking a much larger share of routed than executed notional must show
   a lower `Fill Rate`
 
