@@ -73,19 +73,46 @@ as deviations, not violations, precisely because that config is not in the data.
 
 ## 3. Where the band comes from
 
-Three layers, best first, plus an operator-supplied override (§3.3). Every
+Four layers, best first, plus an operator-supplied override (§3.3). Every
 resolved band carries its provenance, and the report exposes it on every row.
 
 | layer | source | available |
 |---|---|---|
+| **published** | `target_oms.limitup/limitdn` — the engine's own band, off the feed | **India and Korea only**, see below |
 | **observed** | `qatt`: book locked (`qbid=qask`) or one-sided (`qask=0` up, `qbid=0` down). The pinned price *is* the band. | only when the stock actually hit the band |
 | **computed** | base price from `qatt`: `preCls = price - netChange`, cross-checked against `price / (1 + pctChange/100)` | any stock that printed |
 | **fallback** | `target_stock.orgclose^adjclose` on the **same date** — that column already holds the previous close | always |
 
-`target_oms.limitup/limitdn` carries the engine's own band and would be the
-strongest source, but its data was checked and found inconsistent. It is
-**deliberately not used**. If it is ever fixed it slots in above `observed` and
-turns §6's `LULD_GUARD_INACTIVE` from an inference into a direct read.
+`target_oms.limitup/limitdn` is **inconsistent across markets generally, but
+always populated for India and Korea**. It is therefore read behind a
+per-market allowlist — `BAND_FROM_TARGET_OMS = {IN, KR}`, a module constant —
+and never trusted globally. This is what makes India checkable at all: its
+per-scrip circuit filters cannot be derived from anything else we have.
+
+Two consequences worth stating. For IN and KR the band is *what the algo itself
+believed*, so a `LULD_CAP` breach there is unambiguous — the engine had the right
+number and priced through it anyway. And for those two markets §6's
+`LULD_GUARD_INACTIVE` becomes a direct read (`limitup <= 0` means no guard) rather
+than an inference from behaviour.
+
+Adding a market to that allowlist requires evidence, not optimism: `--diagnose`
+prints per-market `limitup/limitdn` population and null rates precisely so the
+set can be widened on data rather than on hope.
+
+**`target_oms` holds many rows per `id_target`** — it is a tickstream, one record
+per update, not one per order. Two rules follow:
+
+- Take the band **prevailing at `t_transmit`**, via `aj` on the split's transmit
+  time, not the last row of the day. For a static daily band the two agree; for a
+  band that moves intraday only the `aj` is right, and it costs nothing to be
+  correct in both cases. Where a split has no earlier `target_oms` record, fall
+  back to the first record after it, then to the day's last.
+- Take the last **non-null, positive** value, not the last row. `FlexOrderStream`
+  only writes `limitup`/`limitdn` into the record when `quote != null`, so rows
+  with a zero or null band are common and mean *"not known at this instant"*, not
+  *"no band"*. Reading the last row blindly returns 0 on a stock that has a
+  perfectly good band a few records earlier, and 0 would then read as
+  `LULD_GUARD_INACTIVE` — a fabricated finding from a parsing mistake.
 
 `mbref`'s `luld` table (`time; sym; atime; flag; limitup; limitdown`) holds the
 feed-published band, but **we have no access to that server**, so it plays no
@@ -95,15 +122,20 @@ part. Noted only so nobody re-derives it as an option.
 
 | field | values |
 |---|---|
-| `band_src` | `override` · `observed` · `qatt_netchange` · `target_stock` |
-| `band_conf` | `confirmed` — an observed pin agrees with the computed band within one tick<br>`assumed` — never hit the band; computed only<br>`contradicted` — a pin, or the session `highPrice`/`lowPrice`, sits outside the computed band |
+| `band_src` | `override` · `target_oms` · `observed` · `qatt_netchange` · `target_stock` |
+| `band_conf` | `confirmed` — published, or an observed pin agrees with the computed band within one tick<br>`assumed` — never hit the band; computed only<br>`widened_observed` — computed band contradicted, but the cause is known (§3.2), so the observed extreme is used instead<br>`contradicted` — contradicted with no known cause; band discarded |
 
 **`contradicted` discards the computed band and suppresses that stock's LULD
 findings.** Reporting "could not establish a band for 40 names" is worth more
 than 40 fabricated violations. Suppressed stocks are counted and listed.
 
-Bands round **inward** to `target_stock.ticksize`, so a band is never reported
-wider than the rule allows.
+`widened_observed` is the deliberate exception, and it applies where a
+contradiction has a *known* mechanism rather than an unknown one — Japan's
+expanded limits (§3.2). There the observed extreme is a better band than no band,
+so the finding is kept and its confidence marked down instead of being dropped.
+
+Bands round **inward** to the tick grid (§3.4), so a band is never reported wider
+than the rule allows.
 
 ### 3.2 Japan
 
@@ -128,22 +160,44 @@ base >= 1000:  k = floor(log10(base)) - 3
 Checks: base 1,000 -> 300; 10,000 -> 3,000; 20,000 -> 5,000; 100,000 -> 30,000.
 These are asserted in the self-test against the published table.
 
-**Three things make this table wrong on exactly the stocks that matter, and all
-three are handled by §3.1 rather than by widening the table:**
+Japan is not on the `target_oms` allowlist and has no reference source, so the
+step table alone is not enough. **Three things make it wrong on exactly the
+stocks that matter:**
 
 1. **Expanded limits.** A name closing limit-up/down on a special quote gets a
    widened limit the next day — doubled, wider again on consecutive days. The
    step table then reports a band narrower than the real one, and every split
-   between the two reads as a violation. This is the single largest
-   false-positive source for JP, and `band_conf=contradicted` is what catches it.
+   between the two reads as a violation. The single largest false-positive source
+   for JP.
 2. **Base price is not always the previous close** — after a corporate action, or
    when TSE carries a last special quote forward. The `orgclose` / `adjclose`
    distinction.
-3. **SQ days** — the notes already say the algo does not work for SQ.
+3. **SQ days** — the notes already say the algo does not work for SQ. Derivable
+   from the calendar: the second Friday of each month.
 
-India (scrip-specific 2/5/10/20% circuit filters) and Indonesia (IDX
-auto-rejection tiers, revised repeatedly) are the same problem and get the same
-treatment: computed where possible, `assumed`, and suppressed on contradiction.
+**Japan therefore gets two extra steps that no other market needs:**
+
+**Prior-day expansion detection.** Read the *previous session's* `qatt` for the
+same syms. If the stock ended pinned — locked or one-sided — at the previous
+day's computed band edge, TSE widened today's limit, and the step-table value is
+multiplied accordingly. One extra query per date, and the previous session is
+already being fetched for nothing else, so it is a genuine addition rather than a
+reuse.
+
+**Observed widening.** When today's session `highPrice`/`lowPrice` exceeds the
+computed band, the band is set to the observed extreme and marked
+`band_conf=widened_observed` — **not** suppressed. Suppression is right when a
+contradiction means "band unknown"; in Japan it has a known cause, so the
+observed extreme is strictly better than nothing.
+
+The second step is what makes the first one safe. The exact expansion multiplier
+for consecutive limit closes is the one number here taken on trust, and if it is
+wrong the observed data overrides it rather than propagating the error. That
+ordering is deliberate: no Japan finding rests on the multiplier alone.
+
+Indonesia (IDX auto-rejection tiers, revised repeatedly and asymmetric in some
+periods) has no equivalent rescue and stays `assumed`, suppressed on
+contradiction, until §3.3 or §11.3 supplies it.
 
 ### 3.3 The override file
 
@@ -161,6 +215,42 @@ Partial coverage is fine: a stock present in the file uses it and gets
 normal chain. This makes reference data **pluggable as it arrives** instead of a
 precondition, and it is also how a single disputed case gets pinned for a
 re-run.
+
+### 3.4 The tick grid, from `tsid`
+
+`target_stock.tstbl` / `tsid` carry the **tick size table id** — confirmed in the
+engine, where `Stock.java` emits `|tstbl:` from `_ticksizetableid` and
+`kdb/load_ticksizeids.q` loads one per sym out of `mbref`. Observed values: every
+HK stock is `5872`; Chinese stocks are `10058` or `10216`.
+
+The table those ids point into lives in `mbref`, which we cannot reach, so the id
+is opaque on its own. It is still worth having, because **every stock sharing a
+`tsid` shares a tick ladder by construction**. That makes the ladder recoverable
+from data we already have:
+
+```
+for each tsid group:
+    prices  <- distinct qbid, qask and trade prices from qatt over the range
+    sort, take successive differences
+    the ladder is the step function of (price level -> modal difference)
+```
+
+For `5872` this should reproduce the HKEX spread table (0.001 / 0.005 / 0.010 /
+0.025 / 0.050 ...). The reconstruction is **self-validating**: a real ladder is a
+clean step function, so if the recovered grid is ragged, the grouping is wrong and
+the script says so rather than rounding against nonsense. Where recovery fails,
+the scalar `target_stock.ticksize` is the fallback.
+
+This replaces a scalar tick with the real grid, which is what makes the inward
+rounding in §3.1 exact rather than approximate.
+
+**One open question, cheap to settle and worth more than the grid itself.** A-share
+ticks are a uniform 0.01 CNY, so China having *two* ids probably does not encode
+tick size at all — more likely SH vs SZ, or main board vs STAR/ChiNext. A crosstab
+of `tsid` against symbol prefix (`600*` `601*` `603*` vs `000*` `002*` vs `300*` vs
+`688*`) settles it. **If it separates main board from STAR/ChiNext, `tsid` is the
+board discriminator**, and China's +/-10% vs +/-20% correction (§1.1) is solved
+without needing `segment`. `--diagnose` prints this crosstab.
 
 ---
 
@@ -464,24 +554,48 @@ one-line change that reverses it.
 ## 11. What is missing to get every band exactly right
 
 Ordered by value per unit of effort. The script ships useful without any of
-these — §3.1 already reports `assumed` and suppresses `contradicted` rather than
-guessing — but each one converts a market from approximate to exact.
+these -- §3.1 already reports `assumed` and suppresses `contradicted` rather than
+guessing -- but each one converts a market from approximate to exact.
 
-### 11.1 One `target_stock` sample (cheapest, removes the most gaps)
+### 11.1 Settled since the first draft
 
-Twenty rows spanning the nine markets, all 94 columns. Several columns look like
-they answer band questions directly and cannot be decoded from a name alone:
-
-| column | what it would settle |
+| was missing | resolved by |
 |---|---|
-| `segment` | board membership — STAR / ChiNext / KOSPI / KOSDAQ / KONEX / main. Settles the §1.1 corrections for CN and KR outright. |
-| `ipo`, `newtkr` | listing age — CN day-one has no limit, TW has none for 5 days |
-| `stype`, `etf`, `preferred` | security type — ETFs and preferreds carry different bands in CN, KR and JP |
-| `tstbl`, `tsid` | the **tick size table id**. Confirmed: `Stock.java` emits `\|tstbl:` from `_ticksizetableid`, and `kdb/load_ticksizeids.q` loads these per sym. Using the real grid instead of the scalar `ticksize` makes inward rounding exact. |
-| `orgclose` vs `adjclose` | which one an exchange uses as base after a corporate action — currently `orgclose^adjclose`, which is a guess |
-| `mrp`, `p2c`, `mos`, `tac` | unknown; may be relevant, may not |
+| India per-scrip circuit filters -- previously a hard blocker | `target_oms.limitup/limitdn`, always populated for IN (§3) |
+| Korea board bands (KOSPI/KOSDAQ vs KONEX) | same -- the published band already reflects whichever applies |
+| China day-one listings, Taiwan first five days | `target_stock.ipo` |
+| the tick grid | `tsid` grouping plus empirical recovery from `qatt` (§3.4) |
+| Japan expanded limits | prior-day pin detection plus observed widening (§3.2) |
 
-### 11.2 The engine's own price-limit rule (the exact answer)
+### 11.2 Still worth having, cheap
+
+**A `tsid` x symbol-prefix crosstab for China.** If `10058` / `10216` separates
+main board from STAR/ChiNext, `tsid` is the board discriminator and China's
++/-10% vs +/-20% is exact rather than prefix-inferred. `--diagnose` prints it;
+one run settles it.
+
+**Per-market `target_oms` population rates.** The allowlist is `{IN, KR}` on your
+word. If JP, MY or TH turn out to be populated too, each one moves from computed
+to published and the whole of §3.2 becomes a fallback rather than the primary
+path for Japan. `--diagnose` prints null rates per market for exactly this.
+
+**A `target_stock` sample, 20 rows across the nine markets.** Lower value than
+before -- `ipo` and `tsid` are now understood -- but `segment`, `stype`, `etf`,
+`preferred` and the unknown `mrp` / `p2c` / `mos` / `tac` are still undecoded, and
+`segment` would replace prefix inference for CN and KR boards.
+
+### 11.3 Still genuinely external
+
+| market | missing | why it cannot be derived |
+|---|---|---|
+| **Indonesia** | IDX auto-rejection tiers + effective dates | a price-tier step table, revised repeatedly and asymmetric in some periods. Not on the `target_oms` allowlist, and no observable rescue like Japan's. |
+| **China** | ST / \*ST status (+/-5%) | carried in the stock **name**, not the code. No prefix implies it. |
+| **Korea** | investment caution / warning designations | exchange-assigned, changes intraday. Largely moot now the published band is used for KR. |
+
+`--band-file` (§3.3) is what these are for. Indonesia reports `RULE_UNKNOWN`
+until it is supplied.
+
+### 11.4 The exact answer, if it can ever be exported
 
 `Stock.java` holds an **`IFCPriceLimit`** per stock:
 
@@ -493,54 +607,27 @@ public interface IFCPriceLimit {
 }
 ```
 
-and `Stock.toString()` emits `|pricelimit:<id>|dn:<limitdn>|up:<limitup>`.
+and `Stock.toString()` emits `|pricelimit:<id>|dn:<limitdn>|up:<limitup>`. The
+implementations are in a jar absent from the `ai3` slice; the per-stock
+assignment lives in the security master.
 
-This is the band the algo is actually held to, per stock, and `fromFeed()` says
-whether it came off the feed or was computed by a rule. The implementations are
-in an external jar not present in the `ai3` slice, and the per-stock assignment
-lives in the security master.
+This is the band the algo is actually held to, and `fromFeed()` says whether it
+came off the feed or from a rule. An export of the rule table plus its per-stock
+assignment would make every market exact at once, and would change the question
+from *"does the algo match the exchange's rule"* to *"does the algo match its own
+configured rule"* -- the more useful one, since a mis-assigned `pricelimit` id is
+itself a defect worth finding.
 
-**An export of the price-limit rule table plus its per-stock assignment would
-make the band exact for all nine markets at once**, and would change the question
-from "does the algo match the exchange's rule" — which is what this script can
-currently ask — to "does the algo match its own configured rule", which is the
-more useful one, since a mis-assigned `pricelimit` id is itself a defect worth
-finding.
+### 11.5 Coverage as designed
 
-### 11.3 Genuinely external — no derivation exists
-
-| market | missing | why it cannot be derived |
+| | band | confidence |
 |---|---|---|
-| **India** | per-scrip circuit filters (2 / 5 / 10 / 20%) | assigned per scrip by the exchange; F&O names carry no individual filter at all, only a flexible 10% dynamic band. Nothing in `target_stock` implies which. **Hard blocker for IN.** |
-| **Indonesia** | IDX auto-rejection tiers + effective dates | a price-tier step table, revised repeatedly and asymmetric in some periods. Needs the rule set *and* when each version applied. |
-| **China** | ST / \*ST status (±5%) | carried in the stock **name**, not the code. No prefix implies it. |
-| **Korea** | 투자경고 / 투자위험 designations | exchange-assigned, changes intraday. Rarer, so lower priority. |
+| **India, Korea** | published (`target_oms`) | exact |
+| **China main board, Taiwan, Malaysia, Thailand** | computed from a close we can read | exact |
+| **Japan** | step table, expansion-corrected, observation-widened | exact for ordinary names; `widened_observed` for the rest |
+| **Hong Kong** | no band rule exists | n/a -- short sell checks only |
+| **China ST names** | unresolvable without a name feed | `assumed`, suppressed on contradiction |
+| **Indonesia** | none | `RULE_UNKNOWN` until `--band-file` |
 
-These are exactly what `--band-file` (§3.3) exists for. India and Indonesia
-report as `RULE_UNKNOWN` until it is supplied.
-
-### 11.4 Solvable here, with work
-
-- **Japan expanded limits.** A name that closed at the band on a special quote
-  gets a widened limit the next day. This is derivable: read the **previous
-  session's** `qatt`, and if its close sat at the computed band edge, widen
-  today's band by the expansion rule. Needs one extra qatt query per date and the
-  exact expansion schedule. Until then, §3.1 catches these as `contradicted` and
-  suppresses them — safe, but it means JP coverage is thinnest on the most
-  volatile names.
-- **SQ days.** Derivable from a calendar — the second Friday of each month.
-- **Dynamic / intraday bands (TH, MY).** Both markets run a narrower intraday
-  band alongside the static ±30%. The static check is correct as far as it goes,
-  but breaches of the dynamic band are invisible to it. Scoping this needs the
-  dynamic rule per market.
-
-### 11.5 What ships without any of the above
-
-Exact: **Korea, Malaysia, Thailand, Taiwan, China main board** — a percentage of
-a previous close we can read, rounded to a grid we have.
-
-Approximate but honest: **Japan** — the step table is right for ordinary names
-and `contradicted` catches the expanded ones.
-
-Unverifiable and reported as such: **India, Indonesia**, plus CN ST names and KR
-KONEX until §11.1 or §11.3 lands.
+Eight of the nine markets have a usable band. Indonesia is the only hole, and it
+is reported as a hole rather than guessed at.
