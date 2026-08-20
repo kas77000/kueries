@@ -36,8 +36,6 @@ import pandas as pd
 
 ORDER_SERVER = "CHANGEME:5010"      # target_stock, for fxlast
 QATT_SERVER = "CHANGEME:5011"       # qatt - the HISTORICAL side, it needs date
-USER = None
-PASSWORD = None
 
 START = dt.date(2026, 7, 28)
 END = dt.date(2026, 7, 30)
@@ -102,9 +100,10 @@ def log(msg=""):
 # Fetch
 # =============================================================================
 
-def connect(hostport, user=None, password=None):
-    """Open a PyKX connection.  pykx is imported here so the rest of this file
-    stays importable without it."""
+def connect(hostport):
+    """Open a PyKX connection on a host and a port; the servers are open, so
+    there is nothing to log in with.  pykx is imported here so the rest of this
+    file stays importable without it."""
     if hostport.startswith(_PLACEHOLDER):
         raise SystemExit(
             f"{hostport!r} is still the placeholder.  Set ORDER_SERVER and "
@@ -116,8 +115,7 @@ def connect(hostport, user=None, password=None):
     host, _, port = hostport.rpartition(":")
     if not host or not port.isdigit():
         raise SystemExit(f"expected host:port, got {hostport!r}")
-    kw = {"username": user, "password": password} if user else {}
-    return pykx.QConnection(host=host, port=int(port), **kw)
+    return pykx.QConnection(host=host, port=int(port))
 
 
 def _dates():
@@ -137,7 +135,7 @@ def fetch():
     days = _dates()
     log(f"market_stats  {START} to {END}  ({len(days)} dates), {COUNTRY}, {UNIT}")
     log(f"  quote server  {QATT_SERVER} ...")
-    hq = connect(QATT_SERVER, USER, PASSWORD)
+    hq = connect(QATT_SERVER)
     log(f"  loading {QUERY_FILE.name} onto the quote server")
     hq(QUERY_FILE.read_text(encoding="utf-8"))
 
@@ -145,7 +143,7 @@ def fetch():
     # the two never have to reach each other.
     if UNIT == "notional":
         log(f"  order server  {ORDER_SERVER} ...  (fxlast, for notional)")
-        ho = connect(ORDER_SERVER, USER, PASSWORD)
+        ho = connect(ORDER_SERVER)
         ho(QUERY_FILE.read_text(encoding="utf-8"))
         sfx = f"*.{COUNTRY}"
         fx = ho(".ms.fxOn", days, sfx.encode())

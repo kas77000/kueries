@@ -74,14 +74,12 @@ import numpy as np
 # ones - qatt in particular exists in both flavours and only the historical one
 # carries a date column.
 #
-# USER / PASSWORD stay None for an open process.  Do not commit a real password;
-# read it from the environment here if these servers ever need one.
+# Both are open processes, so host and port is the whole of it - connect() takes
+# no credentials.
 # -----------------------------------------------------------------------------
 
 ORDER_SERVER = "CHANGEME:5010"   # target, target_state, target_stock, workorder, target_oms
 QATT_SERVER = "CHANGEME:5011"    # qatt
-USER = None
-PASSWORD = None
 
 _PLACEHOLDER = "CHANGEME"
 
@@ -494,8 +492,7 @@ def connect(endpoint: str):
     """Open a PyKX connection.  Imported lazily so --self-test runs anywhere."""
     import pykx as kx
     host, port = endpoint.rsplit(":", 1)
-    return kx.SyncQConnection(host=host, port=int(port),
-                              username=USER, password=PASSWORD)
+    return kx.SyncQConnection(host=host, port=int(port))
 
 
 # =============================================================================

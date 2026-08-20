@@ -61,14 +61,11 @@ import pandas as pd
 # -----------------------------------------------------------------------------
 # CONNECTION.  Edit this.  The HISTORICAL order server, not the realtime one.
 #
-# USER / PASSWORD stay None for an open process; set them if the server wants
-# credentials.  Do not commit a real password - if this server ever needs one,
-# read it from the environment here instead.
+# It is an open process, so host and port is the whole of it - connect() takes
+# no credentials.
 # -----------------------------------------------------------------------------
 
 ORDER_SERVER = "CHANGEME:5010"
-USER = None
-PASSWORD = None
 
 _PLACEHOLDER = "CHANGEME"
 
@@ -249,8 +246,9 @@ def parse_hostport(s):
     return host, int(port)
 
 
-def connect(hostport, user=None, password=None):
-    """Open a PyKX connection.  pykx is imported here, not at module level, so
+def connect(hostport):
+    """Open a PyKX connection on a host and a port; the server is open, so there
+    is nothing to log in with.  pykx is imported here, not at module level, so
     the pure-python half of this file stays importable without it."""
     if hostport.startswith(_PLACEHOLDER):
         raise SystemExit(
@@ -266,12 +264,7 @@ def connect(hostport, user=None, password=None):
             "licence and no QHOME required."
         )
     host, port = parse_hostport(hostport)
-    kw = {}
-    if user:
-        kw["username"] = user
-    if password:
-        kw["password"] = password
-    return pykx.SyncQConnection(host=host, port=port, **kw)
+    return pykx.SyncQConnection(host=host, port=port)
 
 
 def _to_pandas(tbl):
@@ -653,7 +646,7 @@ def run(args):
     log(f"dark_routed_executed  {args.start} to {args.end}  ({len(days)} dates)"
         + (f", country {args.country}" if args.country else ", all countries"))
     log(f"  order server  {ORDER_SERVER} ...")
-    ho = connect(ORDER_SERVER, USER, PASSWORD)
+    ho = connect(ORDER_SERVER)
     # BYTES, not str: PyKX sends a python str as a q symbol, and the q casts
     # with `$, which is a 'type error on a symbol.  b"" is an empty char
     # vector, so `0=count ctry` still selects every country.
