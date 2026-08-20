@@ -119,6 +119,11 @@ SMTP_TIMEOUT = 30              # seconds
 # socket - the way to check a new recipient list.
 EMAIL_DRY_RUN = False
 
+# What the mail says.  Just this - the report is the attachment, and a body
+# that restates it is a second copy to keep in step and one more thing to
+# render wrong in somebody's client.
+EMAIL_SIGNATURE = "Best Regards,\n\nKhalife"
+
 
 # =============================================================================
 # SCOPE
@@ -721,10 +726,6 @@ def save(fig, out_dir: Path, stem: str):
 # that matter fit in a preview pane.
 # =============================================================================
 
-TABLE_HEADERS = tuple(c[0] for c in TABLE_COLS)
-TABLE_ALIGN = tuple("r" if c[2] else "l" for c in TABLE_COLS)
-
-
 def _mailer():
     try:
         from lib import mailer
@@ -734,56 +735,6 @@ def _mailer():
             f"({e}).  It sits beside this script's folder; copy scripts/lib "
             f"too if you moved this one.")
     return mailer
-
-
-def table_cells(rows) -> list:
-    """The per market table as text, in the same order the page prints it."""
-    return [[r.name, fmt_int(r.orders), fmt_int(r.order_qty),
-             fmt_int(r.executed), fmt_pct1(r.completion), fmt_int(r.rejections)]
-            for r in rows]
-
-
-def mail_bodies(rows, tot, subtitle, footer, png_cid=None) -> tuple:
-    """(plain text body, html body).  Pure - no files, no network."""
-    m = _mailer()
-    cells = table_cells(rows)
-
-    headline = (f"{fmt_int(tot.orders)} short-sell orders   ·   "
-                f"{fmt_pct1(tot.completion)} overall completion   ·   "
-                f"{fmt_int(tot.rejections)} rejections")
-    text = "\n".join([
-        TITLE, subtitle, "", headline, "",
-        m.text_table(TABLE_HEADERS, cells, TABLE_ALIGN), "",
-        footer, ""])
-
-    # Inline styles only; mail clients strip <style> blocks.
-    colours = [[None] * 5 + [RED if r.rejections else INK3] for r in rows]
-    kpis = "".join(
-        f'<td style="padding:0 34px 0 0"><div style="font-size:26px;'
-        f'font-weight:700;color:{c}">{m.esc(v)}</div>'
-        f'<div style="font-size:12px;color:{INK2};padding-top:2px">'
-        f'{m.esc(l)}</div></td>'
-        for v, l, c in ((fmt_int(tot.orders), "Short-sell orders", INK),
-                        (fmt_pct1(tot.completion), "Overall completion", GREEN),
-                        (fmt_int(tot.rejections), "Rejections", RED)))
-    img = (f'<div style="padding-top:22px"><img src="cid:{png_cid}" '
-           f'style="width:100%;max-width:660px" alt="{m.esc(TITLE)}"></div>'
-           if png_cid else "")
-    html = (
-        f'<div style="font:14px system-ui,-apple-system,Segoe UI,Arial,'
-        f'sans-serif;color:{INK};max-width:700px">'
-        f'<div style="font-size:22px;font-weight:700">{m.esc(TITLE)}</div>'
-        f'<div style="font-size:13px;color:{INK2};padding-top:3px">'
-        f'{m.esc(subtitle)}</div>'
-        f'<hr style="border:0;border-top:1px solid {RULE};margin:12px 0 16px">'
-        f'<table cellspacing="0" cellpadding="0"><tr>{kpis}</tr></table>'
-        f'<div style="padding-top:20px">'
-        f'{m.html_table(TABLE_HEADERS, cells, TABLE_ALIGN, colours)}</div>'
-        f'{img}'
-        f'<hr style="border:0;border-top:1px solid {RULE};margin:22px 0 8px">'
-        f'<div style="font-size:11px;color:{INK3}">{m.esc(footer)}</div>'
-        f'</div>')
-    return text, html
 
 
 def email_configured() -> bool:
@@ -797,7 +748,18 @@ def smtp_config():
                           timeout=SMTP_TIMEOUT)
 
 
-def mail_report(rows, tot, subtitle, footer, when, files) -> None:
+def mail_body() -> str:
+    """The whole body.  The report is the PDF; the mail just carries it.
+
+    No HTML, no inlined page, no table repeated in the message.  A body that
+    restates the report is a second copy of it to keep in step, and it renders
+    at the mercy of whatever client opens it - which is exactly what went wrong
+    with the first version of this.
+    """
+    return EMAIL_SIGNATURE
+
+
+def mail_report(when, files) -> None:
     """Build the message and send it, per the EMAIL block at the top.
 
     Raises rather than warning: a report nobody received is only harmless if
@@ -805,25 +767,21 @@ def mail_report(rows, tot, subtitle, footer, when, files) -> None:
     """
     m = _mailer()
     pdf = next((p for p in files if p.suffix == ".pdf"), None)
-    png = next((p for p in files if p.suffix == ".png"), None)
-
     if not EMAIL_FROM:
         raise SystemExit(
             f"EMAIL_TO is set but EMAIL_FROM is empty. Both live in the EMAIL "
             f"block near the top of {Path(__file__).name}.")
+    if pdf is None:
+        raise SystemExit("nothing to attach: no PDF was written")
 
-    cid = "report-page" if png else None
-    text, html = mail_bodies(rows, tot, subtitle, footer, png_cid=cid)
     msg = m.build_message(m.Mail(
         subject=f"{TITLE} - {when}",
         sender=EMAIL_FROM,
         to=EMAIL_TO,
         cc=EMAIL_CC,
         bcc=EMAIL_BCC,
-        text=text,
-        html=html,
-        inline_images=[(cid, png)] if png else (),
-        attachments=[pdf] if pdf else ()))
+        text=mail_body(),
+        attachments=[pdf]))
 
     smtp = smtp_config()
     log("  email:")
@@ -964,7 +922,7 @@ def run(args) -> int:
     files = save(draw(rows, tot, subtitle, footer, days),
                  Path(args.out_dir), stem)
     if email_configured():
-        mail_report(rows, tot, subtitle, footer, subtitle_when, files)
+        mail_report(subtitle_when, files)
     return 0
 
 
@@ -1311,22 +1269,11 @@ def self_test() -> int:
         print("\n" + ("all checks passed" if ok else "SOME CHECKS FAILED"))
         return 0 if ok else 1
 
-    sub = "By market  ·  2026-07-24 18:37"
-    foot = "Generated 2026-07-24 18:37  ·  real-time snapshot"
-    text, html = mail_bodies(rows, tot, sub, foot, png_cid="report-page")
-    check("the text body carries the headline", "55.7%" in text, True)
-    check("and every market, zero rows included",
-          all(r.name in text for r in rows), True)
-    check("and the rejection counts", "394" in text and "239" in text, True)
-    check("the html body references the inlined page",
-          'src="cid:report-page"' in html, True)
-    check("the html colours the rejections red", RED in html, True)
-    check("the html body has no <style> block clients would strip",
-          "<style" in html, False)
+    check("the body is the signature and nothing else",
+          mail_body(), "Best Regards,\n\nKhalife")
+    check("no table in it", "Market" in mail_body(), False)
+    check("no numbers in it", any(c.isdigit() for c in mail_body()), False)
 
-    # the EMAIL block is module state, so the checks set it and put it back
-    print("\nemail is configured in the file, not on the command line")
-    check("an empty EMAIL_TO is the off switch", email_configured(), False)
     with _email_config(EMAIL_TO=["desk@example.com, compliance@example.com"],
                        EMAIL_CC=["risk@example.com"],
                        EMAIL_FROM="algo-reports@example.com",
@@ -1344,16 +1291,20 @@ def self_test() -> int:
                   [p.name for p in files],
                   ["short_sell_report_2026-07-24.pdf",
                    "short_sell_report_2026-07-24.png"])
-            mail_report(rows, tot, sub, foot, "2026-07-24", files)
+            mail_report("2026-07-24", files)
             msg = m.build_message(m.Mail(
                 subject=f"{TITLE} - 2026-07-24", sender=EMAIL_FROM,
-                to=EMAIL_TO, cc=EMAIL_CC, text=text, html=html,
-                inline_images=[("report-page", files[1])],
+                to=EMAIL_TO, cc=EMAIL_CC, text=mail_body(),
                 attachments=[files[0]]))
-            check("the pdf is attached and the png inlined",
+            check("the PDF is the only thing attached",
                   [p.get_filename() for p in msg.walk() if p.get_filename()],
-                  ["short_sell_report_2026-07-24.png",
-                   "short_sell_report_2026-07-24.pdf"])
+                  ["short_sell_report_2026-07-24.pdf"])
+            check("and the page is NOT inlined",
+                  any(p.get_content_type().startswith("image/")
+                      for p in msg.walk()), False)
+            check("the message is plain text, with no html part",
+                  any(p.get_content_type() == "text/html" for p in msg.walk()),
+                  False)
             check("a pasted recipient list is split", m.recipients(msg),
                   ["desk@example.com", "compliance@example.com",
                    "risk@example.com"])
@@ -1364,7 +1315,7 @@ def self_test() -> int:
     with _email_config(EMAIL_TO=["desk@example.com"], EMAIL_FROM=""):
         r = False
         try:
-            mail_report(rows, tot, sub, foot, "x", [])
+            mail_report("x", [])
         except SystemExit as e:
             r = "EMAIL_FROM" in str(e)
         check("EMAIL_TO with no EMAIL_FROM says so, naming the block", r, True)

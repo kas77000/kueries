@@ -212,8 +212,19 @@ it is reported.
 Configured in the `EMAIL` block at the top of the script, not on the command
 line — same shape as
 [`short_sell_report`](../short_sell_report/README.md#email). `EMAIL_TO` empty
-means do not send. The body carries both tables, so the findings are readable in
-a preview pane without opening the PDF.
+means do not send.
+
+The report is the **attachment** — one PDF, however many pages it ran to. The
+body is just the sign-off:
+
+```
+Best Regards,
+
+Khalife
+```
+
+`EMAIL_DRY_RUN = True` builds the message and prints who it would reach without
+opening a socket.
 
 ---
 
@@ -224,7 +235,7 @@ python scripts/luld_report/luld_report.py --self-test
 python scripts/luld_report/luld_report.py --demo
 ```
 
-120 checks, no kdb and no pykx: the suffix routing including the many-to-one
+123 checks, no kdb and no pykx: the suffix routing including the many-to-one
 markets, which limit a period was at, what counts as favourable, window
 arithmetic including open-ended splits, what makes a split active, which orders
 the limit touched, every guard on the findings table, the rollups, the mode

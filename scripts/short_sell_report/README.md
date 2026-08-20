@@ -239,7 +239,10 @@ SMTP_HOST    = "mail.example.com"
 SMTP_PORT    = 0           # 0 -> 25
 SMTP_TIMEOUT = 30          # seconds
 
-EMAIL_DRY_RUN = False
+EMAIL_DRY_RUN     = False
+EMAIL_SIGNATURE   = "Best Regards,
+
+Khalife"
 ```
 
 Who gets this report is part of what the report *is*, not of one run of it — a
@@ -247,10 +250,19 @@ distribution list living in whatever someone last typed is a list that quietly
 loses people. **`EMAIL_TO` empty means do not send**, and that is the whole
 switch: there is no separate enable flag to leave in the wrong position.
 
-The PDF is attached, the PNG is inlined, and the body repeats the headline
-numbers and the whole table — a report that arrives as "see attached" is a
-report most people do not open, and the three numbers that matter fit in a
-preview pane.
+The report is the **attachment**. The body is just:
+
+```
+Best Regards,
+
+Khalife
+```
+
+No HTML, no inlined page, no table repeated in the message. A body that
+restates the report is a second copy to keep in step, and it renders at the
+mercy of whatever client opens it — which is what went wrong with the first
+version of this. `EMAIL_SIGNATURE` is a constant in the same block if the
+sign-off changes.
 
 Each address may itself be a comma or semicolon separated list, so a pasted
 distribution list works as it is. Nobody is mailed twice. An address that does
@@ -284,7 +296,7 @@ rendering path runs on a machine with no kdb, no pykx and no q licence:
 python scripts/short_sell_report/short_sell_report.py --self-test
 ```
 
-It rebuilds the page above from synthetic records — 134 checks — covering the
+It rebuilds the page above from synthetic records — 132 checks — covering the
 suffix routing (including the suffixes that are *not* ours, like Tokyo's `.T`),
 the market rollup, the quantity weighted headline, the Japan exclusion
 (including that the dropped orders' fills and rejections go with them), the

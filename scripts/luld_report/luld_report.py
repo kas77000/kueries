@@ -122,6 +122,11 @@ SMTP_TIMEOUT = 30              # seconds
 
 EMAIL_DRY_RUN = False
 
+# What the mail says.  Just this - the report is the attachment, and a body that
+# restates it is a second copy to keep in step and one more thing to render
+# wrong in somebody's client.
+EMAIL_SIGNATURE = "Best Regards,\n\nKhalife"
+
 
 # =============================================================================
 # SCOPE
@@ -936,91 +941,29 @@ def smtp_config():
     return _mailer().Smtp(host=SMTP_HOST, port=SMTP_PORT, timeout=SMTP_TIMEOUT)
 
 
-def mail_bodies(rows, tot, missed, subtitle, foot, png_cid=None) -> tuple:
-    m = _mailer()
-    mkt = [[r.name, fmt_int(r.orders), fmt_int(r.order_qty),
-            fmt_int(r.executed), fmt_pct1(r.completion), fmt_int(r.rejections)]
-           for r in rows]
-    mh = [c[0] for c in MKT_COLS]
-    ma = ["r" if c[2] else "l" for c in MKT_COLS]
-    miss = [[MARKET_NAME.get(x.parent.market, x.parent.market), x.parent.sym,
-             x.parent.side, fmt_int(x.parent.size), fmt_int(x.executed),
-             fmt_pct1(x.completion), x.pin.side,
-             f"{fmt_hm(x.window[0])}-{fmt_hm(x.window[1])}",
-             f"{x.minutes:.0f}", fmt_int(x.splits_total)]
-            for x in missed[:FINDINGS_PER_PAGE]]
-    xh = ["Market", "Symbol", "Side", "Order qty", "Exec qty", "Completion",
-          "At", "Limit period", "Mins", "Splits"]
-    xa = ["l", "l", "l", "r", "r", "r", "l", "l", "r", "r"]
+def mail_body() -> str:
+    """The whole body.  The report is the PDF; the mail just carries it.
 
-    headline = (f"{fmt_int(tot.orders)} orders at a limit   ·   "
-                f"{fmt_pct1(tot.completion)} overall completion   ·   "
-                f"{fmt_int(tot.rejections)} rejections   ·   "
-                f"{fmt_int(len(missed))} favourable with no split")
-    text = "\n".join(
-        [TITLE, subtitle, "", headline, "",
-         m.text_table(mh, mkt, ma), "",
-         "Favourable limit, no split on the market"
-         + (f" (top {len(miss)} of {len(missed)})" if len(missed) > len(miss)
-            else ""), ""]
-        + ([m.text_table(xh, miss, xa)] if miss else ["  nothing to report"])
-        + ["", foot, ""])
-
-    colours = [[None] * 5 + [RED if r.rejections else INK3] for r in rows]
-    kpi = "".join(
-        f'<td style="padding:0 26px 0 0"><div style="font-size:23px;'
-        f'font-weight:700;color:{c}">{m.esc(v)}</div>'
-        f'<div style="font-size:12px;color:{INK2};padding-top:2px">'
-        f'{m.esc(l)}</div></td>'
-        for v, l, c in ((fmt_int(tot.orders), "Orders at a limit", INK),
-                        (fmt_pct1(tot.completion), "Overall completion", GREEN),
-                        (fmt_int(tot.rejections), "Rejections", RED),
-                        (fmt_int(len(missed)), "Favourable, no split",
-                         RED if missed else INK3)))
-    img = (f'<div style="padding-top:22px"><img src="cid:{png_cid}" '
-           f'style="width:100%;max-width:660px" alt="{m.esc(TITLE)}"></div>'
-           if png_cid else "")
-    html = (
-        f'<div style="font:14px system-ui,-apple-system,Segoe UI,Arial,'
-        f'sans-serif;color:{INK};max-width:760px">'
-        f'<div style="font-size:22px;font-weight:700">{m.esc(TITLE)}</div>'
-        f'<div style="font-size:13px;color:{INK2};padding-top:3px">'
-        f'{m.esc(subtitle)}</div>'
-        f'<hr style="border:0;border-top:1px solid #e1e0d9;margin:12px 0 16px">'
-        f'<table cellspacing="0" cellpadding="0"><tr>{kpi}</tr></table>'
-        f'<div style="padding-top:20px">'
-        f'{m.html_table(mh, mkt, ma, colours)}</div>'
-        f'<div style="font-size:15px;font-weight:700;padding-top:26px">'
-        f'Favourable limit, no split on the market</div>'
-        + (f'<div style="padding-top:10px">{m.html_table(xh, miss, xa)}</div>'
-           if miss else
-           f'<div style="padding-top:8px;color:{INK3}">Nothing to report.</div>')
-        + (f'<div style="font-size:12px;color:{INK3};padding-top:8px">'
-           f'Top {len(miss)} of {len(missed)}; the rest are in the PDF.</div>'
-           if len(missed) > len(miss) else "")
-        + f'{img}'
-        f'<hr style="border:0;border-top:1px solid #e1e0d9;margin:22px 0 8px">'
-        f'<div style="font-size:11px;color:{INK3}">{m.esc(foot)}</div>'
-        f'</div>')
-    return text, html
+    No HTML, no inlined page, no tables repeated in the message.  A body that
+    restates the report is a second copy of it to keep in step, and it renders
+    at the mercy of whatever client opens it.
+    """
+    return EMAIL_SIGNATURE
 
 
-def mail_report(rows, tot, missed, subtitle, foot, when, files) -> None:
+def mail_report(when, files) -> None:
     m = _mailer()
     pdf = next((p for p in files if p.suffix == ".pdf"), None)
-    png = next((p for p in files if p.suffix == ".png"), None)
     if not EMAIL_FROM:
         raise SystemExit(
             f"EMAIL_TO is set but EMAIL_FROM is empty. Both live in the EMAIL "
             f"block near the top of {Path(__file__).name}.")
+    if pdf is None:
+        raise SystemExit("nothing to attach: no PDF was written")
 
-    cid = "report-page" if png else None
-    text, html = mail_bodies(rows, tot, missed, subtitle, foot, png_cid=cid)
     msg = m.build_message(m.Mail(
         subject=f"{TITLE} - {when}", sender=EMAIL_FROM, to=EMAIL_TO,
-        cc=EMAIL_CC, bcc=EMAIL_BCC, text=text, html=html,
-        inline_images=[(cid, png)] if png else (),
-        attachments=[pdf] if pdf else ()))
+        cc=EMAIL_CC, bcc=EMAIL_BCC, text=mail_body(), attachments=[pdf]))
     smtp = smtp_config()
     log("  email:")
     log(m.describe(msg))
@@ -1144,7 +1087,7 @@ def run(args) -> int:
     files = save(pages_for(rows, tot, missed, subtitle, foot, days),
                  Path(args.out_dir), pl.stem)
     if email_configured():
-        mail_report(rows, tot, missed, subtitle, foot, pl.when, files)
+        mail_report(pl.when, files)
     return 0
 
 
@@ -1556,19 +1499,29 @@ def self_test() -> int:
     check("nothing to authenticate with, by design",
           [f for f in ("SMTP_USER", "SMTP_PASSWORD", "USER", "PASSWORD")
            if f in globals()], [])
-    text, html = mail_bodies(dr, totals(dr), dm, "By market  ·  x",
-                             "Generated  ·  x", png_cid="report-page")
-    check("the text body carries every market",
-          all(r.name in text for r in dr), True)
-    check("and the findings heading",
-          "Favourable limit, no split" in text, True)
-    check("the html references the inlined page",
-          'src="cid:report-page"' in html, True)
-    check("and has no <style> block clients would strip",
-          "<style" in html, False)
-    check("a report with no findings still builds a body",
-          "Nothing to report" in mail_bodies(dr, totals(dr), [], "x", "y")[1],
-          True)
+    check("the body is the signature and nothing else",
+          mail_body(), "Best Regards,\n\nKhalife")
+    check("no table in it", "Market" in mail_body(), False)
+    check("no numbers in it", any(c.isdigit() for c in mail_body()), False)
+
+    with tempfile.TemporaryDirectory() as d:
+        files = save(figs, d, "luld_report_2026-07-24")
+        pdfs = [f for f in files if f.suffix == ".pdf"]
+        check("one PDF for the whole report, however many pages", len(pdfs), 1)
+        msg = m.build_message(m.Mail(
+            subject=f"{TITLE} - x", sender="a@b.com", to=["c@d.com"],
+            text=mail_body(), attachments=pdfs))
+        check("the PDF is the only thing attached",
+              [q.get_filename() for q in msg.walk() if q.get_filename()],
+              ["luld_report_2026-07-24.pdf"])
+        check("no page is inlined",
+              any(q.get_content_type().startswith("image/")
+                  for q in msg.walk()), False)
+        check("the message is plain text, with no html part",
+              any(q.get_content_type() == "text/html" for q in msg.walk()),
+              False)
+        check("and it still sends to everyone it should",
+              m.send(msg, m.Smtp(), dry_run=True), ["c@d.com"])
 
     print("\n" + ("all checks passed" if ok else "SOME CHECKS FAILED"))
     return 0 if ok else 1
