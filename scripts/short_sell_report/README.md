@@ -146,6 +146,17 @@ so the historical branch's `date=d` never has to exist on the realtime side. The
 realtime branch bolts on `date:0Nd`, so everything downstream — the grouping,
 the join keys, the frame Python sees — has one shape.
 
+### A note on names in the q
+
+`ss` is q's string-search keyword, so a lambda parameter called `ss` is a
+**parse** error — the query dies on the name before it does anything, and comes
+back as `QError: ss`. Nothing local can catch that: it needs a real q process.
+
+`--self-test` therefore pulls every parameter and local out of `Q_SESSION` and
+checks them against `.Q.res`. Add a name to the query and the check covers it
+automatically. The one to watch for is a plausible-looking short name — `ss`,
+`in`, `var`, `max`, `string`, `last`, `like`, `div`, `bin`, `do`, `if`.
+
 Set both endpoints before the first run:
 
 ```python
@@ -261,7 +272,7 @@ rendering path runs on a machine with no kdb, no pykx and no q licence:
 python scripts/short_sell_report/short_sell_report.py --self-test
 ```
 
-It rebuilds the page above from synthetic records — 127 checks — covering the
+It rebuilds the page above from synthetic records — 133 checks — covering the
 suffix routing (including the suffixes that are *not* ours, like Tokyo's `.T`),
 the market rollup, the quantity weighted headline, the Japan exclusion
 (including that the dropped orders' fills and rejections go with them), the

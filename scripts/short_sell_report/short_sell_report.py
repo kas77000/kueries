@@ -210,8 +210,13 @@ def log(msg=""):
 # Sent as a serialized lambda with typed arguments; nothing is interpolated.
 # `sfx` arrives as a list of CHAR VECTORS ((b"*.HK";b"*.JP";...)) built from
 # MARKETS, so the patterns q filters on and the suffixes Python maps back cannot
-# drift apart.  `ss` is a char vector for the same reason - PyKX turns a str into
-# a q symbol, which is not what `like` and `$` want.
+# drift apart.  `sside` is a char vector for the same reason - PyKX turns a str
+# into a q symbol, which is not what `like` and `$` want.
+#
+# NAMES.  Every parameter and local in here is checked against the q reserved
+# words by --self-test.  `sside` is called that because `ss` is q's string
+# search: naming a parameter after it is a PARSE error, which does not surface
+# until the lambda reaches a real q process and comes back as `QError: ss`.
 #
 # What comes back is deliberately raw: one row per parent and one row per
 # workorder, with sym, fixmsg and state carried through untouched.  The rules
@@ -222,8 +227,8 @@ def log(msg=""):
 # =============================================================================
 
 Q_SESSION = """
-{[hist;d;sfx;ss]
-  ss:`$ss;
+{[hist;d;sfx;sside]
+  sside:`$sside;
   et:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; size:0#0i;
          fixmsg:0#`);
   ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i;
@@ -236,9 +241,9 @@ Q_SESSION = """
   / cased the suffix.
   t:$[hist;
       select date,id_server,id_target,sym,size,fixmsg
-        from target where date=d, side=ss, any (upper sym) like/: sfx;
+        from target where date=d, side=sside, any (upper sym) like/: sfx;
       update date:0Nd from select id_server,id_target,sym,size,fixmsg
-        from target where side=ss, any (upper sym) like/: sfx];
+        from target where side=sside, any (upper sym) like/: sfx];
   t:0!select last sym, last size, last fixmsg
        by date,id_server,id_target from t;
   if[0=count t; :(et;ew)];
@@ -256,6 +261,31 @@ Q_SESSION = """
   (t;w)
   }
 """
+
+
+# .Q.res - the q reserved words.  A name from this list cannot be a parameter
+# or a local: q fails to PARSE the lambda and returns the offending token as the
+# error, so the whole query dies on a name rather than on anything it does.
+# Nothing here can catch that at runtime without a q process, hence the check in
+# --self-test.
+Q_RESERVED = frozenset("""
+abs acos asin atan avg bin binr by cor cos cov delete dev div do each enlist
+exec exit exp from getenv hopen if in insert last like log max min prd select
+setenv sin sqrt ss string sum tan update var wavg where within wsum xexp
+""".split())
+
+
+def q_names(src: str) -> set:
+    """Every parameter and local assigned in a q lambda, for the reserved word
+    check.  Deliberately crude - it over-collects rather than under-collects,
+    because a name it misses is a name nothing is checking."""
+    import re
+    out = set()
+    for params in re.findall(r"\{\s*\[([^\]]*)\]", src):
+        out.update(n.strip() for n in params.split(";") if n.strip())
+    for name in re.findall(r"^\s*([a-zA-Z][a-zA-Z0-9_]*)\s*:(?!:)", src, re.M):
+        out.add(name)
+    return {n for n in out if n}
 
 
 def _check_server(endpoint: str, which: str):
@@ -1386,6 +1416,21 @@ def self_test() -> int:
               p7))[0].rejections, 2)
 
     # -- scope and state -------------------------------------------------------
+    print("\nthe q holds together")
+    names = q_names(Q_SESSION)
+    check("the query's own names are found", "sside" in names and "t" in names,
+          True)
+    check("none of them is a q reserved word - `ss` cost a run to learn",
+          sorted(names & Q_RESERVED), [])
+    check("and the check would catch one if it came back",
+          sorted(q_names("{[hist;ss] ss:1; t:2}") & Q_RESERVED), ["ss"])
+    check("the side is sent as a char vector, not a symbol",
+          isinstance(SHORTSELL_SIDE.encode(), bytes), True)
+    check("the lambda's braces balance",
+          Q_SESSION.count("{") == Q_SESSION.count("}"), True)
+    check("and its brackets do",
+          Q_SESSION.count("[") == Q_SESSION.count("]"), True)
+
     print("\nthe market is the sym suffix")
     check("Hong Kong", market_of("0700.HK"), "HK")
     check("Japan", market_of("7203.JP"), "JP")
