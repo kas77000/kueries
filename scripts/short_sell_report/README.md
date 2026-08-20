@@ -7,8 +7,11 @@ mailed to a list of people.
 ```
 python scripts/short_sell_report/short_sell_report.py
 python scripts/short_sell_report/short_sell_report.py --monthly 2026-07
+python scripts/short_sell_report/short_sell_report.py --demo       # preview, no kdb
+python scripts/short_sell_report/short_sell_report.py --compare    # old counting beside the new
+python scripts/short_sell_report/short_sell_report.py --chains     # what got chained
+python scripts/short_sell_report/short_sell_report.py --no-tag     # what carries no 9604
 python scripts/short_sell_report/short_sell_report.py --self-test
-python scripts/short_sell_report/short_sell_report.py --demo        # preview, no kdb
 ```
 
 The default run is a **real-time snapshot** of the session in progress.
@@ -76,62 +79,268 @@ reach, a network share included.
 
 ---
 
+
 ## What the numbers mean
 
 | | |
 |---|---|
-| **Orders** | parent short sell orders — `target` rows with ``side=`sellshort``. A target **is** an order, so this is a row count. |
-| **Order qty** | the sum of `size` over the targets in that market. `size` **is** the order's quantity, taken as it stands — nothing is aggregated within an order; the only sum is the one across the market's orders. |
-| **Executed** | the sum of `workorder.make`. A workorder **is** a child order, and `make` is what that child executed — whatever state it ended in, so a cancelled child that part-filled still contributes what it filled. Nothing but `make` says a quantity was executed. |
+| **Orders** | one per **order**, not one per `target` row. A rejected-and-replaced order writes a **new `id_target`** each time it is re-sent, so counting target rows counts one economic order several times. They are chained back together on **FIX tag 9604** — see below. |
+| **Order qty** | what the chain asked for. Not simply `sum size`: three sends of 27m that never traded asked for **27m**, not 81m. |
+| **Executed** | the sum of `workorder.make` across **every** attempt. `make` is what that child executed, whatever state it ended in — a cancelled child that part-filled still contributes what it filled. |
 | **Completion** | per market, `Executed / Order qty`. |
-| **Overall completion** | the plain **mean** of those market percentages — each market counts once whatever its size, and a market with no orders is **left out** rather than averaged in as a zero. Not a ratio of the summed quantities: one market with a large unfilled order was setting the number for the whole page (81m of Thai quantity that never traded printed 12.3% on a day whose markets ran 38% to 76%). The mean is also the one a reader can check against the table with a calculator. |
-| **Rejections** | the `workorder` rows whose state is ``` `rejected ```. Counted per **child** order, not per parent, which is why Hong Kong can show 109 orders and 239 rejections. |
-
-**Nothing is grouped, in either table.** A target is an order and a workorder
-is a child order, so every figure on the page is a plain row count or a plain
-sum over rows the query returns as they stand:
-
-```
-Orders      count of target rows
-Order qty   sum of target.size
-Executed    sum of workorder.make
-Rejections  count of workorder rows in state `rejected
-```
-
-The `last … by` clauses this query used to carry were guarding against a row
-multiplication that does not happen, at the price of hiding one that would. A
-check asserts none has crept back in.
+| **Overall completion** | the same ratio over every market at once — **summed executed over summed order qty**. The real fill rate. |
+| **Rejections** | `workorder` rows in state `` `rejected ``, across **all** attempts of the chain. Counted per child order, not per parent, which is why Hong Kong can show 109 orders and 239 rejections. |
 
 `workorder` also carries `invalid_ack` and `fail_ack`. They are **not** counted:
 they are a different failure — a malformed or unacknowledged send rather than a
 venue saying no — and folding them in would inflate the one number on this page
 a compliance reader will quote.
 
-## Two tables, no join
+Nothing is grouped in q. A target is one send and a workorder is a child order;
+the chaining, the sums and the counts all happen in Python, where `--self-test`
+can prove them.
 
-`target` for the parent orders, `workorder` for their children. That is the
-whole query:
+
+## The chain key: FIX tag 9604
+
+The client puts **its own order id in tag 9604** of `fixmsg`, and a
+cancel-and-replace carries the **same id** — the client saying "this is still
+that order". That is a fact, not an inference.
 
 ```
-target     where side=`sellshort, sym suffix is one of the five   -> parents
-workorder  where id_target in those parents                       -> children
+...;16589=108223;9604=104642494_SG_HK_PORTAL_LIV_20260819162013;17717=...
+...;16589=108543;9604=104642494_SG_HK_PORTAL_LIV_20260819162013;17717=...
+                      ^^^^^^^^^^ same id, so one order
 ```
 
-The market is the **sym suffix**, so no third table is needed to find out where
-an order traded:
+Chained on **(date, tag 9604)**.
 
-| suffix | market |
+**`id_server` is deliberately not in the key** — a trader can move an order to
+another order server mid-life, and the two halves are still one order. Keying on
+the server would split them back apart. How often it happens is reported:
+
+```
+1 chain spans more than one order server - a trader moved the order.  Not an
+error; keying on id_server would have split these back apart
+```
+
+A target whose 9604 is empty cannot be chained to anything, so it **stands
+alone** — keyed on its own server *and* `id_target`, which keeps two unrelated
+untagged orders apart (`id_target` is not unique across servers).
+
+> An earlier version of this grouped on the `oes_oid` prefix. That was a
+> convention; 9604 is a contract. The prefix version is gone.
+
+### Reading the tag
+
+**The separator is a semicolon** in this feed, as above. SOH and pipe are
+accepted too, since a stored copy may be rewritten either way.
+
+**A caret is not a separator**, though it looks like one — it is used *inside*
+values throughout this feed:
+
+```
+9012=274=1^275=1                                   one field
+1008649713=SILK_FLOW^TargetPart=30^SharedTempl^^   one field
+```
+
+Splitting on it would carve values into pieces. Nor is a space, for the same
+reason.
+
+The whole tag is compared after splitting, rather than searching for `"9604="` —
+so `19604=`, `96040=` and a `9604=` appearing inside another field's *value* are
+all correctly ignored.
+
+
+## The two checks, run every time
+
+Both of the checks you asked for are built in and print on every run — they are
+not something to remember to look at.
+
+### 1. Is tag 9604 populated for the universe we ask for?
+
+```
+chains: 924 targets -> 871 orders (43 chained, longest 3)
+tag 9604 is populated on every target
+```
+
+or, when it is not:
+
+```
+61 of 924 targets (6.6%) carry no tag 9604 and stand alone, as counting targets
+them: TH 38, JP 19, KR 4
+```
+
+Broken down **per market**, because "the client does not tag Thailand" is a
+different problem from "the client tags nothing". A high number does not
+invalidate the report — those orders are simply not chained — but it says how
+much of it the tag is actually doing.
+
+**`--no-tag` lists them**, largest first, because a percentage is not something
+anyone can act on:
+
+```
+2 of 3 targets carry no tag 9604 (66.7%)
+  Thailand 1, Japan 1
+
+each stands alone and is counted exactly as counting targets it
+
+  market     sym                id_target            size  algo      basket      oes_oid
+  TH         SCB-R.TB                   1      27,000,000  vwap      B1          OID.1
+  JP         7203.JP                    2       5,000,000  vwap      NIGHT       OID.2
+```
+
+The count also rides on the page footer, so a printed report discloses how much
+of itself was never chained.
+
+It is also the tripwire for a parse failure. If `fixmsg` uses a separator the
+parser does not know, **every** target reads as untagged and the run says so in
+the strongest terms it has:
+
+```
+WARNING: NOT ONE of 924 targets carries tag 9604. Either the client sends
+         none, or fixmsg uses a separator fix_tag does not know - check one
+         fixmsg by hand before believing any of this. Nothing has been chained.
+```
+
+### 2. Does one id ever cover two different orders?
+
+A chain must agree on **sym, side, algo and basket**:
+
+```
+no chain mixes sym, side, algo or basket
+```
+
+or:
+
+```
+WARNING: 2 chains disagree on sym, algo - a 9604 is covering more than one
+         order and these numbers are WRONG.  --chains lists them
+```
+
+**That must be zero.** None of those four fields is in the key **on purpose** —
+putting them in would make the key right by construction and silent, and the
+whole question is whether 9604 is trustworthy on its own.
+
+`--chains` prints the offending chains attempt by attempt with each field, so
+what got merged is visible at once:
+
+```
+2 chains cover more than one order - tag 9604 is NOT safe on its own here:
+
+  9604=CLI-X  disagrees on sym, algo
+      id_target 3    XJ.JP        sellshort  vwap    basket B1   size    100
+      id_target 4    OTHER.JP     sellshort  twap    basket B1   size    100
+```
+
+Checks assert the two branches of each are **exclusive** — a run that printed
+both the warning and the all-clear would be worse than one that printed neither,
+and an if/else is exactly what a careless edit breaks.
+
+### 3. What quantity did a chain ask for?
+
+Executed is summed over **every** attempt, so this decides what those fills are
+measured against — and the attempts are not all the same *kind* of thing:
+
+| | |
 |---|---|
-| `.HK` | Hong Kong |
-| `.JP` | Japan |
-| `.KS` | Korea |
-| `.MK` | Malaysia |
-| `.TB` | Thailand |
+| a **replacement** | supersedes the one before it. Three sends of 27m that never traded are **one 27m order**, not 81m — the whole reason the chaining exists. |
+| a **top-up** | extra quantity on an order that already finished. Sizes 900, 1700, 2500 filling 3,600 in total asked for **5,100**, not 2,500. |
 
-The suffixes live in one table in the script, `MARKETS`. The `*.HK`-style
-patterns q filters on are **built from it** and sent as an argument, so what q
-selects and what Python maps back cannot drift apart. Matching is
-case-insensitive, and only the last dot counts, so `BRK.A.HK` is Hong Kong.
+Both are real, they pull opposite ways, and no "take the Nth size" rule handles
+both. `asked` reads it off the fills instead:
+
+```
+asked = (what every attempt filled) + (what the LAST one still had to do)
+```
+
+|  | sizes | fills | executed | asked |
+|---|---|---|---|---|
+| top-ups | 900, 1700, 2500 | 900, 1700, 1000 | 3,600 | **5,100** |
+| reject ×3 | 27m, 27m, 27m | 0, 0, 0 | 0 | **27m** |
+| remainder replace | 100, 70 | 30, 70 | 100 | **100** |
+
+A superseded attempt contributes only what it *traded*, so a replacement is not
+counted twice; a top-up contributes its whole size, because it filled it. A
+single attempt is just its own size.
+
+The others are kept for `--chain-qty` comparison: **`sum`** is right for top-ups
+and puts a rejected-and-replaced order straight back to v1's number; **`max`**
+is right for replacements and reads 144% on top-ups; **`first`** / **`last`**
+each fail one of the two.
+
+### The tripwires
+
+`asked` cannot print over 100% — `qty − executed` *is* the last attempt's
+residual, which is never negative. But that also means the chain-level check
+**can never fire under it**, so it would validate nothing on its own. Two other
+checks carry it:
+
+**A target that filled more than its own size** — independent of `CHAIN_QTY`,
+because the anomaly is per target, not per grouping:
+
+```
+WARNING: 1 individual target executed MORE than their own size. That is not a
+         grouping question - a workorder is filling more than the target it
+         belongs to:
+      id_target 1270254699  6103.JP  size 100  executed 400  (400%)
+```
+
+**A chain that still over-fills gets un-chained.** Under `--chain-qty max` or
+`sum` a chain can still exceed its quantity; whatever grouped it was wrong, so
+it is exploded back into one order per target — exactly what v1 would have said
+— rather than printing 144% on the page:
+
+```
+2 chains above have been UN-CHAINED into their 5 targets and counted the way
+counting targets them, so the page does not read over 100%. Those are the ones to
+look at with --chains
+```
+
+`--keep-over` leaves them chained if you would rather see the raw number.
+
+### 4. Orders that never produced a workorder
+
+Reported, **not removed**:
+
+```
+14 orders never produced a workorder (41,300,000 qty), and are IN the numbers above:
+      11 died within 60s (33,100,000 qty) - pulled before we had a chance
+       3 lived longer (8,200,000 qty) - WE sent nothing, longest 120 min on SCB-R.TB.
+         These are a finding, not noise, and are why none of this is dropped
+         automatically
+```
+
+"No workorder" is ambiguous between two **opposite** readings, and nothing in
+the row says which:
+
+| | |
+|---|---|
+| **the client pulled it** | cancelled seconds after arriving. We never had a chance, and its quantity arguably does not belong in a completion percentage at all. |
+| **we sent nothing** | it sat there for hours and the algo generated nothing — very much our failure, and precisely what a completion report exists to surface. |
+
+How **long it was live** is what separates them, so that is what gets measured
+(`QUICK_CANCEL_SECS`, 60s). A *rejected* workorder counts as having produced
+one: we sent something and the venue said no, which is the opposite of never
+having sent anything.
+
+Until that split shows which case dominates on real data, both stay in the
+numbers and both are disclosed. Removing the quick ones is defensible once the
+data supports it — removing the slow ones would delete a finding.
+
+---
+
+
+## `--compare`, `--chains`, `--no-tag`
+
+One fetch, two rollups, printed side by side — so any difference is the counting
+and nothing else. Executed and rejections are identical **by construction** and
+the footer says so; if they ever differ, something is wrong with the chaining, not with
+the data.
+
+Plain ASCII, including the dash for a market with no orders: this goes to a
+console, and a diagnostic that raises `UnicodeEncodeError` on cp1252 is no use.
+
 
 ## Scope
 
@@ -148,6 +357,7 @@ it. The match is case-insensitive, and the count of what was dropped is printed
 on the run and carried in the page footer, so an exclusion is never silent.
 
 ---
+
 
 ## Real-time and historical
 
@@ -203,6 +413,7 @@ server.
 
 ---
 
+
 ## Seeing the page before it touches kdb
 
 ```
@@ -224,6 +435,7 @@ these pages end up in compliance folders, and a preview that looks like a real
 report is worse than no preview at all.
 
 ---
+
 
 ## Email
 
@@ -287,6 +499,7 @@ this folder somewhere, copy `scripts/lib` beside it.
 
 ---
 
+
 ## Running it offline
 
 `pykx` is imported lazily inside `connect()`, and everything between the query
@@ -297,7 +510,8 @@ rendering path runs on a machine with no kdb, no pykx and no q licence:
 python scripts/short_sell_report/short_sell_report.py --self-test
 ```
 
-It rebuilds the page above from synthetic records — 135 checks — covering the
+It rebuilds the page above from synthetic records — 158 checks — covering
+parsing tag 9604 out of a real `fixmsg`, the chaining and every guard on it, the
 suffix routing (including the suffixes that are *not* ours, like Tokyo's `.T`),
 the market rollup, the mean-of-markets headline, the Japan exclusion
 (including that the dropped orders' fills and rejections go with them), the
@@ -309,6 +523,7 @@ parsing — end to end.
 Needs `matplotlib` to draw and `pandas` to read what PyKX returns; `--self-test`
 skips the rendering checks rather than failing if matplotlib is absent.
 
+
 ## Colour
 
 Taken unchanged from the data-viz reference palette, which documents its own
@@ -318,3 +533,4 @@ never reads as "series 8". Two charts with one series each, so hue is chart
 identity rather than series identity and there is no within-chart separation at
 stake. Light only: this page gets printed and pasted into documents, where a
 themed surface is a liability rather than a feature.
+

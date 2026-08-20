@@ -38,10 +38,8 @@ THE THREE NUMBERS, per market
   Orders       parent orders whose stock had a limit period overlapping their
                own live window.  Not every order in the market - this page is
                about the ones the limit actually touched
-  Completion   PER MARKET, executed / order qty over those orders.  The
-               HEADLINE is the plain mean of the market percentages, each
-               market counting once whatever its size, and a market with no
-               orders left out rather than averaged in as a zero
+  Completion   executed / order qty - per market, and over every market
+               at once for the headline
   Rejections   their workorders in state `rejected
 
 THE TABLE AT THE BOTTOM - favourable, no split
@@ -548,17 +546,6 @@ def touched(parents, pins) -> tuple:
 # ROLLUPS
 # =============================================================================
 
-def _mean(vals) -> "Optional[float]":
-    """The mean of the values that exist.
-
-    A market with no orders has no completion, and it is LEFT OUT rather than
-    counted as a zero - a market we did not trade did not fail to complete, and
-    averaging in a zero for it would say it did.
-    """
-    got = [v for v in vals if v is not None]
-    return (sum(got) / len(got)) if got else None
-
-
 def _completion(executed: int, order_qty: int) -> Optional[float]:
     if order_qty <= 0:
         return None
@@ -579,8 +566,8 @@ class Row(NamedTuple):
 
 
 class DayRow(NamedTuple):
-    """One date.  completion is the mean of THAT DAY's market completions, so a
-    bar on the by day chart means the same thing the headline does."""
+    """One date.  completion is that day's executed over that day's order qty,
+    so a bar on the by day chart means what the headline means."""
     date: dt.date
     orders: int
     order_qty: int
@@ -590,14 +577,7 @@ class DayRow(NamedTuple):
 
 
 class Totals(NamedTuple):
-    """The headline figures.
-
-    completion is the MEAN of the market completions, not a ratio of the summed
-    quantities.  Quantity weighting let one market with a large unfilled order
-    set the number for the whole page: 81m of Thai quantity that never traded
-    took a day whose markets ran 38% to 76% and printed 12.3%.  The mean is
-    also the one a reader can check against the table with a calculator.
-    """
+    """The headline figures.  completion is executed over order qty, summed."""
     orders: int
     order_qty: int
     executed: int
@@ -627,14 +607,10 @@ def by_market(parents, splits) -> list:
 
 def by_day(parents, splits) -> list:
     """One DayRow per date that carried LULD flow, in date order."""
-    days, mkt = {}, {}
+    days = {}
 
     def slot(d):
-        mkt.setdefault(d, {})
         return days.setdefault(d, [0, 0, 0, 0])
-
-    def cell(d, m):
-        return mkt[d].setdefault(m, [0, 0])       # qty, made - for that market
 
     for p in parents:
         if p.date is None:
@@ -642,7 +618,6 @@ def by_day(parents, splits) -> list:
         e = slot(p.date)
         e[0] += 1
         e[1] += p.size
-        cell(p.date, p.market)[0] += p.size
     for s in splits:
         if s.date is None:
             continue
@@ -650,22 +625,24 @@ def by_day(parents, splits) -> list:
         e[2] += s.make
         if s.rejected:
             e[3] += 1
-        cell(s.date, s.market)[1] += s.make
-    return [DayRow(d, days[d][0], days[d][1], days[d][2], days[d][3],
-                   _mean(_completion(e, q) for q, e in mkt[d].values()))
-            for d in sorted(days)]
+    return [DayRow(d, o, q, e, r, _completion(e, q))
+            for d, (o, q, e, r) in sorted(days.items())]
 
 
 def totals(rows) -> Totals:
     """The headline figures.
 
-    Completion is the MEAN of the market completions - each market counts once,
-    whatever its size - and a market with no orders is left out rather than
-    averaged in as a zero.
+    Completion is the summed executed over the summed order qty - the real
+    overall fill rate.  It was briefly the mean of the market percentages,
+    because one market's replaced-and-rejected order was counted three times
+    and 81m of quantity that never existed dragged the ratio to 12.3%.  Chaining
+    fixed the double count at its source, so the honest aggregate is honest
+    again and there is no reason to prefer an average of averages.
     """
-    return Totals(sum(r.orders for r in rows), sum(r.order_qty for r in rows),
-                  sum(r.executed for r in rows), sum(r.rejections for r in rows),
-                  _mean(r.completion for r in rows))
+    ex = sum(r.executed for r in rows)
+    qty = sum(r.order_qty for r in rows)
+    return Totals(sum(r.orders for r in rows), qty, ex,
+                  sum(r.rejections for r in rows), _completion(ex, qty))
 
 
 # =============================================================================
@@ -1436,20 +1413,23 @@ def self_test() -> int:
     check("its rejections", rows[0].rejections, 1)
     check("completion", round(rows[0].completion, 1), 40.0)
     check("a market with no flow has no completion", rows[1].completion, None)
-    check("with one market, the mean IS that market", 
+    check("with one market the headline is that market",
           round(totals(rows).completion, 1), 40.0)
 
-    #  a big market at 10% beside a small one at 90%: weighted would be 10.8%,
-    #  the mean is 50% - which is the whole point of the change
+    #  the headline is the real fill rate: a big market at 10% beside a small
+    #  one at 90% is 10.8%, because most of the quantity really was not done
     two = [Row("JP", "Japan", 100, 1_000_000, 100_000, 0),
            Row("KR", "Korea", 1, 10_000, 9_000, 0),
            Row("MY", "Malaysia", 0, 0, 0, 0)]
-    check("size does not decide the headline any more",
-          round(totals(two).completion, 1), 50.0)
-    check("the quantity weighted figure it replaced",
+    check("the headline is summed executed over summed order qty",
+          round(totals(two).completion, 1), 10.8)
+    check("which is exactly that ratio",
           round(100.0 * 109_000 / 1_010_000, 1), 10.8)
-    check("and the empty market did not drag it to a third",
-          totals(two).completion != round(50.0 / 1.5, 1), True)
+    check("the mean of the market rows would have said 50",
+          round(sum(r.completion for r in two if r.completion is not None)
+                / 2, 1), 50.0)
+    check("a market with no orders contributes nothing to either side",
+          totals(two).completion, totals(two[:2]).completion)
 
     print("\nmodes")
     now = dt.datetime(2026, 7, 24, 18, 37)
