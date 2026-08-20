@@ -245,6 +245,11 @@ Q_ORDERS = """
 # ambiguous on its own and Python weighs the two, where the rule is testable.
 Q_PINS = """
 {[hist;d;syms]
+  / `$ IS LOAD BEARING.  syms arrives as a list of CHAR VECTORS - PyKX sends
+  / bytes that way - and `sym in syms` against a symbol column with char vectors
+  / on the right matches NOTHING.  Not an error: every day would come back with
+  / no limit periods, no orders touched, and a page of zeros.
+  syms:`$syms;
   ep:([] sym:0#`; grp:0#0j; start:0#0Nt; end:0#0Nt; price:0#0n;
          noask:0#0j; nobid:0#0j; ticks:0#0j);
   q:$[hist;
@@ -1056,6 +1061,7 @@ def run(args) -> int:
     qh = connect(pl.qatt_server)
 
     parents, splits, missed, traded, seen = [], [], [], 0, 0
+    no_pin_days = 0
     for d in pl.dates:
         if not args.quiet and d is not None:
             log(f"  {d} ...")
@@ -1066,6 +1072,11 @@ def run(args) -> int:
         seen += len(ps)
         syms = sorted({p.sym for p in ps})
         pins = to_pins(fetch_pins(qh, pl.hist, d, syms), d)
+        if not pins:
+            #  a day of short sell flow with NO limit period anywhere is
+            #  possible, but a run of them means the quote query is matching
+            #  nothing rather than the market being calm
+            no_pin_days += 1
         kept, hits = touched(ps, pins)
         if not kept:
             continue
@@ -1082,6 +1093,14 @@ def run(args) -> int:
 
     log(f"  {seen:,} orders in scope, {tot.orders:,} of them touched a limit, "
         f"{tot.rejections:,} rejections")
+    if seen and not tot.orders:
+        log(f"  WARNING: {seen:,} short sell orders were in scope and NOT ONE "
+            f"touched a limit period. Check {pl.qatt_server} has the syms and "
+            f"the date - a quote query matching nothing looks exactly like a "
+            f"calm market from here")
+    elif no_pin_days:
+        log(f"  {no_pin_days} of {len(pl.dates)} dates had no limit period at "
+            f"all")
     log(f"  {len(missed):,} favourable with no split on the market")
     cap = FINDINGS_PER_PAGE * FINDINGS_MAX_PAGES
     if len(missed) > cap:
@@ -1253,6 +1272,16 @@ def self_test() -> int:
                             ("day chart 2", DAY_BANDS[1])):
         check(f"{nm}: the title sits above the axes, not on the bars",
               ty > y0 + h, True)
+    #  a symbol column compared against char vectors matches NOTHING, and the
+    #  page of zeros that follows looks exactly like a calm market
+    for nm, src, args in (("Q_ORDERS", Q_ORDERS, ("sfx",)),
+                          ("Q_PINS", Q_PINS, ("syms",))):
+        for arg in args:
+            used_bare = f"in {arg}" in src or f"like/: {arg}" in src
+            cast = f"{arg}:`${arg};" in src
+            like = f"like/: {arg}" in src
+            check(f"{nm}: {arg} is cast with `$ before use, or used with like",
+                  (cast or like) if used_bare else True, True)
     check("the reserved word check would still catch one",
           sorted(q_names("{[d;ss] ss:1}") & Q_RESERVED), ["ss"])
     check("the order query groups nothing",

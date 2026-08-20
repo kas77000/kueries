@@ -144,6 +144,27 @@ is **counted on the page and logged**, never silently dropped.
 
 ---
 
+## Known gap: this does not chain replaced orders yet
+
+[`short_sell_report`](../short_sell_report/README.md) collapses a
+rejected-and-replaced order back into **one** order using FIX tag 9604, because
+the engine writes a **new `id_target`** for every re-send. **This report does
+not.** Until it does:
+
+- **Orders** and **Order qty** are inflated wherever an order was replaced —
+  the same 3-orders-for-one, 81m-for-27m error that started that work.
+- **Completion** is depressed by the same amount, since it divides by that
+  inflated quantity.
+- **The favourable-no-split table can produce false positives.** An order
+  re-sent under a new `id_target` looks like a separate order that "sent
+  nothing during the limit", even when a sibling attempt *did* have a split on
+  the book. That is a finding pointing at nothing.
+
+The chaining is worth porting across, and it is the same code: `fix_tag`,
+`to_attempts`, `to_chains` and the diagnostics.
+
+---
+
 ## Scope
 
 **Japan, Korea, Malaysia, Thailand, Indonesia, China, Taiwan and India** —
@@ -239,7 +260,7 @@ python scripts/luld_report/luld_report.py --self-test
 python scripts/luld_report/luld_report.py --demo
 ```
 
-126 checks, no kdb and no pykx: the suffix routing including the many-to-one
+129 checks, no kdb and no pykx: the suffix routing including the many-to-one
 markets, which limit a period was at, what counts as favourable, window
 arithmetic including open-ended splits, what makes a split active, which orders
 the limit touched, every guard on the findings table, the rollups, the mode
