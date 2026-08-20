@@ -25,8 +25,13 @@ fixmsg, and a cancel-and-replace carries the SAME id - it is the client saying
 earlier version of this file grouped on the oes_oid prefix; that was a
 convention, and conventions are what break silently.)
 
-Chained on (date, id_server, tag 9604).  A target whose 9604 is empty cannot be
-chained to anything, so it stands alone and is counted exactly as v1 counts it.
+Chained on (date, tag 9604).  NOT on id_server: a trader can move an order to a
+different order server mid-life, and the two halves are still one order.  How
+often that happens is reported.
+
+A target whose 9604 is empty cannot be chained to anything, so it stands alone -
+keyed on its own server and id_target, which is what keeps two unrelated
+untagged orders apart - and is counted exactly as v1 counts it.
 
 BOTH OF THE USER'S CHECKS ARE BUILT IN AND RUN EVERY TIME.
 
@@ -151,14 +156,22 @@ def fetch(handle, hist: bool, d: Optional[dt.date]):
 # CHAINS
 # =============================================================================
 
-# FIX fields are separated by SOH.  Stored copies commonly rewrite that as a
-# pipe, a semicolon or a caret, so all four are accepted.  A SPACE is not a
-# separator: values contain them.
+# THE SEPARATOR IS A SEMICOLON in this feed.  From a real fixmsg:
+#
+#   ...;16589=108223;9604=104642494_SG_HK_PORTAL_LIV_20260819162013;17717=...
+#
+# SOH and pipe are accepted too, since a stored copy may be rewritten either
+# way and neither appears inside a value here.
+#
+# A CARET IS NOT A SEPARATOR, even though it looks like one.  It is used INSIDE
+# values all over this feed - `SILK_FLOW^1008649713^TargetPart=30^SharedTempl^^`
+# and `9012=274=1^275=1` are both one field - so splitting on it would carve
+# values into pieces.  Nor is a space, for the same reason.
 #
 # If the real separator is none of these, fix_tag finds nothing and EVERY target
 # reads as having no 9604 - which the run reports in the first line of output
 # rather than quietly failing to chain anything.
-_FIX_SEPS = "\x01|;^\n\r"
+_FIX_SEPS = "\x01;|\n\r"
 CLIENT_ID_TAG = "9604"
 
 
@@ -204,14 +217,19 @@ class Attempt(NamedTuple):
     def chain_key(self) -> tuple:
         """What makes an order: the client's own id for it.
 
-        A target with no 9604 keys on its own id_target instead, so it stands
-        alone.  Grouping the un-tagged ones together would merge every unrelated
-        order the client did not label, which is the one mistake here that would
-        be invisible.
+        id_server is NOT in it - a trader can move an order to another order
+        server and it is still the same order, which is exactly the case a
+        server in the key would split back apart.
+
+        A target with no 9604 keys on its own server and id_target instead, so
+        it stands alone.  Grouping the un-tagged ones together would merge every
+        unrelated order the client did not label, which is the one mistake here
+        that would be invisible - and id_target alone is not unique across
+        servers, hence both.
         """
         if not self.client_id:
-            return (self.date, self.key[1], "", self.id_target)
-        return (self.date, self.key[1], self.client_id)
+            return (self.date, "", self.key[1], self.id_target)
+        return (self.date, self.client_id)
 
 
 class Chain(NamedTuple):
@@ -329,6 +347,7 @@ class ChainStats(NamedTuple):
     no_id_by_market: dict
     mixed: list                # chains disagreeing on sym/side/algo/basket
     mixed_size: list           # chains whose attempts disagree on size
+    multi_server: list         # chains spanning more than one order server
 
 
 def chain_stats(attempts, chs) -> ChainStats:
@@ -342,7 +361,9 @@ def chain_stats(attempts, chs) -> ChainStats:
         longest=max([c.n for c in chs], default=0),
         no_id=len(no_id), no_id_by_market=by_mkt,
         mixed=[c for c in chs if c.disagrees_on()],
-        mixed_size=[c for c in chs if len({a.size for a in c.attempts}) > 1])
+        mixed_size=[c for c in chs if len({a.size for a in c.attempts}) > 1],
+        multi_server=[c for c in chs
+                      if len({a.key[1] for a in c.attempts}) > 1])
 
 
 def report_stats(st: ChainStats, quiet=False):
@@ -376,6 +397,13 @@ def report_stats(st: ChainStats, quiet=False):
             f"numbers are WRONG.  --chains lists them")
     else:
         log(f"  no chain mixes sym, side, algo or basket")
+
+    if st.multi_server:
+        one = len(st.multi_server) == 1
+        log(f"  {len(st.multi_server):,} chain{'' if one else 's'} "
+            f"{'spans' if one else 'span'} more than one "
+            f"order server - a trader moved the order.  Not an error; keying "
+            f"on id_server would have split these back apart")
 
     if st.mixed_size:
         log(f"  NOTE: {len(st.mixed_size):,} chains have attempts of differing "
@@ -575,10 +603,12 @@ def _a(idt, country, size, cid, basket="B1", side="sellshort",
     r = v1._p(idt, country, size, d=d, srv=srv)
     if sym:
         r["sym"] = sym
-    fix = "8=FIX.4.2\x0135=D\x01"
+    #  built the way the real feed does: semicolon separated, with a caret
+    #  bearing field beside it so the parser is exercised against both
+    fix = "8=FIX.4.2;35=D;9012=274=1^275=1;16589=108223;"
     if cid:
-        fix += f"{CLIENT_ID_TAG}={cid}\x01"
-    r.update({"fixmsg": fix + extra + "59=0",
+        fix += f"{CLIENT_ID_TAG}={cid};"
+    r.update({"fixmsg": fix + extra + "17717=7280001184;59=0",
               "oes_oid": f"OID.{idt}", "basket": basket, "side": side,
               "algo": algo, "time": dt.timedelta(seconds=t)})
     return r
@@ -604,7 +634,22 @@ def self_test() -> int:
     check("pipe separated, as logs rewrite it",
           fix_tag("8=FIX.4.2|9604=ABC123|59=0"), "ABC123")
     check("semicolon separated", fix_tag("35=D;9604=ABC123;59=0"), "ABC123")
-    check("caret separated", fix_tag("35=D^9604=ABC123^59=0"), "ABC123")
+    #  A REAL fixmsg from this feed, semicolons throughout.  A caret is NOT a
+    #  separator here - it appears inside values - so a value carrying one must
+    #  come back whole.
+    REAL = ("35=D;9012=274=1^275=1;16589=108223;"
+            "9604=104642494_SG_HK_PORTAL_LIV_20260819162013;"
+            "17717=7280001184;16500=system;40=1;16505=GAM.MK")
+    check("the real message shape",
+          fix_tag(REAL), "104642494_SG_HK_PORTAL_LIV_20260819162013")
+    check("a caret inside a value does NOT split it",
+          fix_tag(REAL, tag="9012"), "274=1^275=1")
+    check("a caret-joined value keeps its carets",
+          fix_tag("35=D;1008649713=SILK_FLOW^TargetPart=30^SharedTempl^^;59=0",
+                  tag="1008649713"), "SILK_FLOW^TargetPart=30^SharedTempl^^")
+    check("the second message carries the SAME id, which is the whole point",
+          fix_tag(REAL) == fix_tag(REAL.replace("16589=108223",
+                                                "16589=108543")), True)
     check("a value containing a space survives",
           fix_tag(f"9604=ABC 123{SOH}59=0"), "ABC 123")
     check("a value containing an = survives",
@@ -650,6 +695,19 @@ def self_test() -> int:
           len(to_chains(to_attempts([
               _a(1, "TH", 100, "CLI-1", sym="A.TB", t=1),
               _a(2, "TH", 100, "CLI-1", sym="B.TB", t=2)])[0])), 1)
+    #  a trader can move an order to another order server; the two halves are
+    #  still one order, which is why id_server is not in the key
+    moved, _ = to_attempts([_a(1, "TH", 100, "CLI-1", t=1, srv=1),
+                            _a(2, "TH", 100, "CLI-1", t=2, srv=7)])
+    mv = to_chains(moved)
+    check("a trader moving the order server does NOT split it", len(mv), 1)
+    check("and the run says it happened",
+          len(chain_stats(moved, mv).multi_server), 1)
+    check("which is not an error", len(chain_stats(moved, mv).mixed), 0)
+    check("two untagged targets on different servers stay apart",
+          len(to_chains(to_attempts([_a(1, "TH", 100, "", srv=1),
+                                     _a(1, "TH", 100, "", srv=7)])[0])), 2)
+
     check("a different day IS a different order",
           len(to_chains(to_attempts([
               _a(1, "TH", 100, "CLI-1", d=dt.date(2026, 7, 1)),

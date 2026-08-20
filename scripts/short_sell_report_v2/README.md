@@ -35,23 +35,48 @@ cancel-and-replace carries the **same id** — the client saying "this is still
 that order". That is a fact, not an inference.
 
 ```
-8=FIX.4.2 | 35=D | 9604=CLI-0001 | 59=0     attempt 1
-8=FIX.4.2 | 35=D | 9604=CLI-0001 | 59=0     attempt 2   same order
+...;16589=108223;9604=104642494_SG_HK_PORTAL_LIV_20260819162013;17717=...
+...;16589=108543;9604=104642494_SG_HK_PORTAL_LIV_20260819162013;17717=...
+                      ^^^^^^^^^^ same id, so one order
 ```
 
-Chained on **(date, id_server, tag 9604)**. A target whose 9604 is empty cannot
-be chained to anything, so it **stands alone** and is counted exactly as v1
-counts it — untagged orders are never grouped together, which would merge every
-order the client did not label.
+Chained on **(date, tag 9604)**.
+
+**`id_server` is deliberately not in the key** — a trader can move an order to
+another order server mid-life, and the two halves are still one order. Keying on
+the server would split them back apart. How often it happens is reported:
+
+```
+1 chain spans more than one order server - a trader moved the order.  Not an
+error; keying on id_server would have split these back apart
+```
+
+A target whose 9604 is empty cannot be chained to anything, so it **stands
+alone** — keyed on its own server *and* `id_target`, which keeps two unrelated
+untagged orders apart (`id_target` is not unique across servers).
 
 > An earlier version of this grouped on the `oes_oid` prefix. That was a
 > convention; 9604 is a contract. The prefix version is gone.
 
-**Reading the tag.** Fields are split on SOH (``), pipe, semicolon or caret —
-a space is *not* a separator, since values contain them. The whole tag is
-compared after splitting rather than searching for `"9604="`, so `19604=`,
-`96040=` and a `9604=` appearing inside another field's *value* are all
-correctly ignored.
+### Reading the tag
+
+**The separator is a semicolon** in this feed, as above. SOH and pipe are
+accepted too, since a stored copy may be rewritten either way.
+
+**A caret is not a separator**, though it looks like one — it is used *inside*
+values throughout this feed:
+
+```
+9012=274=1^275=1                                   one field
+1008649713=SILK_FLOW^TargetPart=30^SharedTempl^^   one field
+```
+
+Splitting on it would carve values into pieces. Nor is a space, for the same
+reason.
+
+The whole tag is compared after splitting, rather than searching for `"9604="` —
+so `19604=`, `96040=` and a `9604=` appearing inside another field's *value* are
+all correctly ignored.
 
 ## What changes, and what does not
 
@@ -198,7 +223,7 @@ each other.
 python scripts/short_sell_report_v2/short_sell_report_v2.py --self-test
 ```
 
-95 checks, no kdb and no pykx: parsing tag 9604 out of a fixmsg in four
+102 checks, no kdb and no pykx: parsing tag 9604 out of a fixmsg in four
 separator styles and refusing the 19604/96040/embedded-value traps, chaining on
 the client id, untagged targets standing alone, which attempt sets the quantity,
 both checks and the exclusivity of their branches, the Thailand rollup end to
