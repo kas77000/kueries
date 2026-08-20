@@ -71,6 +71,13 @@ from typing import NamedTuple, Optional
 # Copy scripts/lib alongside this folder if you move it.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from lib.report_page import (                                    # noqa: E402
+    BASELINE, BLUE, COL_W, DASH, GREEN, H_TABLE_HEAD, HEADER_BG, INK, INK2,
+    INK3, L, PAGE_H, PAGE_W, R, RED, RULE, SURFACE,
+    barchart, figure, fmt_int, fmt_pct0, fmt_pct1, footer as _footer, heading,
+    hline, kpis as _kpis_row, log, save as _save, table as _table_rows,
+    vbarchart)
+
 # -----------------------------------------------------------------------------
 # CONNECTIONS.  Edit these.
 #
@@ -160,40 +167,14 @@ RESTRICTED_FIXMSG = "*RSHO=1*"
 
 
 # =============================================================================
-# PALETTE
+# THIS REPORT
 #
-# Taken UNCHANGED from the data-viz reference palette, which documents its own
-# validation.  Two charts, one series each, so hue is chart identity rather than
-# series identity and no within-chart separation is at stake:
-#
-#   completion   categorical slot 1, blue #2a78d6
-#   rejections   status `critical`, red #d03b3b - 4.68:1 on this surface, and
-#                deliberately not the categorical red, so it never reads as
-#                "series 8"
-#
-# Light only.  This page is a PDF that gets printed and pasted into documents;
-# a themed surface would be a liability rather than a feature.
+# The page itself - palette, marks, table, KPI row - is scripts/lib/report_page.
+# What stays here is what is about THIS report: its title, its layout bands, and
+# what goes in its columns.
 # =============================================================================
 
-BLUE = "#2a78d6"        # completion bars
-RED = "#d03b3b"         # rejection bars, rejection counts, the rejection KPI
-GREEN = "#006300"       # the completion KPI (success text)
-SURFACE = "#ffffff"
-INK = "#0b0b0b"         # primary
-INK2 = "#52514e"        # secondary
-INK3 = "#898781"        # muted - axis and category labels
-RULE = "#e1e0d9"        # hairline
-BASELINE = "#c3c2b7"    # chart baseline
-HEADER_BG = "#3a3835"   # table header band
-HEADER_FG = "#ffffff"
-
-FONTS = ["Segoe UI", "Helvetica Neue", "Arial", "DejaVu Sans"]
-
 TITLE = "Short-Sell Order Report"
-
-
-def log(msg=""):
-    print(msg, file=sys.stderr, flush=True)
 
 
 # =============================================================================
@@ -575,25 +556,6 @@ def totals(rows) -> Totals:
 
 
 # =============================================================================
-# FORMATTING
-# =============================================================================
-
-DASH = "—"
-
-
-def fmt_int(n) -> str:
-    return f"{int(n):,}"
-
-
-def fmt_pct1(v) -> str:
-    return DASH if v is None else f"{v:.1f}%"
-
-
-def fmt_pct0(v) -> str:
-    return "0%" if v is None else f"{v:.0f}%"
-
-
-# =============================================================================
 # PAGE
 #
 # One A4 portrait page, laid out by hand in figure fractions.  Not a GridSpec:
@@ -657,220 +619,28 @@ BAR_R_IN = 0.035      # rounded data end, inches (~4px at 100dpi)
 BAR_FRAC = 0.58       # bar height as a fraction of the row pitch - thin marks
 
 
-def _mpl():
-    """matplotlib, imported here so the module still imports without it."""
-    try:
-        import matplotlib
-    except ImportError:
-        raise SystemExit("drawing the report needs matplotlib.  "
-                         "pip install matplotlib")
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    matplotlib.rcParams["font.family"] = "sans-serif"
-    matplotlib.rcParams["font.sans-serif"] = FONTS
-    matplotlib.rcParams["pdf.fonttype"] = 42      # embed TrueType, keep text real
-    return plt
-
-
-def _hline(fig, y, x0=L, x1=R, color=RULE, lw=0.8):
-    from matplotlib.lines import Line2D
-    fig.add_artist(Line2D([x0, x1], [y, y], transform=fig.transFigure,
-                          color=color, linewidth=lw, zorder=1))
-
-
-def _rect(fig, x, y, w, h, color, zorder=1):
-    from matplotlib.patches import Rectangle
-    fig.add_artist(Rectangle((x, y), w, h, transform=fig.transFigure,
-                             facecolor=color, edgecolor="none", zorder=zorder))
-
-
-def _rounded_bar(ax, y0, h, w, color, rx, ry):
-    """A bar with a square baseline end and a rounded data end.
-
-    rx and ry are given separately because the axes is not square: a single
-    radius in data units would draw an ellipse.  Both are clamped so a very
-    short bar degrades to a rectangle instead of folding in on itself.
-    """
-    from matplotlib.patches import PathPatch
-    from matplotlib.path import Path
-    if w <= 0:
-        return
-    rx = min(rx, w * 0.5)
-    ry = min(ry, h * 0.5)
-    y1 = y0 + h
-    verts = [(0.0, y0), (w - rx, y0), (w, y0), (w, y0 + ry), (w, y1 - ry),
-             (w, y1), (w - rx, y1), (0.0, y1), (0.0, y0)]
-    codes = [Path.MOVETO, Path.LINETO, Path.CURVE3, Path.CURVE3, Path.LINETO,
-             Path.CURVE3, Path.CURVE3, Path.LINETO, Path.CLOSEPOLY]
-    ax.add_patch(PathPatch(Path(verts, codes), facecolor=color,
-                           edgecolor="none", zorder=3))
-
-
-def _rounded_vbar(ax, x0, w, h, color, rx, ry):
-    """A column with a square foot on the baseline and a rounded top.
-
-    The mirror of _rounded_bar.  rx and ry are separate for the same reason: a
-    single radius in data units would draw an ellipse on a non-square axes.
-    """
-    from matplotlib.patches import PathPatch
-    from matplotlib.path import Path
-    if h <= 0:
-        return
-    rx = min(rx, w * 0.5)
-    ry = min(ry, h * 0.5)
-    x1 = x0 + w
-    verts = [(x0, 0.0), (x0, h - ry), (x0, h), (x0 + rx, h), (x1 - rx, h),
-             (x1, h), (x1, h - ry), (x1, 0.0), (x0, 0.0)]
-    codes = [Path.MOVETO, Path.LINETO, Path.CURVE3, Path.CURVE3, Path.LINETO,
-             Path.CURVE3, Path.CURVE3, Path.LINETO, Path.CLOSEPOLY]
-    ax.add_patch(PathPatch(Path(verts, codes), facecolor=color,
-                           edgecolor="none", zorder=3))
-
-
-def _vbarchart(fig, rect, title, labels, values, texts, color,
-               vmax=None, fs=5.4, title_y=None):
-    """One VERTICAL bar chart: columns left to right, dates turned on their side
-    under the baseline, values above each column.
-
-    This is the form the day series takes.  A month is a sequence, and a
-    sequence reads left to right - the horizontal form used for the five markets
-    would put time on the vertical axis, which is the wrong axis for it.
-    """
-    x0, y0, w, h = rect
-    ax = fig.add_axes(rect)
-    ax.set_axis_off()
-    ax.patch.set_alpha(0.0)
-
-    n = max(len(values), 1)
-    top = vmax if vmax is not None else max([abs(v) for v in values] + [0.0])
-    if not top:
-        top = 1.0
-    ax.set_xlim(-0.5, n - 0.5)
-    ax.set_ylim(0.0, top * 1.16)          # headroom for the value labels
-
-    rx = BAR_R_IN * n / (w * PAGE_W)
-    ry = BAR_R_IN * (top * 1.16) / (h * PAGE_H)
-
-    pad = 0.03 * top
-    for i, (lab, v, txt) in enumerate(zip(labels, values, texts)):
-        _rounded_vbar(ax, i - BAR_FRAC / 2.0, BAR_FRAC, max(v, 0.0),
-                      color, rx, ry)
-        ax.text(i, max(v, 0.0) + pad, txt, ha="center", va="bottom",
-                fontsize=fs, color=INK, fontweight="bold")
-        ax.text(i, -pad, lab, ha="right", va="center", rotation=90,
-                rotation_mode="anchor", fontsize=fs, color=INK3)
-
-    if title_y is None:
-        title_y = y0 + h + 0.014
-    fig.text(x0, title_y, title, fontsize=10.5, fontweight="bold", color=INK)
-    _hline(fig, y0, x0, x0 + w, color=BASELINE, lw=0.8)
-    return ax
-
-
-def _barchart(fig, rect, title, labels, values, texts, color,
-              vmax=None, fs=8.0, title_y=None, gutter=0.38, head=1.26):
-    """One horizontal bar chart: category gutter, bars, direct value labels.
-
-    No axes, no grid, no ticks.  Every bar is labelled - with at most a handful
-    of categories, or with a date series that is read like a table, the label is
-    the value channel and an axis would only repeat it less precisely.
-
-    gutter is how much room the category labels get, and head how far past the
-    longest bar the value labels may run, both as multiples of the scale.  They
-    are arguments because a full date needs about half again the gutter a market
-    name does, and a bar squeezed to buy that room is the wrong trade.
-    """
-    x0, y0, w, h = rect
-    ax = fig.add_axes(rect)
-    ax.set_axis_off()
-    ax.patch.set_alpha(0.0)
-
-    n = max(len(values), 1)
-    top = vmax if vmax is not None else max([abs(v) for v in values] + [0.0])
-    if not top:
-        top = 1.0
-    # gutter for the category labels, headroom for the value labels
-    ax.set_xlim(-gutter * top, head * top)
-    ax.set_ylim(n, 0)                       # first category at the top
-
-    # inches per data unit, so the corner radius is round rather than elliptical
-    span_x = (gutter + head) * top
-    rx = BAR_R_IN * span_x / (w * PAGE_W)
-    ry = BAR_R_IN * n / (h * PAGE_H)
-
-    pad = 0.022 * top
-    for i, (lab, v, txt) in enumerate(zip(labels, values, texts)):
-        yb = i + (1.0 - BAR_FRAC) / 2.0
-        _rounded_bar(ax, yb, BAR_FRAC, max(v, 0.0), color, rx, ry)
-        ax.text(-pad, i + 0.5, lab, ha="right", va="center",
-                fontsize=fs, color=INK3)
-        ax.text(max(v, 0.0) + pad, i + 0.5, txt, ha="left", va="center",
-                fontsize=fs, color=INK, fontweight="bold")
-
-    if title_y is None:
-        title_y = y0 + h + 0.014
-    fig.text(x0, title_y, title, fontsize=10.5, fontweight="bold", color=INK)
-    _hline(fig, y0 - 0.008, x0, x0 + w, color=BASELINE, lw=0.8)
-    return ax
-
-
 def _table(fig, rows, y_top, row_h):
-    """The per market table, drawn by hand.
-
-    A dark header band and hairline separated rows, matching the page this
-    reproduces.  Numbers are right aligned on tabular figures so the columns
-    line up; a zero rejection count stays muted so the eye is only pulled to
-    the counts that are not zero.
-    """
-    head_y = y_top - H_TABLE_HEAD
-    _rect(fig, L, head_y, COL_W, H_TABLE_HEAD, HEADER_BG, zorder=2)
-
-    x = L
-    edges = []
-    for label, frac, right in TABLE_COLS:
-        w = frac * COL_W
-        edges.append((x, w, right))
-        tx = x + w - 0.008 if right else x + 0.010
-        fig.text(tx, head_y + H_TABLE_HEAD / 2.0, label,
-                 ha="right" if right else "left", va="center",
-                 fontsize=8.5, fontweight="bold", color=HEADER_FG, zorder=3)
-        x += w
-
-    y = head_y
-    for r in rows:
-        y -= row_h
-        cells = (
-            (r.name, INK, "normal"),
-            (fmt_int(r.orders), INK, "normal"),
-            (fmt_int(r.order_qty), INK, "normal"),
-            (fmt_int(r.executed), INK, "normal"),
-            (fmt_pct1(r.completion), INK, "normal"),
-            (fmt_int(r.rejections),
-             RED if r.rejections else INK3,
-             "bold" if r.rejections else "normal"),
-        )
-        for (cx, cw, right), (txt, colour, weight) in zip(edges, cells):
-            tx = cx + cw - 0.008 if right else cx + 0.010
-            fig.text(tx, y + row_h / 2.0, txt,
-                     ha="right" if right else "left", va="center",
-                     fontsize=9, color=colour, fontweight=weight)
-        _hline(fig, y, L, R)
-    return y
+    """The per market table.  A zero rejection count stays muted, so the eye is
+    only pulled to the counts that are not zero."""
+    cells = [[(r.name, INK, "normal"),
+              (fmt_int(r.orders), INK, "normal"),
+              (fmt_int(r.order_qty), INK, "normal"),
+              (fmt_int(r.executed), INK, "normal"),
+              (fmt_pct1(r.completion), INK, "normal"),
+              (fmt_int(r.rejections),
+               RED if r.rejections else INK3,
+               "bold" if r.rejections else "normal")]
+             for r in rows]
+    return _table_rows(fig, TABLE_COLS, cells, y_top, row_h)
 
 
 def _kpis(fig, tot):
     """The three headline figures.  Colour carries the same meaning it carries
     everywhere else on the page: green completion, red rejections."""
-    items = (
-        (fmt_int(tot.orders), "Short-sell orders", INK),
-        (fmt_pct1(tot.completion), "Overall completion", GREEN),
-        (fmt_int(tot.rejections), "Rejections", RED),
-    )
-    for i, (value, label, colour) in enumerate(items):
-        x = L + i * (COL_W / 3.0)
-        fig.text(x, Y_KPI_VALUE, value, fontsize=24, fontweight="bold",
-                 color=colour, va="baseline")
-        fig.text(x, Y_KPI_LABEL, label, fontsize=9, color=INK2, va="baseline")
+    _kpis_row(fig, [(fmt_int(tot.orders), "Short-sell orders", INK),
+                    (fmt_pct1(tot.completion), "Overall completion", GREEN),
+                    (fmt_int(tot.rejections), "Rejections", RED)],
+              Y_KPI_VALUE, Y_KPI_LABEL)
 
 
 def _sorted_pairs(rows, key):
@@ -881,16 +651,10 @@ def _sorted_pairs(rows, key):
 
 def draw(rows, tot, subtitle, footer, days=None):
     """The whole page.  Pure: takes rollups, returns a figure."""
-    plt = _mpl()
     monthly = days is not None
 
-    fig = plt.figure(figsize=(PAGE_W, PAGE_H), facecolor=SURFACE)
-    fig.patch.set_facecolor(SURFACE)
-
-    fig.text(L, Y_TITLE, TITLE, fontsize=19, fontweight="bold", color=INK,
-             va="baseline")
-    fig.text(L, Y_SUBTITLE, subtitle, fontsize=9.5, color=INK2, va="baseline")
-    _hline(fig, Y_RULE_TOP)
+    fig = figure()
+    heading(fig, TITLE, subtitle, Y_TITLE, Y_SUBTITLE, Y_RULE_TOP)
     _kpis(fig, tot)
 
     row_h = 0.030 if monthly else 0.040
@@ -903,16 +667,16 @@ def draw(rows, tot, subtitle, footer, days=None):
     mkt_y0, mkt_rect_h, mkt_title_y = MKT_BAND["monthly" if monthly else "daily"]
     half = 0.405
 
-    _barchart(fig, (L, mkt_y0, half, mkt_rect_h), "Completion by market",
-              [r.name for r in comp],
-              [(r.completion or 0.0) for r in comp],
-              [fmt_pct0(r.completion) for r in comp],
-              BLUE, vmax=100.0, fs=8.0, title_y=mkt_title_y)
-    _barchart(fig, (R - half, mkt_y0, half, mkt_rect_h), "Rejections by market",
-              [r.name for r in rej],
-              [float(r.rejections) for r in rej],
-              [fmt_int(r.rejections) for r in rej],
-              RED, fs=8.0, title_y=mkt_title_y)
+    barchart(fig, (L, mkt_y0, half, mkt_rect_h), "Completion by market",
+             [r.name for r in comp],
+             [(r.completion or 0.0) for r in comp],
+             [fmt_pct0(r.completion) for r in comp],
+             BLUE, vmax=100.0, fs=8.0, title_y=mkt_title_y)
+    barchart(fig, (R - half, mkt_y0, half, mkt_rect_h), "Rejections by market",
+             [r.name for r in rej],
+             [float(r.rejections) for r in rej],
+             [fmt_int(r.rejections) for r in rej],
+             RED, fs=8.0, title_y=mkt_title_y)
 
     # ---- completion and rejections by day ----------------------------------
     if monthly:
@@ -924,32 +688,24 @@ def draw(rows, tot, subtitle, footer, days=None):
         labels = [f"{d.date:%Y-%m-%d}" for d in days] or ["-"]
         day_fs = 5.4 if len(days) > 16 else 6.8
         (cy, ch, cty), (ry, rh, rty) = DAY_BANDS
-        _vbarchart(fig, (L, cy, COL_W, ch), "Completion by day",
-                   labels,
-                   [(d.completion or 0.0) for d in days] or [0.0],
-                   [fmt_pct0(d.completion) for d in days] or [DASH],
-                   BLUE, vmax=100.0, fs=day_fs, title_y=cty)
-        _vbarchart(fig, (L, ry, COL_W, rh), "Rejections by day",
-                   labels,
-                   [float(d.rejections) for d in days] or [0.0],
-                   [fmt_int(d.rejections) for d in days] or ["0"],
-                   RED, fs=day_fs, title_y=rty)
+        vbarchart(fig, (L, cy, COL_W, ch), "Completion by day",
+                  labels,
+                  [(d.completion or 0.0) for d in days] or [0.0],
+                  [fmt_pct0(d.completion) for d in days] or [DASH],
+                  BLUE, vmax=100.0, fs=day_fs, title_y=cty)
+        vbarchart(fig, (L, ry, COL_W, rh), "Rejections by day",
+                  labels,
+                  [float(d.rejections) for d in days] or [0.0],
+                  [fmt_int(d.rejections) for d in days] or ["0"],
+                  RED, fs=day_fs, title_y=rty)
 
     # ---- notes and footer ---------------------------------------------------
-    _hline(fig, Y_RULE_BOTTOM)
-    fig.text(L, Y_FOOTER, footer, fontsize=7.5, color=INK3, va="baseline")
+    _footer(fig, footer, Y_RULE_BOTTOM, Y_FOOTER)
     return fig
 
 
 def save(fig, out_dir: Path, stem: str):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    written = []
-    for ext in ("pdf", "png"):
-        p = out_dir / f"{stem}.{ext}"
-        fig.savefig(p, dpi=DPI, facecolor=SURFACE)
-        written.append(p)
-        log(f"  wrote {p}")
-    return written
+    return _save(fig, out_dir, stem, dpi=DPI)
 
 
 # =============================================================================

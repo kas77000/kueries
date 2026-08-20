@@ -1,6 +1,7 @@
 # scripts/lib
 
-Shared pieces that are not about any one report. Everything under `scripts/` is
+Shared pieces that are not about any one report: the page they are drawn on,
+and the mail that carries them. Everything under `scripts/` is
 otherwise self-contained, one folder per script; this is the exception, for the
 things a second script would otherwise copy.
 
@@ -12,6 +13,54 @@ from lib import mailer
 ```
 
 If you copy a script folder to another machine, copy this one beside it.
+
+---
+
+## `report_page.py`
+
+The A4 page these reports are made of: the palette, a hand-drawn table, a KPI
+row, and horizontal and vertical bar charts. It knows nothing about orders,
+markets or kdb — a caller passes text and numbers and gets marks on a page.
+
+```python
+from lib.report_page import figure, heading, kpis, table, barchart, save, INK, BLUE
+
+fig = figure()                                   # blank A4 portrait
+heading(fig, "My Report", "By market · 2026-07-24")
+kpis(fig, [("732", "Orders", INK)], 0.884)
+table(fig, COLS, rows, y_top=0.808, row_h=0.040)
+barchart(fig, (L, 0.195, 0.405, 0.265), "By market", labels, values, texts, BLUE)
+save(fig, out_dir, "my_report")                  # .pdf + .png
+```
+
+```
+python scripts/lib/report_page.py --self-test
+```
+
+**Why it is a library.** The second report wanted the same page as the first,
+and two copies of a layout drift the moment one of them is corrected. What is
+in here is the part that is genuinely the same. The *layout* — where the bands
+sit, how tall the rows are, what goes in the columns — stays in each report,
+because that is the part that legitimately differs.
+
+**Not a grid.** The page is a document rather than a plot: a title block, a
+rule, a KPI row, a table, then charts. Only the bars live in an axes, and every
+position is a figure fraction, so a caller reads like a layout rather than like
+a chain of subplot calls.
+
+- `table()` takes `[(label, width fraction, right_aligned)]` and rows of
+  `(text, colour, weight)` **per cell**, so the caller decides what is
+  emphasised without this module knowing why. It returns the y it ended at.
+- `barchart()` / `vbarchart()` draw no axes, no grid and no ticks — every bar
+  carries a direct label, which for a handful of categories is more precise
+  than an axis and less furniture.
+- `save()` takes one figure, or a list for a multi-page PDF — in which case it
+  also writes `stem_p1.png`, `stem_p2.png`… PNG has no concept of a page, and
+  silently writing only the first one is how a second page goes unnoticed.
+- The palette is the validated data-viz reference set, light only: these pages
+  get printed and pasted into documents, where a themed surface is a liability.
+
+Used by [`short_sell_report`](../short_sell_report/README.md).
 
 ---
 
@@ -86,4 +135,4 @@ nobody received is only harmless if somebody knows it was not received.
 
 Standard library only — `smtplib` and `email`.
 
-Used by [`scripts/short_sell_report`](../short_sell_report/README.md).
+Used by [`short_sell_report`](../short_sell_report/README.md).
