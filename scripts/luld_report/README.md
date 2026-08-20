@@ -30,7 +30,7 @@ by market:
 Limit Up / Limit Down Order Report
 By market · 2026-07-24 18:37
 ────────────────────────────────────────────────────────────────────
-103                48.3%                309           10
+103                43.6%                309           10
 Orders at a limit  Overall completion   Rejections    Favourable, no split
 
 ┌───────────┬────────┬────────────┬────────────┬────────────┬────────────┐
