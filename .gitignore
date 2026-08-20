@@ -7,3 +7,6 @@ no_git/
 
 # python artefacts, from running the scripts' --self-test
 __pycache__/
+
+# report output written by the scripts
+scripts/*/out/
