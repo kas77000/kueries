@@ -153,6 +153,11 @@ ORDER_SERVER_RT   = "CHANGEME:5012"   # realtime
 ORDER_SERVER_HIST = "CHANGEME:5010"   # historical, the same tables plus `date`
 ```
 
+Host and port is the whole of it — both are open processes, so `connect()` is
+`kx.SyncQConnection(host=…, port=…)` with no username and no password, the same
+way the mail relay needs no login. A check asserts no `USER` or `PASSWORD`
+constant has crept back in.
+
 `--monthly` walks the month a date at a time, skipping weekends. Holidays are
 **not** skipped: a holiday calendar we would have to maintain is a worse failure
 mode than a handful of queries that return nothing.
@@ -235,8 +240,9 @@ attached, and opens no socket — the way to check a new recipient list.
 **SMTP is host, port and timeout — there is nothing else.** No credentials and
 no STARTTLS: the relay takes mail from the host this runs on, so there is
 nothing to authenticate with, and an auth path nobody exercises is a path that
-is broken by the time somebody needs it. A check asserts no `SMTP_USER` or
-`SMTP_PASSWORD` has crept back in.
+is broken by the time somebody needs it. One check covers both this and the kdb
+connection: no `SMTP_USER`, `SMTP_PASSWORD`, `USER` or `PASSWORD` constant
+exists.
 
 The mailer itself is **[`scripts/lib/mailer.py`](../lib/README.md)**, which knows
 nothing about this report and is meant to be reused by the next script that

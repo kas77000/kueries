@@ -74,15 +74,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # CONNECTIONS.  Edit these.
 #
 # Two flavours of the SAME order server.  The default report reads the realtime
-# one; --monthly and --date read the historical one.  USER / PASSWORD stay None
-# for an open process - do not commit a real password, read it from the
-# environment here if these servers ever need one.
+# one; --monthly and --date read the historical one.  Both are open processes -
+# host and port is the whole of it, the same way the relay needs no login.
 # -----------------------------------------------------------------------------
 
 ORDER_SERVER_RT = "CHANGEME:5012"     # realtime   - target and workorder
 ORDER_SERVER_HIST = "CHANGEME:5010"   # historical - the same two, plus `date`
-USER = None
-PASSWORD = None
 
 _PLACEHOLDER = "CHANGEME"
 
@@ -269,7 +266,12 @@ def _check_server(endpoint: str, which: str):
 
 
 def connect(endpoint: str):
-    """Open a PyKX connection.  Imported lazily so --self-test runs anywhere."""
+    """Open a PyKX connection.  Host and port; the processes are open.
+
+    pykx is imported here rather than at module level so --self-test, --demo and
+    everything else off the wire run on a machine that has neither pykx nor a q
+    licence.
+    """
     try:
         import pykx as kx
     except ImportError:
@@ -277,8 +279,7 @@ def connect(endpoint: str):
     host, _, port = endpoint.rpartition(":")
     if not host or not port.isdigit():
         raise SystemExit(f"expected host:port, got {endpoint!r}")
-    return kx.SyncQConnection(host=host, port=int(port),
-                              username=USER, password=PASSWORD)
+    return kx.SyncQConnection(host=host, port=int(port))
 
 
 # A date is always sent, even to the realtime server, so the argument keeps its
@@ -1558,9 +1559,10 @@ def self_test() -> int:
             r = "EMAIL_FROM" in str(e)
         check("EMAIL_TO with no EMAIL_FROM says so, naming the block", r, True)
 
-    check("there is nothing to authenticate with, by design",
+    check("there is nothing to authenticate with anywhere, by design",
           [f for f in ("SMTP_USER", "SMTP_PASSWORD", "SMTP_PASSWORD_ENV",
-                       "SMTP_STARTTLS") if f in globals()], [])
+                       "SMTP_STARTTLS", "USER", "PASSWORD") if f in globals()],
+          [])
     check("port 0 means 25", m.Smtp(host="x").resolved_port(), 25)
 
     check("there are no email flags left on the command line",
