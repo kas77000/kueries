@@ -29,12 +29,13 @@ the quantities, nor the rejections.
 
 WHAT THE THREE NUMBERS MEAN
 
-  Orders       parent short sell orders - target rows with side=`sellshort,
-               one per (date, id_server, id_target)
-  Completion   executed / order qty, quantity weighted.  Executed is the sum
-               of workorder `make` - a workorder is a child order and `make` is
-               what it executed, whatever state it ended in; order qty is the
-               sum of parent `size`.  The headline figure is the same ratio
+  Orders       parent short sell orders - target rows with side=`sellshort.
+               A target IS an order, so this is a row count
+  Completion   executed / order qty, quantity weighted.  Order qty is the sum
+               of `size` over the targets in that market - `size` IS the
+               order's quantity, taken as it stands; executed is the sum of
+               workorder `make` - a workorder is a child order and `make` is
+               what it executed, whatever state it ended in.  The headline figure is the same ratio
                taken over all five markets at once, NOT the average of the
                five percentages - a market with 500 orders should not weigh
                the same as one with 5.
@@ -235,17 +236,20 @@ Q_SESSION = """
          state:0#`);
 
   / parents.  The sym suffix is the market filter, so target_stock is not read
-  / at all - two tables, no join.  target is a tickstream, an amended order
-  / writes again, so the last row per (date;id_server;id_target) is the order as
-  / it finally stood.  upper, because the filter must not depend on how the feed
-  / cased the suffix.
+  / at all - two tables, no join.  upper, because the filter must not depend on
+  / how the feed cased the suffix.
+  /
+  / NOTHING IS GROUPED.  A target IS an order and `size` IS its quantity, so
+  / the rows come back as they are; the market total is the sum of the sizes of
+  / the targets in that market, and that sum happens in Python.  Same for
+  / workorder below.  Every `last ... by` this query used to carry was guarding
+  / against a row multiplication that does not happen, at the price of hiding
+  / one that would.
   t:$[hist;
       select date,id_server,id_target,sym,size,fixmsg
         from target where date=d, side=sside, any (upper sym) like/: sfx;
       update date:0Nd from select id_server,id_target,sym,size,fixmsg
         from target where side=sside, any (upper sym) like/: sfx];
-  t:0!select last sym, last size, last fixmsg
-       by date,id_server,id_target from t;
   if[0=count t; :(et;ew)];
 
   / children.  Every workorder of those targets, ROW BY ROW and deliberately not
@@ -513,9 +517,11 @@ class Totals(NamedTuple):
 def by_market(parents, splits) -> list:
     """One Row per market, always all five, always in MARKETS order.
 
-    Both workorder figures are per row: an order's executed quantity is the sum
-    of `make` over its rows, and its rejections are the count of its rows
-    carrying the state.
+    Every figure is a plain count or a plain sum over rows the query returned
+    as they stand.  A target is an order and `size` is its quantity, so a
+    market's order qty is the sum of its targets' sizes; a workorder is a child
+    order, so a market's executed is the sum of their `make` and its rejections
+    the count of those in state `rejected.  Nothing is grouped anywhere.
     """
     orders = {c: 0 for c in MARKET_CODES}
     qty = {c: 0 for c in MARKET_CODES}
@@ -1426,6 +1432,9 @@ def self_test() -> int:
           sorted(q_names("{[hist;ss] ss:1; t:2}") & Q_RESERVED), ["ss"])
     check("the side is sent as a char vector, not a symbol",
           isinstance(SHORTSELL_SIDE.encode(), bytes), True)
+    check("the query groups nothing - both tables come back row by row",
+          [ln.strip() for ln in Q_SESSION.splitlines()
+           if "last " in ln and " by " in ln], [])
     check("the lambda's braces balance",
           Q_SESSION.count("{") == Q_SESSION.count("}"), True)
     check("and its brackets do",

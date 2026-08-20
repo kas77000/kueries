@@ -80,14 +80,26 @@ reach, a network share included.
 
 | | |
 |---|---|
-| **Orders** | parent short sell orders — `target` rows with ``side=`sellshort``, one per `(date, id_server, id_target)`. `target` is a tickstream, so an amended order is reduced to its **last** row before it is counted. |
-| **Order qty** | the sum of parent `size`. |
+| **Orders** | parent short sell orders — `target` rows with ``side=`sellshort``. A target **is** an order, so this is a row count. |
+| **Order qty** | the sum of `size` over the targets in that market. `size` **is** the order's quantity, taken as it stands — nothing is aggregated within an order; the only sum is the one across the market's orders. |
 | **Executed** | the sum of `workorder.make`. A workorder **is** a child order, and `make` is what that child executed — whatever state it ended in, so a cancelled child that part-filled still contributes what it filled. Nothing but `make` says a quantity was executed. |
 | **Completion** | `Executed / Order qty`. The **headline** figure is that same ratio taken over all five markets at once, **not** the average of the five percentages — a market with 500 orders must not weigh the same as one with 5. |
 | **Rejections** | the `workorder` rows whose state is ``` `rejected ```. Counted per **child** order, not per parent, which is why Hong Kong can show 109 orders and 239 rejections. |
 
-Both are a plain sum and a plain count over the target's workorder rows —
-`workorder` is never grouped by `id_work`.
+**Nothing is grouped, in either table.** A target is an order and a workorder
+is a child order, so every figure on the page is a plain row count or a plain
+sum over rows the query returns as they stand:
+
+```
+Orders      count of target rows
+Order qty   sum of target.size
+Executed    sum of workorder.make
+Rejections  count of workorder rows in state `rejected
+```
+
+The `last … by` clauses this query used to carry were guarding against a row
+multiplication that does not happen, at the price of hiding one that would. A
+check asserts none has crept back in.
 
 `workorder` also carries `invalid_ack` and `fail_ack`. They are **not** counted:
 they are a different failure — a malformed or unacknowledged send rather than a
@@ -272,7 +284,7 @@ rendering path runs on a machine with no kdb, no pykx and no q licence:
 python scripts/short_sell_report/short_sell_report.py --self-test
 ```
 
-It rebuilds the page above from synthetic records — 133 checks — covering the
+It rebuilds the page above from synthetic records — 134 checks — covering the
 suffix routing (including the suffixes that are *not* ours, like Tokyo's `.T`),
 the market rollup, the quantity weighted headline, the Japan exclusion
 (including that the dropped orders' fills and rejections go with them), the
