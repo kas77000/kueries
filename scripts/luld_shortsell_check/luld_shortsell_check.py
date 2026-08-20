@@ -306,8 +306,14 @@ def compute_band(base: float, country: str, sym: str,
 
 
 def reconcile_band(computed: Optional[Band], pin, session_high, session_low,
-                   country: str, tick: float) -> Optional[Band]:
+                   country: str, tick: float,
+                   acc_high=None, acc_low=None) -> Optional[Band]:
     """Grade a computed band against what the market actually did.
+
+    acc_high / acc_low are the extreme prices at which OUR OWN splits were
+    accepted by the venue.  A split the exchange took at a price outside the
+    computed band is proof the band is wrong - better proof than the session
+    extremes, because it is our order and the venue's own answer to it.
 
     None means the band is contradicted with no known cause and has been
     discarded.  That is deliberate: reporting "no band for 40 names" is worth
@@ -319,15 +325,16 @@ def reconcile_band(computed: Optional[Band], pin, session_high, session_low,
     if pin and pin > 0:
         if abs(pin - computed.up) <= tol or abs(pin - computed.dn) <= tol:
             return computed._replace(conf="confirmed")
-    escaped_up = session_high is not None and session_high > computed.up + tol
-    escaped_dn = session_low is not None and 0 < session_low < computed.dn - tol
+    escaped_up = (session_high is not None and session_high > computed.up + tol)         or (acc_high is not None and acc_high > computed.up + tol)
+    escaped_dn = (session_low is not None and 0 < session_low < computed.dn - tol)         or (acc_low is not None and 0 < acc_low < computed.dn - tol)
     pin_outside = bool(pin) and pin > 0 and (
         pin > computed.up + tol or pin < computed.dn - tol)
     if escaped_up or escaped_dn or pin_outside:
         if country not in WIDEN_ON_CONTRADICTION:
             return None
-        up = max([v for v in (computed.up, session_high, pin) if v] or [computed.up])
-        lows = [v for v in (computed.dn, session_low, pin) if v and v > 0]
+        up = max([v for v in (computed.up, session_high, pin, acc_high) if v]
+                 or [computed.up])
+        lows = [v for v in (computed.dn, session_low, pin, acc_low) if v and v > 0]
         return Band(up, min(lows), "observed", "widened_observed")
     return computed
 
@@ -367,9 +374,11 @@ def load_band_overrides(path) -> dict:
 
 
 def resolve_band(sym, country, trade_date, base, tick, oms_up, oms_dn,
-                 pin, pin_up, sess_high, sess_low, overrides) -> Optional[Band]:
+                 pin, pin_up, sess_high, sess_low, overrides,
+                 acc_high=None, acc_low=None) -> Optional[Band]:
     """The full chain: override, then target_oms where it is trusted, then the
-    computed band reconciled against what the market did."""
+    computed band reconciled against what the market did - including the prices
+    at which the venue accepted our own splits."""
     hit = overrides.get((trade_date, sym))
     if hit is not None:
         return hit
@@ -379,7 +388,8 @@ def resolve_band(sym, country, trade_date, base, tick, oms_up, oms_dn,
     computed = compute_band(base, country, sym, trade_date, tick)
     if computed is None:
         return None
-    return reconcile_band(computed, pin, sess_high, sess_low, country, tick)
+    return reconcile_band(computed, pin, sess_high, sess_low, country, tick,
+                          acc_high=acc_high, acc_low=acc_low)
 
 
 # =============================================================================
@@ -523,6 +533,18 @@ for _s in ("created", "init", "scheduled", "activated", "intransmit",
            "transmitted", "acked", "leave", "cxl_pending", "cxlrej", "cxl",
            "filled", "done", "rpld", "expired", "cxlord_succeed", "closed"):
     _STATE_CLASS[_s] = "normal"
+
+
+# States that PROVE a split reached the market and was not bounced.  Used as
+# band evidence: an accepted price outside a computed band means the band is
+# wrong, and our own orders are better evidence than the session extremes.
+# "transmitted" is deliberately absent - sent is not the same as accepted.
+ON_MARKET_STATES = ("acked", "leave", "filled", "done", "rpld", "expired",
+                    "cxl", "cxlord_succeed")
+
+
+def reached_market(state) -> bool:
+    return str(state or "").strip().lower() in ON_MARKET_STATES
 
 
 def classify_state(state) -> str:
@@ -718,6 +740,62 @@ def check_ss_hk_chase(sp: Split, ask_after, resting_secs,
                    f"ask moved {moved:.0f} ticks to {ask_after} without a reprice")
 
 
+def check_luld_reject(sp: Split, band: Optional[Band]) -> Optional[Finding]:
+    """A split the venue BOUNCED on a band market.
+
+    This is the other half of LULD_CAP, and it carries better evidence.  A
+    split priced outside the band that actually reaches the exchange comes back
+    rejected, and then the breach is confirmed by the venue itself rather than
+    by our reconstruction of its rule - no band-confidence caveat applies.
+
+    It does not replace LULD_CAP.  Plenty of LULD problems never produce a
+    rejection: CLOSE_BAD_PRICE means we stopped the order ourselves and it was
+    never sent, and the no-split family is about orders that were never built.
+    Rejections are an extra channel, not the channel.
+
+    Three outcomes, and the middle one is about OUR band rather than the algo:
+
+      outside the band   the venue agrees with us - a confirmed breach
+      inside the band    either our band is too wide, or the reject was not
+                         price related.  Reported as a band-quality signal, not
+                         charged to the algo.
+      no band            rejected on a band market we could not price - worth
+                         seeing precisely because we cannot judge it
+    """
+    if classify_state(sp.state) != "rejected" or not _priced(sp):
+        return None
+    m = MARKETS.get(sp.country)
+    if m is None or m.band_rule is None:
+        return None
+    if band is None:
+        return Finding("LULD_REJECT", "violation", sp.sym, sp.id_target,
+                       sp.id_work, 0.0, 0.0,
+                       f"split at {sp.price} rejected by the venue on a band "
+                       f"market, and no band could be established to judge it")
+    if sp.price > band.up or sp.price < band.dn:
+        edge = band.up if sp.price > band.up else band.dn
+        side = "above limit up" if sp.price > band.up else "below limit down"
+        return Finding("LULD_REJECT", "violation", sp.sym, sp.id_target,
+                       sp.id_work, edge, _ticks(abs(sp.price - edge), sp.tick),
+                       f"split at {sp.price} was {side} {edge} and the venue "
+                       f"rejected it - the exchange confirms the breach")
+    return Finding("LULD_REJECT_INBAND", "deviation", sp.sym, sp.id_target,
+                   sp.id_work, sp.price, 0.0,
+                   f"split at {sp.price} rejected although inside our band "
+                   f"[{band.dn}, {band.up}] ({band.src}/{band.conf}) - either the "
+                   f"band is too wide or the reject was not price related")
+
+
+def accepted_price_extremes(splits) -> tuple:
+    """(high, low) of the prices at which our own splits reached the market.
+
+    A price the venue accepted is a price inside the real band, so these bound
+    it from the inside - see reconcile_band.
+    """
+    px = [s.price for s in splits if _priced(s) and reached_market(s.state)]
+    return (max(px), min(px)) if px else (None, None)
+
+
 def merge_refs(qatt_findings: list, transmit_findings: list) -> list:
     """Combine the two reference markets into one finding per rule.
 
@@ -751,7 +829,7 @@ def run_rules(sp: Split, band: Optional[Band], ref: str) -> list:
     """Every rule that applies to this split, for one reference market."""
     out = []
     for f in (check_luld_cap(sp, band), check_client_limit(sp),
-              check_luld_offset(sp, band)):
+              check_luld_offset(sp, band), check_luld_reject(sp, band)):
         if f:
             out.append(f)
     if sp.side != SHORTSELL_SIDE:
@@ -1085,7 +1163,8 @@ def write_workbook(out_dir: str, findings_by_rule: dict) -> str:
 # RUN
 # =============================================================================
 
-ALL_RULES = ("LULD_CAP", "LULD_CLIENT_LIMIT", "LULD_OFFSET", "SS_HK_ASK",
+ALL_RULES = ("LULD_CAP", "LULD_CLIENT_LIMIT", "LULD_OFFSET", "LULD_REJECT",
+             "LULD_REJECT_INBAND", "SS_HK_ASK",
              "SS_UPTICK", "SS_TH_LTP1", "SS_KR_CLAMP", "SS_HK_CHASE",
              "LULD_FAVOURABLE_NO_SPLIT", "LULD_FAVOURABLE_PASSIVE",
              "LULD_UNFAVOURABLE_CHURN", "LULD_BLIND_SUPPRESSION",
@@ -1205,27 +1284,39 @@ def run(args) -> int:
                         oms[_i(rec.get("id_target"))] = (
                             _f(rec.get("limitup")), _f(rec.get("limitdn")))
 
-            parents, pins = {}, {}
-            for rec in tgt.to_dict("records"):
-                idt = _i(rec.get("id_target"))
-                parents[idt] = rec
+            # Splits are built BEFORE the bands, because the prices at which the
+            # venue accepted our own orders are evidence about where the band
+            # really is - see reconcile_band.
+            parents = {_i(r.get("id_target")): r for r in tgt.to_dict("records")}
+            wo_rows = wo.to_dict("records") if not wo.empty else []
+            splits = build_splits(wo_rows, parents, {}, quotes, None)
+            by_parent, by_sym = defaultdict(list), defaultdict(list)
+            for sp in splits:
+                by_parent[sp.id_target].append(sp)
+                by_sym[sp.sym].append(sp)
+
+            pins = {}
+            for idt, rec in parents.items():
                 sym = _s(rec.get("sym"))
                 ev = band_ev.loc[sym].to_dict() if sym in band_ev.index else {}
                 base = _f(ev.get("preClsTick")) or _f(rec.get("orgclose")) \
                     or _f(rec.get("adjclose"))
                 oms_up, oms_dn = oms.get(idt, (0.0, 0.0))
                 tick = _f(rec.get("ticksize"))
+                acc_high, acc_low = accepted_price_extremes(by_sym.get(sym, []))
+                country = _s(rec.get("country"))
                 band = resolve_band(
-                    sym=sym, country=_s(rec.get("country")), trade_date=d,
+                    sym=sym, country=country, trade_date=d,
                     base=base, tick=tick, oms_up=oms_up, oms_dn=oms_dn,
                     pin=_f(ev.get("pinPrice")) or None,
                     pin_up=bool(ev.get("pinUp")),
                     sess_high=_f(ev.get("sessHigh")) or None,
                     sess_low=_f(ev.get("sessLow")) or None,
-                    overrides=overrides)
+                    overrides=overrides,
+                    acc_high=acc_high, acc_low=acc_low)
                 rec["_band"] = band
-                country = _s(rec.get("country"))
-                if band is None and MARKETS.get(country, Market("", None, None, None, False)).band_rule:
+                m = MARKETS.get(country)
+                if band is None and m is not None and m.band_rule:
                     tally.suppress(country, sym)
                 elif band is not None:
                     tally.band(country, band.conf)
@@ -1233,12 +1324,6 @@ def run(args) -> int:
                     pins[sym] = Pin(sym, "up" if ev.get("pinUp") else "down",
                                     _i(ev.get("pinStart")), _i(ev.get("pinEnd")),
                                     _f(ev.get("pinPrice")))
-
-            wo_rows = wo.to_dict("records") if not wo.empty else []
-            splits = build_splits(wo_rows, parents, {}, quotes, None)
-            by_parent = defaultdict(list)
-            for sp in splits:
-                by_parent[sp.id_target].append(sp)
 
             cap_by_sym = defaultdict(list)
             for sp in splits:
@@ -1747,6 +1832,73 @@ def test_hk_chase_is_silent_when_it_repriced_in_time_or_barely_moved():
     assert check_ss_hk_chase(sp, 100.05, 45, 2, 30) is None
 
 
+def test_luld_reject_outside_the_band_is_confirmed_by_the_exchange():
+    b = Band(110.0, 90.0, "computed", "assumed")
+    f = check_luld_reject(_split(country="CN", sym="600584.CH", price=115.0,
+                                 state="rejected"), b)
+    assert f is not None and f.rule == "LULD_REJECT"
+    assert f.severity == "violation"
+    assert "exchange confirms" in f.reason
+
+
+def test_luld_reject_inside_the_band_blames_the_band_not_the_algo():
+    b = Band(110.0, 90.0, "computed", "assumed")
+    f = check_luld_reject(_split(country="CN", price=100.0, state="rejected"), b)
+    assert f is not None and f.rule == "LULD_REJECT_INBAND"
+    assert f.severity == "deviation", "an in-band reject is not an algo violation"
+
+
+def test_luld_reject_reports_a_rejection_we_cannot_judge():
+    f = check_luld_reject(_split(country="CN", price=100.0, state="rejected"), None)
+    assert f is not None and f.rule == "LULD_REJECT"
+    assert "no band" in f.reason
+
+
+def test_luld_reject_ignores_splits_that_were_not_rejected():
+    b = Band(110.0, 90.0, "computed", "assumed")
+    for st in ("acked", "filled", "close_bad_price", "leave"):
+        assert check_luld_reject(_split(country="CN", price=115.0, state=st),
+                                 b) is None, st
+
+
+def test_luld_reject_ignores_markets_with_no_band_rule():
+    b = Band(110.0, 90.0, "computed", "assumed")
+    assert check_luld_reject(_split(country="HK", price=115.0,
+                                    state="rejected"), b) is None
+
+
+def test_run_rules_reports_both_the_cap_and_the_rejection():
+    b = Band(110.0, 90.0, "computed", "assumed")
+    sp = _split(country="CN", sym="600584.CH", price=115.0, state="rejected")
+    rules = {f.rule for f in run_rules(sp, b, "qatt")}
+    assert "LULD_CAP" in rules, "the bad price is still a finding"
+    assert "LULD_REJECT" in rules, "so is what it cost us"
+
+
+def test_accepted_prices_bound_the_real_band_from_inside():
+    sp = [_split(price=105.0, state="filled"), _split(price=95.0, state="acked"),
+          _split(price=999.0, state="rejected"),      # bounced, proves nothing
+          _split(price=1.0, state="close_bad_price")]  # never sent
+    hi, lo = accepted_price_extremes(sp)
+    assert hi == 105.0 and lo == 95.0
+
+
+def test_accepted_prices_are_empty_when_nothing_reached_the_market():
+    assert accepted_price_extremes([_split(state="rejected")]) == (None, None)
+
+
+def test_an_accepted_price_outside_the_band_contradicts_it():
+    c = Band(110.0, 90.0, "computed", "assumed")
+    # the venue took our order at 115, so 115 is inside the real band
+    assert reconcile_band(c, None, None, None, "KR", 0.01, acc_high=115.0) is None
+
+
+def test_an_accepted_price_outside_the_band_widens_it_for_japan():
+    c = Band(1300.0, 700.0, "computed", "assumed")
+    r = reconcile_band(c, None, None, None, "JP", 1.0, acc_high=1450.0)
+    assert r is not None and r.conf == "widened_observed" and r.up == 1450.0
+
+
 def test_merge_refs_counts_a_finding_once_not_twice():
     b = Band(110.0, 90.0, "computed", "confirmed")
     sp = _split(price=115.0)
@@ -1990,6 +2142,13 @@ def test_resolve_band_ignores_a_nonpositive_oms_band():
     b = resolve_band("X.KS", "KR", dt.date(2026, 7, 16), 100.0, 0.01,
                      0.0, 0.0, None, None, None, None, {})
     assert b.src == "computed", "a zero oms band means 'unknown', not 'no band'"
+
+
+def test_resolve_band_carries_accepted_prices_into_reconciliation():
+    # a KR split the venue took at 140 proves the +/-30% band off 100 is wrong
+    b = resolve_band("X.KS", "KR", dt.date(2026, 7, 16), 100.0, 0.01,
+                     0.0, 0.0, None, None, None, None, {}, acc_high=140.0)
+    assert b is None, "an accepted price outside the band must contradict it"
 
 
 def test_resolve_band_returns_none_for_india_without_oms():

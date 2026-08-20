@@ -356,6 +356,8 @@ Two classes, kept apart because the notes mix them:
 | `LULD_CAP` | JP KR MY TH CN TW IN | `limit_dn <= price <= limit_up` | violation |
 | `LULD_CLIENT_LIMIT` | all | split not more aggressive than parent `limit_price` | violation |
 | `LULD_OFFSET` | CN JP | offset in ticks from the unfavourable band | deviation |
+| `LULD_REJECT` | JP KR MY TH CN TW IN | split **rejected by the venue** while priced outside the band — the exchange confirms the breach (§5.2) | violation |
+| `LULD_REJECT_INBAND` | JP KR MY TH CN TW IN | rejected while priced *inside* our band — our band is suspect, not the algo (§5.2) | deviation |
 | `SS_HK_ASK` | HK | `price >= qask` at `t_transmit`; a market-order short sell fails by construction | violation |
 | `SS_UPTICK` | JP KR MY | `price > lastPrice`, or `>=` when `qatt.trdTick` shows the last tick was up | violation |
 | `SS_TH_LTP1` | TH | `price = lastPrice + ticksize` | deviation; violation if *below* |
@@ -414,7 +416,50 @@ in the same sym.
 **To enable any of these** takes one entry in the rule table, its fixtures in the
 self-test, and a line in §11.5. The blocker is desk confirmation, not engineering.
 
-### 5.2 Two reference markets, deliberately
+### 5.2 Rejections, which cut both ways
+
+A split priced outside the band that actually reaches the venue **comes back
+rejected**. That makes rejections a second detection channel for LULD, and a
+better-evidenced one than `LULD_CAP`: where `LULD_CAP` rests on our
+reconstruction of the exchange's rule, a rejection is the exchange's own answer.
+`LULD_REJECT` therefore carries **no band-confidence caveat** — it is true even
+if our band is wrong.
+
+It does not replace `LULD_CAP`, because plenty of LULD problems never produce a
+rejection at all:
+
+- `CLOSE_BAD_PRICE` — we stopped the order ourselves and it was never sent
+- the no-split family (§6) — the order was never built
+- a bad price that happened to stay inside the band
+
+Three outcomes, and the middle one is about **our** band rather than the algo:
+
+| split price vs our band | reading |
+|---|---|
+| outside | `LULD_REJECT`, violation — the venue agrees with us |
+| inside | `LULD_REJECT_INBAND`, deviation — either our band is too wide, or the reject was not price related. **Not charged to the algo.** |
+| no band resolved | `LULD_REJECT`, violation — rejected on a band market we could not price, worth seeing precisely because we cannot judge it |
+
+**Rejections and acceptances are also band evidence**, and this is the more
+valuable half. A price the venue *accepted* is by definition inside the real
+band, so the extreme accepted prices bound it from the inside:
+
+```
+acc_high > computed.up   ->  the computed band is too narrow -> contradicted
+acc_low  < computed.dn   ->  same
+```
+
+This is a sharper test than the session `highPrice`/`lowPrice` of §3.1, because
+it is **our own order and the venue's own answer to it** rather than something
+inferred from the tape. It feeds `reconcile_band` alongside the pin and the
+session extremes, so in Japan it widens the band and everywhere else it
+suppresses it.
+
+Only states that **prove** a split reached the market count as accepted —
+`acked`, `leave`, `filled`, `done`, `rpld`, `expired`, `cxl`, `cxlord_succeed`.
+`transmitted` is deliberately excluded: sent is not the same as accepted.
+
+### 5.3 Two reference markets, deliberately
 
 Every split is checked twice:
 
@@ -438,9 +483,13 @@ that is the exact shape of the Hong Kong "market moves away" note.
 ones:
 
 - **Short sell** fails loudly: `REJECTED`, `INVALID_ACK`, `FAIL_ACK`.
-- **LULD usually produces no rejection at all**: `CLOSE_BAD_PRICE` (7 call sites,
-  all on the price path), `CLOSE_TAKE_OUTOFMONEY`, `CLOSE_STOCK_HALT`,
-  `CLOSE_ORDER_HALT`, `STOPPED_VOLATILITY_TAG262` / `TAG325` — or silence.
+- **LULD fails through both channels.** A split priced outside the band that
+  reaches the venue is `REJECTED`, and §5.2 checks exactly that. But a LULD
+  problem often never reaches the venue at all — `CLOSE_BAD_PRICE` (7 call
+  sites, all on the price path), `CLOSE_TAKE_OUTOFMONEY`, `CLOSE_STOCK_HALT`,
+  `CLOSE_ORDER_HALT`, `STOPPED_VOLATILITY_TAG262` / `TAG325` — or produces no
+  order to reject. So rejections are an **additional** channel for LULD, never
+  the only one, and no LULD check is gated on state.
 
 So every row carries `state` and `state_class` (`rejected` / `suppressed` /
 `halted` / `never_on_market` / `normal`), derived from the enum's own predicates

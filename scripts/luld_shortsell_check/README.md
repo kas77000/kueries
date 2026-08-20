@@ -186,11 +186,44 @@ market consistently one tick off is a setting, not hundreds of failures.
 | `LULD_CAP` | JP KR MY TH CN TW IN | split price inside the band | violation |
 | `LULD_CLIENT_LIMIT` | all | split not more aggressive than the parent's `limit_price` | violation |
 | `LULD_OFFSET` | CN JP | ticks from the unfavourable band | deviation |
+| `LULD_REJECT` | band markets | **rejected by the venue** while priced outside the band | violation |
+| `LULD_REJECT_INBAND` | band markets | rejected while priced *inside* our band | deviation |
 | `SS_HK_ASK` | HK | short sell at or above the ask; a market-order short sell fails by construction | violation |
 | `SS_UPTICK` | JP KR MY | above the last trade, or equal on a zero-plus tick (`qatt.trdTick`) | violation |
 | `SS_TH_LTP1` | TH | last traded price + 1 tick | deviation, violation if below the last trade |
 | `SS_KR_CLAMP` | KR | an uptick price above the band must be capped at it, not sent through | violation |
 | `SS_HK_CHASE` | HK | resting split, ask moved away, no reprice | violation |
+
+### Rejections cut both ways
+
+A split priced outside the band that actually reaches the venue **comes back
+rejected**, so rejections are a second LULD channel — and a better-evidenced
+one. `LULD_CAP` rests on our reconstruction of the exchange's rule;
+`LULD_REJECT` is the exchange's own answer, so it carries **no band-confidence
+caveat** and is true even if our band is wrong.
+
+It does not replace `LULD_CAP`. Plenty of LULD problems never produce a
+rejection: `CLOSE_BAD_PRICE` means we stopped the order ourselves and never sent
+it, and the no-split family is about orders that were never built. Rejections
+are an extra channel, not the channel — which is why no LULD check is gated on
+state.
+
+A rejection **inside** our band is reported as `LULD_REJECT_INBAND` and is
+**not charged to the algo**: either our band is too wide, or the reject was not
+price related. It is a band-quality signal.
+
+The more valuable half is the reverse. **A price the venue *accepted* is by
+definition inside the real band**, so the extreme accepted prices bound it from
+the inside and feed `reconcile_band`:
+
+```
+accepted price above the computed limit up  ->  our band is too narrow
+```
+
+That is a sharper test than the session high/low, because it is our own order
+and the venue's own answer to it. Only states that *prove* a split reached the
+market count — `acked`, `leave`, `filled`, `done`, `rpld`, `expired`, `cxl`,
+`cxlord_succeed`. `transmitted` is excluded: sent is not accepted.
 
 ### Every split is judged twice, and the disagreement is the point
 
@@ -297,7 +330,7 @@ that silently matched nothing:
 python scripts/luld_shortsell_check/luld_shortsell_check.py --self-test
 ```
 
-105 tests, no kdb connection required — which matters, because this is written
+116 tests, no kdb connection required — which matters, because this is written
 on a machine that has none. They cover the Japan step table against the
 published values, inward rounding, ladder recovery including its refusal to
 guess on ragged data, band reconciliation in all four confidence states, every
