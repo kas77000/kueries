@@ -7,6 +7,7 @@ The [Short-Sell Order Report](../short_sell_report/README.md), counting a
 python scripts/short_sell_report_v2/short_sell_report_v2.py
 python scripts/short_sell_report_v2/short_sell_report_v2.py --compare    # v1 beside v2
 python scripts/short_sell_report_v2/short_sell_report_v2.py --chains     # what got chained
+python scripts/short_sell_report_v2/short_sell_report_v2.py --no-tag    # what carries no 9604
 python scripts/short_sell_report_v2/short_sell_report_v2.py --self-test
 ```
 
@@ -139,6 +140,23 @@ different problem from "the client tags nothing". A high number does not
 invalidate the report — those orders are simply not chained — but it says how
 much of it the tag is actually doing.
 
+**`--no-tag` lists them**, largest first, because a percentage is not something
+anyone can act on:
+
+```
+2 of 3 targets carry no tag 9604 (66.7%)
+  Thailand 1, Japan 1
+
+each stands alone and is counted exactly as v1 counts it
+
+  market     sym                id_target            size  algo      basket      oes_oid
+  TH         SCB-R.TB                   1      27,000,000  vwap      B1          OID.1
+  JP         7203.JP                    2       5,000,000  vwap      NIGHT       OID.2
+```
+
+The count also rides on the page footer, so a printed report discloses how much
+of itself was never chained.
+
 It is also the tripwire for a parse failure. If `fixmsg` uses a separator the
 parser does not know, **every** target reads as untagged and the run says so in
 the strongest terms it has:
@@ -183,18 +201,39 @@ Checks assert the two branches of each are **exclusive** — a run that printed
 both the warning and the all-clear would be worse than one that printed neither,
 and an if/else is exactly what a careless edit breaks.
 
-### One thing still assumed
+### 3. Can completion come out over 100%?
 
-That the chain's quantity is the **last** attempt's size. `--chain-qty max` if a
-replace can come back for only the unfilled remainder. Every run reports:
+Executed is summed over **every** attempt's fills, so the chain's quantity has
+to be one that no combination of fills can exceed. Your case — a partial fill,
+then a replace for the remainder — is exactly where that goes wrong:
 
 ```
-NOTE: 5 chains have attempts of differing size; CHAIN_QTY='last' takes the last
+partial fill, replace for the remainder      replace GROWS the order
+  attempt 1  size 100  fills  30               attempt 1  size 100  fills 100
+  attempt 2  size  70  fills  70               attempt 2  size 150  fills  50
+  executed 100                                 executed 150
+
+  first  100%                                  first  150%   <-- over
+  last   143%   <-- over                       last   100%
+  max    100%                                  max    100%
 ```
 
-While that count is zero the two settings are identical. A chain that resizes is
-**not** reported as mixed — a replace may legitimately change quantity, which is
-the difference between that and a chain that changes stock.
+`first` fixes your case and breaks the other one. **`max` is the only choice
+safe in both directions**, so it is the default. `--chain-qty first` and
+`--chain-qty last` are there to compare with.
+
+And the reasoning is not trusted either — any chain that fills more than its
+quantity is reported **whatever the setting**:
+
+```
+WARNING: 2 chains executed MORE than the quantity taken for them, so completion
+         is over 100% there. With CHAIN_QTY='max' that should be impossible -
+         check these before believing the page:
+      9604=CLI-0001  SCB-R.TB  qty 70  executed 100  (143%)  sizes [70, 100]
+```
+
+A chain that merely **resizes** is reported separately and is not an error — a
+replace may legitimately change quantity, unlike stock.
 
 ---
 
@@ -223,7 +262,7 @@ each other.
 python scripts/short_sell_report_v2/short_sell_report_v2.py --self-test
 ```
 
-102 checks, no kdb and no pykx: parsing tag 9604 out of a fixmsg in four
+119 checks, no kdb and no pykx: parsing tag 9604 out of a fixmsg in four
 separator styles and refusing the 19604/96040/embedded-value traps, chaining on
 the client id, untagged targets standing alone, which attempt sets the quantity,
 both checks and the exclusivity of their branches, the Thailand rollup end to

@@ -62,11 +62,12 @@ counts as a rejection, the page, the mail - is IMPORTED FROM v1, not copied.
 A second copy of a report is a report that drifts, and the point of this one
 is that the ONLY difference is how orders are counted.
 
-ONE THING LEFT ASSUMED: that the chain's quantity is the LAST attempt's size.
-Set CHAIN_QTY = "max" if a replace can come back for only the unfilled
-remainder, where fills summed across attempts against a smaller final size
-would overstate completion.  Every run reports how many chains had attempts of
-differing size; while that is zero the two settings are identical.
+THE CHAIN'S QUANTITY is the LARGEST any attempt asked for - CHAIN_QTY="max".
+A replace can come back for only the unfilled remainder, and it can also grow
+the order; "first" is wrong in the second case and "last" in the first, and
+only "max" survives both.  Both are still available.  Any chain that fills more
+than its quantity is reported whatever the setting, which is the tripwire if
+this reasoning is incomplete.
 
   --compare runs BOTH rollups over one fetch and prints them side by side.
 =============================================================================
@@ -96,15 +97,26 @@ OUT_DIR = _HERE.parent / "out"
 
 TITLE = "Short-Sell Order Report"
 
-# Which attempt's size is the chain's quantity.
-#   "last"  the order as it finally stood.  Right when a replace re-sends the
-#           same quantity, which is what a reject-and-replace does.
-#   "max"   the largest attempt.  Right if a replace can come back for only the
-#           unfilled remainder, where fills from earlier attempts would
-#           otherwise be measured against a smaller order.
-# Every run reports how many chains had attempts of differing size.  While that
-# is zero the two are identical and this does not matter.
-CHAIN_QTY = "last"
+# Which attempt's size is the chain's quantity.  Executed is summed over EVERY
+# attempt's fills, so this decides what those fills are measured against.
+#
+#   "max"    the largest attempt asked for.  THE DEFAULT, and the only one that
+#            cannot print a completion over 100%.
+#   "first"  the original order.  Safe when a replace comes back for the
+#            unfilled remainder; WRONG when a replace grows the order.
+#   "last"   the order as it finally stood.  Safe when a replace grows it;
+#            WRONG when it comes back for the remainder.
+#
+#   partial fill, replace for the remainder      replace GROWS the order
+#     attempt 1  size 100  fills  30               attempt 1  size 100  fills 100
+#     attempt 2  size  70  fills  70               attempt 2  size 150  fills  50
+#     executed 100                                 executed 150
+#       first 100%   last 143%   max 100%            first 150%   last 100%   max 100%
+#
+# Every run reports chains whose attempts differ in size, and separately any
+# chain whose fills exceed its quantity - which should be impossible under
+# "max" and is the tripwire if it is not.
+CHAIN_QTY = "max"
 
 
 # =============================================================================
@@ -322,7 +334,12 @@ def to_chains(attempts, qty=None) -> list:
     for k, got in groups.items():
         got = sorted(got, key=lambda a: (a.seq, a.id_target))
         last = got[-1]
-        size = max(a.size for a in got) if qty == "max" else last.size
+        if qty == "max":
+            size = max(a.size for a in got)
+        elif qty == "first":
+            size = got[0].size
+        else:
+            size = last.size
         out.append(Chain(chain_key=k, date=last.date, country=last.country,
                          sym=last.sym, side=last.side, basket=last.basket,
                          algo=last.algo, client_id=last.client_id,
@@ -366,6 +383,33 @@ def chain_stats(attempts, chs) -> ChainStats:
                       if len({a.key[1] for a in c.attempts}) > 1])
 
 
+def chain_fills(chs, splits) -> dict:
+    """Executed quantity per chain, from the same workorder rows the page uses."""
+    owner = {}
+    for c in chs:
+        for k in c.keys:
+            owner[k] = c.chain_key
+    out = {}
+    for sp in splits:
+        ck = owner.get(sp.key)
+        if ck is not None:
+            out[ck] = out.get(ck, 0) + sp.make
+    return out
+
+
+def over_filled(chs, splits) -> list:
+    """Chains that executed MORE than their quantity - a completion over 100%.
+
+    Under CHAIN_QTY="max" this should be empty: fills are summed over attempts
+    and no attempt can fill more than the largest one asked for.  If it is not
+    empty, that reasoning is incomplete and the page is overstating completion
+    somewhere, so it says so rather than printing 143% and leaving it there.
+    """
+    fills = chain_fills(chs, splits)
+    return [(c, fills.get(c.chain_key, 0)) for c in chs
+            if c.size > 0 and fills.get(c.chain_key, 0) > c.size]
+
+
 def report_stats(st: ChainStats, quiet=False):
     log(f"  chains: {st.attempts:,} targets -> {st.chains:,} order"
         f"{'' if st.chains == 1 else 's'} "
@@ -406,10 +450,56 @@ def report_stats(st: ChainStats, quiet=False):
             f"on id_server would have split these back apart")
 
     if st.mixed_size:
-        log(f"  NOTE: {len(st.mixed_size):,} chains have attempts of differing "
-            f"size; CHAIN_QTY={CHAIN_QTY!r} takes the "
-            f"{'largest' if CHAIN_QTY == 'max' else 'last'}. --chains")
+        which = {"max": "the largest", "first": "the first",
+                 "last": "the last"}[CHAIN_QTY]
+        log(f"  {len(st.mixed_size):,} chains have attempts of differing size "
+            f"- a replace resized the order; CHAIN_QTY={CHAIN_QTY!r} takes "
+            f"{which}. --chains")
     return st
+
+
+def report_over_filled(over) -> None:
+    if not over:
+        return
+    log(f"  WARNING: {len(over):,} chain{'' if len(over) == 1 else 's'} "
+        f"executed MORE than the quantity taken for them, so completion is "
+        f"over 100% there. With CHAIN_QTY={CHAIN_QTY!r} that should be "
+        f"impossible - check these before believing the page:")
+    for c, made in over[:10]:
+        log(f"      {CLIENT_ID_TAG}={c.client_id or '(none)'}  {c.sym}  "
+            f"qty {c.size:,}  executed {made:,}  "
+            f"({100.0 * made / c.size:.0f}%)  sizes "
+            f"{sorted({a.size for a in c.attempts})}")
+
+
+def dump_untagged(attempts, limit=200) -> int:
+    """The targets carrying no tag 9604.
+
+    They are counted on the page - each stands alone, exactly as v1 counts it -
+    but until now there was no way to see WHICH they were, and "6.6% untagged"
+    is not something anyone can act on.
+    """
+    got = [a for a in attempts if not a.client_id]
+    if not got:
+        print(f"every target carries tag {CLIENT_ID_TAG}")
+        return 0
+    by_mkt = {}
+    for a in got:
+        by_mkt[a.country] = by_mkt.get(a.country, 0) + 1
+    print(f"{len(got):,} of {len(attempts):,} targets carry no tag "
+          f"{CLIENT_ID_TAG} "
+          f"({100.0 * len(got) / max(len(attempts), 1):.1f}%)")
+    print("  " + ", ".join(f"{v1.MARKET_NAME.get(k, k)} {n:,}"
+                           for k, n in sorted(by_mkt.items(),
+                                              key=lambda kv: -kv[1])))
+    print(f"\neach stands alone and is counted exactly as v1 counts it"
+          + (f"; showing the first {limit}" if len(got) > limit else ""))
+    print(f"\n  {'market':<11}{'sym':<16}{'id_target':>12}  {'size':>14}  "
+          f"{'algo':<10}{'basket':<12}oes_oid")
+    for a in sorted(got, key=lambda x: -x.size)[:limit]:
+        print(f"  {a.country:<11}{a.sym:<16}{a.id_target:>12}  {a.size:>14,}  "
+              f"{a.algo or '-':<10}{a.basket or '-':<12}{a.oes_oid or '-'}")
+    return 0
 
 
 def dump_chains(chs, limit=40):
@@ -557,8 +647,12 @@ def run(args) -> int:
         attempts.extend(att)
         splits.extend(v1.to_splits(wr, att))       # keyed on the target rows
 
+    if args.no_tag:
+        return dump_untagged(attempts)
+
     chs = to_chains(attempts, args.chain_qty)
     st = report_stats(chain_stats(attempts, chs), args.quiet)
+    report_over_filled(over_filled(chs, splits))
     if args.chains:
         return dump_chains(chs)
 
@@ -579,7 +673,8 @@ def run(args) -> int:
     subtitle = f"By market  ·  {pl.when}"
     foot = (f"Generated {dt.datetime.now():%Y-%m-%d %H:%M}  ·  "
             + ("historical" if pl.hist else "real-time snapshot")
-            + f"  ·  {st.attempts:,} targets chained into {st.chains:,} orders")
+            + f"  ·  {st.attempts:,} targets chained into {st.chains:,} orders"
+            + (f", {st.no_id:,} untagged" if st.no_id else ""))
     if dropped:
         foot += f"  ·  {dropped:,} restricted JP excluded"
 
@@ -726,15 +821,18 @@ def self_test() -> int:
     print("\nwhich attempt sets the quantity")
     grew, _ = to_attempts([_a(1, "TH", 100, "CLI-1", t=1),
                            _a(2, "TH", 250, "CLI-1", t=2)])
+    check("first takes the original order",
+          to_chains(grew, "first")[0].size, 100)
     check("last takes the order as it finally stood",
           to_chains(grew, "last")[0].size, 250)
     check("max takes the largest attempt",
           to_chains(grew, "max")[0].size, 250)
     shrank, _ = to_attempts([_a(1, "TH", 250, "CLI-1", t=1),
                              _a(2, "TH", 100, "CLI-1", t=2)])
-    check("where a replace shrank it, last and max differ",
-          (to_chains(shrank, "last")[0].size, to_chains(shrank, "max")[0].size),
-          (100, 250))
+    check("where a replace shrank it, the three differ",
+          tuple(to_chains(shrank, q)[0].size
+                for q in ("first", "last", "max")), (250, 100, 250))
+    check("max is the default", CHAIN_QTY, "max")
     out_of_order, _ = to_attempts([_a(2, "TH", 100, "CLI-1", t=9),
                                    _a(1, "TH", 250, "CLI-1", t=1)])
     check("the last attempt is the last one SENT, not the first row seen",
@@ -743,6 +841,62 @@ def self_test() -> int:
                                 _a(9, "TH", 300, "CLI-1", t=5)])
     check("a tied timestamp falls back to id_target",
           to_chains(same_time, "last")[0].size, 300)
+
+    #  THE CASE THAT DECIDES IT.  Executed is summed over EVERY attempt, so the
+    #  quantity has to be one that no combination of fills can exceed.
+    print("\ncompletion can never exceed 100%")
+    #  partial fill, then a replace for the remainder: 30 of 100, then 70 of 70
+    part, _ = to_attempts([_a(1, "TH", 100, "CLI-1", t=1),
+                           _a(2, "TH", 70, "CLI-1", t=2)])
+    psp = v1.to_splits([v1._c(1, 1, 30, "filled"), v1._c(2, 2, 70, "filled")],
+                       part)
+    for q, bad in (("first", 0), ("last", 1), ("max", 0)):
+        check(f"remainder replace, CHAIN_QTY={q!r}: "
+              f"{'OVER 100%' if bad else 'within 100%'}",
+              len(over_filled(to_chains(part, q), psp)), bad)
+    #  the other direction: the client GREW the order on the replace
+    grow, _ = to_attempts([_a(1, "TH", 100, "CLI-1", t=1),
+                           _a(2, "TH", 150, "CLI-1", t=2)])
+    gsp = v1.to_splits([v1._c(1, 1, 100, "filled"), v1._c(2, 2, 50, "filled")],
+                       grow)
+    for q, bad in (("first", 1), ("last", 0), ("max", 0)):
+        check(f"grown order, CHAIN_QTY={q!r}: "
+              f"{'OVER 100%' if bad else 'within 100%'}",
+              len(over_filled(to_chains(grow, q), gsp)), bad)
+    check("so only max is safe in BOTH directions",
+          [q for q in ("first", "last", "max")
+           if not over_filled(to_chains(part, q), psp)
+           and not over_filled(to_chains(grow, q), gsp)], ["max"])
+    check("and the detector says by how much",
+          [(round(100.0 * made / c.size), c.size)
+           for c, made in over_filled(to_chains(part, "last"), psp)],
+          [(143, 70)])
+    check("a chain that fills exactly its quantity is not flagged",
+          over_filled(to_chains(part, "max"), psp), [])
+    check("nor is one that fills less",
+          over_filled(to_chains(part, "max"),
+                      v1.to_splits([v1._c(1, 1, 10, "filled")], part)), [])
+
+    print("\nseeing the untagged targets")
+    import contextlib as _c
+    import io as _i2
+
+    def printed(fn, *a):
+        buf = _i2.StringIO()
+        with _c.redirect_stdout(buf):
+            fn(*a)
+        return buf.getvalue()
+
+    ut = printed(dump_untagged, blank)
+    check("--no-tag says how many and what share",
+          "2 of 3 targets carry no tag 9604" in ut, True)
+    check("and breaks it down by market", "Thailand 2" in ut, True)
+    check("and lists them by id_target",
+          all(str(a.id_target) in ut for a in blank if not a.client_id), True)
+    check("largest first, so the ones that matter are at the top",
+          ut.index("700") < ut.index("100"), True)
+    check("a fully tagged session says so instead",
+          "every target carries tag 9604" in printed(dump_untagged, att), True)
 
     print("\ncheck 1 - is tag 9604 populated")
     st = chain_stats(att, chs)
@@ -902,14 +1056,20 @@ def main(argv=None) -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--monthly", metavar="YYYY-MM")
     p.add_argument("--date", type=dt.date.fromisoformat, metavar="YYYY-MM-DD")
-    p.add_argument("--chain-qty", choices=("last", "max"), default=CHAIN_QTY,
-                   help="which attempt's size is the chain's quantity")
+    p.add_argument("--chain-qty", choices=("max", "first", "last"),
+                   default=CHAIN_QTY,
+                   help="which attempt's size is the chain's quantity. max is "
+                        "the only one that cannot print a completion over 100%%")
     p.add_argument("--compare", action="store_true",
                    help="print v1 and v2 side by side over ONE fetch and exit, "
                         "so any difference is the counting and nothing else")
     p.add_argument("--chains", action="store_true",
                    help="list the chained orders and their attempts, and exit "
                         "- the way to check tag 9604 against the engine")
+    p.add_argument("--no-tag", action="store_true",
+                   help="list the targets carrying NO tag 9604, and exit - "
+                        "they are counted as v1 counts them, and this is how "
+                        "to see which they are")
     p.add_argument("--out-dir", default=str(OUT_DIR))
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--self-test", action="store_true",
