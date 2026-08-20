@@ -638,9 +638,21 @@ class Missed(NamedTuple):
     parent: Parent
     pin: Pin
     window: tuple              # (start, end) of the overlap, ms
-    unfilled: int
+    executed: int
     splits_total: int
     windows_qualifying: int
+
+    @property
+    def unfilled(self) -> int:
+        """What was still to do.  Not a column any more - the page shows what
+        WAS done, and this is what it was measured against - but it is still
+        what the table is sorted by, and it is derivable from the two columns
+        that are there."""
+        return self.parent.size - self.executed
+
+    @property
+    def completion(self) -> Optional[float]:
+        return _completion(self.executed, self.parent.size)
 
     @property
     def minutes(self) -> float:
@@ -698,10 +710,12 @@ def missed_opportunities(parents, splits, hits, min_mins=MIN_PIN_MINS) -> list:
         if not qualifying:
             continue
         w, ov = max(qualifying, key=lambda q: q[1][1] - q[1][0])
-        out.append(Missed(parent=p, pin=w, window=ov, unfilled=unfilled,
+        out.append(Missed(parent=p, pin=w, window=ov, executed=executed,
                           splits_total=len(kids),
                           windows_qualifying=len(qualifying)))
-    # biggest missed quantity first - the page is read from the top
+    # biggest missed quantity first - the page is read from the top.  Unfilled
+    # is no longer a column, but it is order qty times one minus completion, so
+    # the order is still readable off the two that are.
     return sorted(out, key=lambda m: (m.unfilled, m.minutes), reverse=True)
 
 
@@ -736,16 +750,17 @@ MKT_COLS = (
 # The findings table.  Splits is the order's TOTAL child count: 0 means it never
 # worked, a number means it worked but not while the limit was there.
 MISS_COLS = (
-    ("Market", 0.11, False),
-    ("Symbol", 0.15, False),
-    ("Side", 0.08, False),
-    ("Order qty", 0.12, True),
-    ("Unfilled", 0.12, True),
-    ("Limit", 0.09, True),
-    ("At", 0.07, False),
-    ("Limit period", 0.14, False),
-    ("Mins", 0.06, True),
-    ("Splits", 0.06, True),
+    ("Market", 0.10, False),
+    ("Symbol", 0.14, False),
+    ("Side", 0.07, False),
+    ("Order qty", 0.11, True),
+    ("Exec qty", 0.11, True),
+    ("Completion", 0.10, True),
+    ("Limit", 0.08, True),
+    ("At", 0.06, False),
+    ("Limit period", 0.13, False),
+    ("Mins", 0.05, True),
+    ("Splits", 0.05, True),
 )
 
 
@@ -772,12 +787,17 @@ def _market_table(fig, rows, y_top, row_h):
 
 
 def _miss_cells(m: Missed):
+    """Completion is the number in red: on a page about limits we could have
+    traded into, how little of the order got done IS the finding.  Order qty
+    beside it is what that percentage is a percentage of - the two together give
+    back the quantity missed, so nothing is lost by not printing it."""
     return [(MARKET_NAME.get(m.parent.market, m.parent.market), INK, "normal"),
             (m.parent.sym, INK, "normal"),
             (m.parent.side or ("buy" if m.parent.sidesign > 0 else "sell"),
              INK, "normal"),
             (fmt_int(m.parent.size), INK, "normal"),
-            (fmt_int(m.unfilled), RED, "bold"),
+            (fmt_int(m.executed), INK, "normal"),
+            (fmt_pct1(m.completion), RED, "bold"),
             (f"{m.pin.price:,.4g}" if m.pin.price else DASH, INK, "normal"),
             (m.pin.side, INK2, "normal"),
             (f"{fmt_hm(m.window[0])}–{fmt_hm(m.window[1])}", INK2, "normal"),
@@ -858,8 +878,8 @@ def draw_missed(missed, subtitle, foot, page=1, pages=1, dropped=0):
                         0.845, 0.0245, fs=7.5, head_fs=7.5)
         if dropped:
             fig.text(L, y - 0.022,
-                     f"{dropped:,} more not shown - the table is sorted by "
-                     f"unfilled quantity, so these are the smallest.",
+                     f"{dropped:,} more not shown - the table is sorted by the "
+                     f"quantity missed, so these are the smallest.",
                      fontsize=7.5, color=RED, va="baseline")
     else:
         fig.text(L, 0.80, "Nothing to report: no order sat through a "
@@ -924,13 +944,14 @@ def mail_bodies(rows, tot, missed, subtitle, foot, png_cid=None) -> tuple:
     mh = [c[0] for c in MKT_COLS]
     ma = ["r" if c[2] else "l" for c in MKT_COLS]
     miss = [[MARKET_NAME.get(x.parent.market, x.parent.market), x.parent.sym,
-             x.parent.side, fmt_int(x.parent.size), fmt_int(x.unfilled),
-             x.pin.side, f"{fmt_hm(x.window[0])}-{fmt_hm(x.window[1])}",
+             x.parent.side, fmt_int(x.parent.size), fmt_int(x.executed),
+             fmt_pct1(x.completion), x.pin.side,
+             f"{fmt_hm(x.window[0])}-{fmt_hm(x.window[1])}",
              f"{x.minutes:.0f}", fmt_int(x.splits_total)]
             for x in missed[:FINDINGS_PER_PAGE]]
-    xh = ["Market", "Symbol", "Side", "Order qty", "Unfilled", "At",
-          "Limit period", "Mins", "Splits"]
-    xa = ["l", "l", "l", "r", "r", "l", "l", "r", "r"]
+    xh = ["Market", "Symbol", "Side", "Order qty", "Exec qty", "Completion",
+          "At", "Limit period", "Mins", "Splits"]
+    xa = ["l", "l", "l", "r", "r", "r", "l", "l", "r", "r"]
 
     headline = (f"{fmt_int(tot.orders)} orders at a limit   ·   "
                 f"{fmt_pct1(tot.completion)} overall completion   ·   "
@@ -1374,7 +1395,10 @@ def self_test() -> int:
         return missed_opportunities(kept, sp, hits)
 
     check("nothing sent at all is a finding", len(miss([])), 1)
-    check("and it says how much was left", miss([])[0].unfilled, 1000)
+    check("with nothing executed", miss([])[0].executed, 0)
+    check("so completion is zero", miss([])[0].completion, 0.0)
+    check("and the quantity missed is the whole order", miss([])[0].unfilled,
+          1000)
     check("with the window it was left in",
           miss([])[0].window, (11 * H, 12 * H))
     check("and the minutes", round(miss([])[0].minutes), 60)
@@ -1386,6 +1410,10 @@ def self_test() -> int:
           miss([_w(9, 1, 0, "leave", on=9 * H, off=10 * H)])[0].splits_total, 1)
     check("a fully filled order is not a finding",
           len(miss([_w(9, 1, 1000, "filled", on=9 * H, off=10 * H)])), 0)
+    part = miss([_w(9, 1, 250, "filled", on=9 * H, off=10 * H)])
+    check("a part filled one reports what it did", part[0].executed, 250)
+    check("and its completion", round(part[0].completion, 1), 25.0)
+    check("with the missed quantity still derivable", part[0].unfilled, 750)
     check("a rejected split never reached the market, so it does not excuse us",
           len(miss([_w(9, 1, 0, "rejected", on=None, off=None)])), 1)
 
@@ -1478,6 +1506,12 @@ def self_test() -> int:
 
     figs = pages_for(dr, totals(dr), dm, "By market  ·  x", "Generated  ·  x")
     check("the daily report is two pages", len(figs), 2)
+    check("the findings columns add up to the full width",
+          round(sum(c[1] for c in MISS_COLS), 6), 1.0)
+    check("and so do the market ones",
+          round(sum(c[1] for c in MKT_COLS), 6), 1.0)
+    check("the findings table shows what was done, not what was not",
+          [c[0] for c in MISS_COLS][3:6], ["Order qty", "Exec qty", "Completion"])
     buf = io.BytesIO()
     figs[0].savefig(buf, format="pdf")
     check("page one renders", buf.getvalue()[:5], b"%PDF-")

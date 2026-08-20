@@ -41,16 +41,21 @@ Orders at a limit  Overall completion   Rejections    Favourable, no split
 **Page 2** — *Favourable limit, no split on the market*:
 
 ```
-┌────────┬──────────┬──────┬───────────┬──────────┬───────┬──────┬─────────────┬──────┬────────┐
-│ Market │ Symbol   │ Side │ Order qty │ Unfilled │ Limit │ At   │ Limit period│ Mins │ Splits │
-├────────┼──────────┼──────┼───────────┼──────────┼───────┼──────┼─────────────┼──────┼────────┤
-│ Japan  │ 1010.JP  │ sell │   215,000 │  215,000 │  12.5 │ up   │ 11:10–11:26 │   16 │      0 │
-│ Taiwan │ 1070.TT  │ sell │   185,000 │  185,000 │  27.5 │ up   │ 12:10–12:46 │   36 │      0 │
-│ Korea  │ 1045.KS  │ buy  │   197,500 │  116,525 │ 21.25 │ down │ 11:45–11:56 │   11 │      1 │
-└────────┴──────────┴──────┴───────────┴──────────┴───────┴──────┴─────────────┴──────┴────────┘
+┌────────┬─────────┬──────┬───────────┬──────────┬────────────┬───────┬──────┬─────────────┬──────┬────────┐
+│ Market │ Symbol  │ Side │ Order qty │ Exec qty │ Completion │ Limit │ At   │ Limit period│ Mins │ Splits │
+├────────┼─────────┼──────┼───────────┼──────────┼────────────┼───────┼──────┼─────────────┼──────┼────────┤
+│ Japan  │ 1010.JP │ sell │   215,000 │        0 │       0.0% │  12.5 │ up   │ 11:10–11:26 │   16 │      0 │
+│ Taiwan │ 1070.TT │ sell │   185,000 │        0 │       0.0% │  27.5 │ up   │ 12:10–12:46 │   36 │      0 │
+│ Korea  │ 1045.KS │ buy  │   197,500 │   80,975 │      41.0% │ 21.25 │ down │ 11:45–11:56 │   11 │      1 │
+└────────┴─────────┴──────┴───────────┴──────────┴────────────┴───────┴──────┴─────────────┴──────┴────────┘
 ```
 
-Sorted by **unfilled quantity**, biggest first — the page is read from the top.
+**Completion is the number in red**: on a page about limits we could have traded
+into, how little of the order got done *is* the finding. Order qty beside it is
+what that percentage is a percentage of, so the quantity missed is still there —
+`Order qty × (1 − Completion)` — without a column spent printing it.
+
+Sorted by that missed quantity, biggest first — the page is read from the top.
 
 `--monthly` inserts a page of **Completion by day** and **Rejections by day**
 between the two, as full-width vertical charts.
@@ -219,7 +224,7 @@ python scripts/luld_report/luld_report.py --self-test
 python scripts/luld_report/luld_report.py --demo
 ```
 
-112 checks, no kdb and no pykx: the suffix routing including the many-to-one
+120 checks, no kdb and no pykx: the suffix routing including the many-to-one
 markets, which limit a period was at, what counts as favourable, window
 arithmetic including open-ended splits, what makes a split active, which orders
 the limit touched, every guard on the findings table, the rollups, the mode
