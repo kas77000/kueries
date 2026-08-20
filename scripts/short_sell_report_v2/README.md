@@ -239,6 +239,35 @@ WARNING: 2 chains executed MORE than the quantity taken for them, so completion
 A chain that merely **resizes** is reported separately and is not an error — a
 replace may legitimately change quantity, unlike stock.
 
+### 4. Orders that never produced a workorder
+
+Reported, **not removed**:
+
+```
+14 orders never produced a workorder (41,300,000 qty), and are IN the numbers above:
+      11 died within 60s (33,100,000 qty) - pulled before we had a chance
+       3 lived longer (8,200,000 qty) - WE sent nothing, longest 120 min on SCB-R.TB.
+         These are a finding, not noise, and are why none of this is dropped
+         automatically
+```
+
+"No workorder" is ambiguous between two **opposite** readings, and nothing in
+the row says which:
+
+| | |
+|---|---|
+| **the client pulled it** | cancelled seconds after arriving. We never had a chance, and its quantity arguably does not belong in a completion percentage at all. |
+| **we sent nothing** | it sat there for hours and the algo generated nothing — very much our failure, and precisely what a completion report exists to surface. |
+
+How **long it was live** is what separates them, so that is what gets measured
+(`QUICK_CANCEL_SECS`, 60s). A *rejected* workorder counts as having produced
+one: we sent something and the venue said no, which is the opposite of never
+having sent anything.
+
+Until that split shows which case dominates on real data, both stay in the
+numbers and both are disclosed. Removing the quick ones is defensible once the
+data supports it — removing the slow ones would delete a finding.
+
 ---
 
 ## `--compare`
@@ -266,7 +295,7 @@ each other.
 python scripts/short_sell_report_v2/short_sell_report_v2.py --self-test
 ```
 
-122 checks, no kdb and no pykx: parsing tag 9604 out of a fixmsg in four
+135 checks, no kdb and no pykx: parsing tag 9604 out of a fixmsg in four
 separator styles and refusing the 19604/96040/embedded-value traps, chaining on
 the client id, untagged targets standing alone, which attempt sets the quantity,
 both checks and the exclusivity of their branches, the Thailand rollup end to

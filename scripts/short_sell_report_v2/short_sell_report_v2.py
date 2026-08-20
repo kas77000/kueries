@@ -133,16 +133,16 @@ Q_SESSION = """
   sside:`$sside;
   et:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; size:0#0i;
          fixmsg:0#`; oes_oid:0#`; basket:0#`; side:0#`; algo:0#`;
-         time:0#0Nt);
+         t_start:0#0Nt; t_end:0#0Nt; time:0#0Nt);
   ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i;
          state:0#`);
 
   t:$[hist;
       select date,id_server,id_target,sym,size,fixmsg,oes_oid,basket,side,
-          algo,time
+          algo,t_start,t_end,time
         from target where date=d, side=sside, any (upper sym) like/: sfx;
       update date:0Nd from select id_server,id_target,sym,size,fixmsg,oes_oid,
-          basket,side,algo,time
+          basket,side,algo,t_start,t_end,time
         from target where side=sside, any (upper sym) like/: sfx];
   if[0=count t; :(et;ew)];
 
@@ -222,6 +222,8 @@ class Attempt(NamedTuple):
     basket: str
     side: str
     algo: str
+    t_start: float             # the order's live window, seconds
+    t_end: float
     seq: float                 # target `time`, to find the last attempt
     id_target: int
 
@@ -296,6 +298,7 @@ def to_attempts(records) -> tuple:
             oes_oid=v1._s(r.get("oes_oid")), basket=v1._s(r.get("basket")),
             side=v1._s(r.get("side")) or v1.SHORTSELL_SIDE,
             algo=v1._s(r.get("algo")),
+            t_start=_t(r.get("t_start")), t_end=_t(r.get("t_end")),
             seq=_t(r.get("time")), id_target=idt))
     return out, dropped
 
@@ -408,6 +411,62 @@ def over_filled(chs, splits) -> list:
     fills = chain_fills(chs, splits)
     return [(c, fills.get(c.chain_key, 0)) for c in chs
             if c.size > 0 and fills.get(c.chain_key, 0) > c.size]
+
+
+# An order that never produced a workorder is ambiguous, and the two readings
+# are opposites:
+#
+#   the client pulled it        - it was cancelled seconds after it arrived and
+#                                 we never had a chance.  Not our failure, and
+#                                 its quantity arguably does not belong in a
+#                                 completion percentage at all.
+#   we never sent anything      - it sat there for hours and the algo generated
+#                                 nothing.  Very much our failure, and exactly
+#                                 what a completion report exists to surface.
+#
+# Nothing in the row itself says which.  How LONG it was live does: a lifetime
+# of seconds is the first, of hours the second.  So this measures rather than
+# decides, and the split is printed on every run.
+QUICK_CANCEL_SECS = 60.0
+
+
+def no_workorder(chs, splits) -> tuple:
+    """(quick, slow) - chains that never produced a single workorder, split by
+    whether they lived long enough for that to be our fault."""
+    had = {sp.key for sp in splits}
+    none = [c for c in chs if not (c.keys & had)]
+    quick = [c for c in none
+             if (c.attempts[-1].t_end - c.attempts[0].t_start)
+             <= QUICK_CANCEL_SECS]
+    slow = [c for c in none if c not in quick]
+    return quick, slow
+
+
+def report_no_workorder(quick, slow) -> None:
+    """Report them; do not remove them.
+
+    Dropping the quick ones from completion is defensible - there was nothing
+    to complete - but it is not free: an order that vanishes from a report is
+    an order nobody counts, and the SLOW ones are a finding rather than noise.
+    Until the split below shows which case dominates, both stay in and both are
+    disclosed.
+    """
+    if not (quick or slow):
+        return
+    qn = sum(c.size for c in quick)
+    sn = sum(c.size for c in slow)
+    log(f"  {len(quick) + len(slow):,} orders never produced a workorder "
+        f"({qn + sn:,} qty), and are IN the numbers above:")
+    if quick:
+        log(f"      {len(quick):,} died within {QUICK_CANCEL_SECS:.0f}s "
+            f"({qn:,} qty) - pulled before we had a chance")
+    if slow:
+        worst = max(slow, key=lambda c: c.attempts[-1].t_end
+                    - c.attempts[0].t_start)
+        mins = (worst.attempts[-1].t_end - worst.attempts[0].t_start) / 60.0
+        log(f"      {len(slow):,} lived longer ({sn:,} qty) - WE sent nothing, "
+            f"longest {mins:.0f} min on {worst.sym}. These are a finding, not "
+            f"noise, and are why none of this is dropped automatically")
 
 
 def report_stats(st: ChainStats, quiet=False):
@@ -674,6 +733,7 @@ def run(args) -> int:
     chs = to_chains(attempts, args.chain_qty)
     st = report_stats(chain_stats(attempts, chs), args.quiet)
     report_over_filled(over_filled(chs, splits))
+    report_no_workorder(*no_workorder(chs, splits))
     if args.chains:
         return dump_chains(chs)
 
@@ -712,7 +772,7 @@ def run(args) -> int:
 # =============================================================================
 
 def _a(idt, country, size, cid, basket="B1", side="sellshort",
-       algo="vwap", t=0.0, d=None, srv=1, sym=None, extra=""):
+       algo="vwap", t=0.0, live=3600.0, d=None, srv=1, sym=None, extra=""):
     """One target row, as q returns it.  cid goes into fixmsg as tag 9604, the
     way the client actually sends it - so the fixture exercises the PARSE, not
     just the grouping."""
@@ -725,13 +785,24 @@ def _a(idt, country, size, cid, basket="B1", side="sellshort",
     if cid:
         fix += f"{CLIENT_ID_TAG}={cid};"
     r.update({"fixmsg": fix + extra + "17717=7280001184;59=0",
+              "t_start": dt.timedelta(seconds=t),
+              "t_end": dt.timedelta(seconds=t + live),
               "oes_oid": f"OID.{idt}", "basket": basket, "side": side,
               "algo": algo, "time": dt.timedelta(seconds=t)})
     return r
 
 
 def self_test() -> int:
+    import contextlib as _c
+    import io as _i2
     ok = True
+
+    def printed_err(fn, *a):
+        """report_* write to stderr, via log()."""
+        buf = _i2.StringIO()
+        with _c.redirect_stderr(buf):
+            fn(*a)
+        return buf.getvalue()
 
     def check(name, got, want):
         nonlocal ok
@@ -898,9 +969,48 @@ def self_test() -> int:
           over_filled(to_chains(part, "max"),
                       v1.to_splits([v1._c(1, 1, 10, "filled")], part)), [])
 
+    print("\norders that never produced a workorder")
+    #  three orders: one pulled in 5s, one that sat for an hour with nothing
+    #  sent, and one that worked normally
+    nw, _ = to_attempts([_a(1, "TH", 1000, "CLI-A", t=1, live=5.0),
+                         _a(2, "TH", 2000, "CLI-B", t=2, live=3600.0),
+                         _a(3, "TH", 3000, "CLI-C", t=3, live=3600.0)])
+    nwc = to_chains(nw)
+    nws = v1.to_splits([v1._c(1, 3, 1500, "filled")], nw)
+    quick, slow = no_workorder(nwc, nws)
+    check("the one pulled in seconds is found",
+          [c.client_id for c in quick], ["CLI-A"])
+    check("the one we sat on is found separately",
+          [c.client_id for c in slow], ["CLI-B"])
+    check("and the one that worked is neither",
+          "CLI-C" not in [c.client_id for c in quick + slow], True)
+    #  a REJECTED workorder is still a workorder: we sent something and the
+    #  venue said no, which is the opposite of never having sent anything
+    rej_sp = v1.to_splits([v1._c(9, 2, 0, "rejected"),
+                           v1._c(1, 3, 1500, "filled")], nw)
+    check("a rejected workorder counts as having produced one",
+          [c.client_id for c in no_workorder(nwc, rej_sp)[1]], [])
+    check("leaving only the one pulled in seconds",
+          [c.client_id for c in no_workorder(nwc, rej_sp)[0]], ["CLI-A"])
+
+    th = [r for r in by_market(nwc, nws) if r.code == "TH"][0]
+    check("all three are still IN the rollup - nothing is dropped", th.orders, 3)
+    check("with their quantity", th.order_qty, 6000)
+    check("and the two that did nothing drag completion, as they should",
+          round(th.completion, 1), 25.0)
+
+    said_nw = printed_err(report_no_workorder, quick, slow)
+    check("the run discloses them", "never produced a workorder" in said_nw,
+          True)
+    check("says they are IN the numbers", "are IN the numbers" in said_nw, True)
+    check("separates the pulled from the neglected",
+          ("pulled before we had a chance" in said_nw
+           and "WE sent nothing" in said_nw), True)
+    check("and names the worst one", "XT.TB" in said_nw, True)
+    check("a session with none says nothing at all",
+          printed_err(report_no_workorder, [], []), "")
+
     print("\nseeing the untagged targets")
-    import contextlib as _c
-    import io as _i2
 
     def printed(fn, *a):
         buf = _i2.StringIO()
