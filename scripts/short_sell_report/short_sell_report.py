@@ -682,12 +682,18 @@ def _sorted_pairs(rows, key):
     return sorted(rows, key=key, reverse=True)
 
 
-def draw(rows, tot, subtitle, footer, days=None):
-    """The whole page.  Pure: takes rollups, returns a figure."""
+def draw(rows, tot, subtitle, footer, days=None, title=None):
+    """The whole page.  Pure: takes rollups, returns a figure.
+
+    title exists so short_sell_report_v2 can put its own name on the same
+    layout rather than copying it - a second copy of a page is a page that
+    drifts, and the whole point of the v2 is that everything except the way
+    orders are counted is identical.
+    """
     monthly = days is not None
 
     fig = figure()
-    heading(fig, TITLE, subtitle, Y_TITLE, Y_SUBTITLE, Y_RULE_TOP)
+    heading(fig, title or TITLE, subtitle, Y_TITLE, Y_SUBTITLE, Y_RULE_TOP)
     _kpis(fig, tot)
 
     row_h = 0.030 if monthly else 0.040
