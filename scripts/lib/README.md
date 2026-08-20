@@ -33,7 +33,7 @@ msg = build_message(Mail(
     inline_images=[("report-page", Path("report.png"))],   # <img src="cid:report-page">
     attachments=[Path("report.pdf")]))
 
-send(msg, Smtp.from_env())
+send(msg, Smtp(host="mail.example.com", port=25))
 ```
 
 ```
@@ -67,12 +67,16 @@ before anything leaves the machine.
   strip `<head>` with it. `html_table` takes per cell colours, so a caller can
   pick out the numbers that matter without this module knowing why they matter.
 
-### Configuration
+### The server
 
-`Smtp.from_env()` reads `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`,
-`SMTP_STARTTLS` and `SMTP_FROM`, and anything passed explicitly wins over the
-environment. The port defaults to 587 with STARTTLS and 25 without. Keeping
-credentials in the environment is what keeps a password out of shell history.
+`Smtp(host, port, timeout)` — and nothing else. The port defaults to 25 and the
+timeout to 30s.
+
+**No credentials, no STARTTLS.** An internal relay that accepts mail from the
+host it runs on has nothing to authenticate with, and an auth path nobody
+exercises is a path that is broken by the time somebody needs it. `send()` is
+therefore exactly `smtplib.SMTP(host, port, timeout=…)` and one `send_message`.
+Adding auth back is a `login()` call and two more fields.
 
 ### What it deliberately does not do
 

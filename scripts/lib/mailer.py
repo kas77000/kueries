@@ -20,6 +20,11 @@ stands.
       attachments=[Path("short_sell_report_2026-07-24.pdf")]))
   send(msg, Smtp(host="smtp.example.com", port=25))
 
+SMTP IS HOST, PORT AND TIMEOUT.  No credentials, no STARTTLS - an internal relay
+that takes mail from the host it runs on has nothing to authenticate with, and
+an auth path nobody exercises is a path that is broken by the time somebody
+needs it.
+
 TWO STEPS ON PURPOSE.  build_message() is pure - it touches the filesystem to
 read the attachments and nothing else - so a caller can assemble a message,
 check it, and print it without a mail server anywhere in reach.  send() is the
@@ -27,11 +32,6 @@ only function that opens a socket.  Every caller's --self-test can therefore
 cover the message it actually sends.
 
   python scripts/lib/mailer.py --self-test
-
-CONFIGURATION.  Smtp() carries the server; its fields default from the
-environment (SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_STARTTLS,
-SMTP_FROM) so a password never has to be committed or passed on a command line
-where it would land in shell history.
 
 WHAT THIS DELIBERATELY DOES NOT DO.  No retry loop, no queue, no bounce
 handling.  A report mailer that silently swallows a failure is worse than one
@@ -43,12 +43,11 @@ harmless if somebody knows it was not received.
 from __future__ import annotations
 
 import mimetypes
-import os
 import re
 import smtplib
 import sys
 from email.message import EmailMessage
-from email.utils import formataddr, formatdate, make_msgid, parseaddr
+from email.utils import formatdate, make_msgid, parseaddr
 from pathlib import Path
 from typing import NamedTuple, Optional, Sequence
 
@@ -63,28 +62,20 @@ MAX_ATTACHMENT_MB = 20      # most gateways bounce past this; fail loudly first
 
 
 class Smtp(NamedTuple):
-    """Where to send.  Every field falls back to the environment."""
+    """Where to send: a host, a port and a timeout.
+
+    No credentials and no STARTTLS.  These reports go through an internal relay
+    that takes mail from the host it runs on, so there is nothing to
+    authenticate with - and an auth path nobody exercises is a path that is
+    broken by the time somebody needs it.  Adding one back is a login() call
+    here and two more fields.
+    """
     host: str = ""
-    port: int = 0
-    user: Optional[str] = None
-    password: Optional[str] = None
-    starttls: bool = False
+    port: int = 0                  # 0 -> 25
     timeout: int = 30
 
-    @classmethod
-    def from_env(cls, **overrides) -> "Smtp":
-        env = {
-            "host": os.environ.get("SMTP_HOST", ""),
-            "port": int(os.environ.get("SMTP_PORT") or 0),
-            "user": os.environ.get("SMTP_USER") or None,
-            "password": os.environ.get("SMTP_PASSWORD") or None,
-            "starttls": _truthy(os.environ.get("SMTP_STARTTLS")),
-        }
-        env.update({k: v for k, v in overrides.items() if v not in (None, "", 0)})
-        return cls(**env)
-
     def resolved_port(self) -> int:
-        return self.port or (587 if self.starttls else 25)
+        return self.port or 25
 
 
 class Mail(NamedTuple):
@@ -100,10 +91,6 @@ class Mail(NamedTuple):
     reply_to: Optional[str] = None
     attachments: Sequence = ()
     inline_images: Sequence = ()     # [(cid, path), ...], referenced as cid:<cid>
-
-
-def _truthy(v) -> bool:
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 def parse_addresses(value) -> list:
@@ -242,15 +229,11 @@ def send(msg: EmailMessage, smtp: Smtp, dry_run: bool = False) -> list:
     if dry_run:
         return rcpt
     if not smtp.host:
-        raise ValueError("no SMTP host: pass one, or set SMTP_HOST")
-    with smtplib.SMTP(smtp.host, smtp.resolved_port(), timeout=smtp.timeout) as s:
-        s.ehlo()
-        if smtp.starttls:
-            s.starttls()
-            s.ehlo()
-        if smtp.user:
-            s.login(smtp.user, smtp.password or "")
-        s.send_message(msg, from_addr=parseaddr(msg["From"])[1], to_addrs=rcpt)
+        raise ValueError("no SMTP host")
+    with smtplib.SMTP(smtp.host, smtp.resolved_port(),
+                      timeout=smtp.timeout) as srv:
+        srv.send_message(msg, from_addr=parseaddr(msg["From"])[1],
+                         to_addrs=rcpt)
     return rcpt
 
 
@@ -412,6 +395,7 @@ def self_test() -> int:
         check("the message serialises", m.as_bytes()[:5], b"Subje")
         check("dry_run reports the envelope without sending",
               send(m, Smtp(), dry_run=True), recipients(m))
+        m2 = m
 
         raises("no recipients raises",
                lambda: build_message(Mail("s", "a@b.com", [], "body")),
@@ -431,21 +415,16 @@ def self_test() -> int:
                lambda: build_message(Mail("s", "a@b.com", ["c@d.com"], "b",
                                           attachments=[Path(d) / "nope.pdf"])),
                "not a file")
-        raises("sending with no host raises",
-               lambda: send(m, Smtp()), "no SMTP host")
 
-    print("\nsmtp config")
-    os.environ["SMTP_HOST"] = "mail.example.com"
-    os.environ["SMTP_PORT"] = ""
-    os.environ["SMTP_STARTTLS"] = "yes"
-    s = Smtp.from_env()
-    check("host from the environment", s.host, "mail.example.com")
-    check("starttls from the environment", s.starttls, True)
-    check("port defaults to 587 with starttls", s.resolved_port(), 587)
-    check("and to 25 without", Smtp(host="x").resolved_port(), 25)
-    check("an explicit value beats the environment",
-          Smtp.from_env(host="other.example.com").host, "other.example.com")
-    del os.environ["SMTP_HOST"], os.environ["SMTP_PORT"], os.environ["SMTP_STARTTLS"]
+    print("\nsmtp")
+    check("host, port and timeout, and nothing else", list(Smtp._fields),
+          ["host", "port", "timeout"])
+    check("port 0 means 25", Smtp(host="x").resolved_port(), 25)
+    check("an explicit port is kept",
+          Smtp(host="x", port=2525).resolved_port(), 2525)
+    check("the timeout has a default", Smtp(host="x").timeout, 30)
+    raises("sending with no host raises", lambda: send(m2, Smtp()),
+           "no SMTP host")
 
     print("\ntables")
     t = text_table(["Market", "Orders"], [["Hong Kong", "109"], ["Japan", "541"]],

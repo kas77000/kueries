@@ -60,7 +60,6 @@ import argparse
 import calendar
 import datetime as dt
 import fnmatch
-import os
 import sys
 from pathlib import Path
 from typing import NamedTuple, Optional
@@ -105,15 +104,11 @@ EMAIL_CC = []
 EMAIL_BCC = []
 EMAIL_FROM = ""                # "algo-reports@example.com"
 
+# The relay takes mail from the host this runs on, so there is nothing to
+# authenticate with: host, port and timeout is the whole of it.
 SMTP_HOST = ""                 # "mail.example.com"
-SMTP_PORT = 0                  # 0 -> 587 when STARTTLS is on, else 25
-SMTP_STARTTLS = False
-SMTP_USER = None               # None on an open relay
-
-# The password is the one thing that does NOT belong in this file.  Name the
-# environment variable holding it instead, so nothing secret is ever committed
-# and nothing secret is ever on a command line where history keeps it.
-SMTP_PASSWORD_ENV = "SMTP_PASSWORD"
+SMTP_PORT = 0                  # 0 -> 25
+SMTP_TIMEOUT = 30              # seconds
 
 # True builds the message and reports who it would go to without opening a
 # socket - the way to check a new recipient list.
@@ -1004,11 +999,9 @@ def email_configured() -> bool:
 
 
 def smtp_config():
-    """The SMTP settings, with the password read from the environment."""
-    m = _mailer()
-    return m.Smtp(host=SMTP_HOST, port=SMTP_PORT, user=SMTP_USER,
-                  password=os.environ.get(SMTP_PASSWORD_ENV) or None,
-                  starttls=SMTP_STARTTLS)
+    """The SMTP settings.  Host, port and timeout - there is nothing else."""
+    return _mailer().Smtp(host=SMTP_HOST, port=SMTP_PORT,
+                          timeout=SMTP_TIMEOUT)
 
 
 def mail_report(rows, tot, subtitle, footer, when, files) -> None:
@@ -1527,12 +1520,11 @@ def self_test() -> int:
                        EMAIL_CC=["risk@example.com"],
                        EMAIL_FROM="algo-reports@example.com",
                        SMTP_HOST="mail.example.com", SMTP_PORT=2525,
-                       EMAIL_DRY_RUN=True):
+                       SMTP_TIMEOUT=30, EMAIL_DRY_RUN=True):
         check("filling EMAIL_TO turns it on", email_configured(), True)
         check("the port is taken from the config",
               smtp_config().resolved_port(), 2525)
-        check("and 587 when STARTTLS is on and the port is left at 0",
-              m.Smtp(host="x", starttls=True).resolved_port(), 587)
+        check("the timeout too", smtp_config().timeout, 30)
 
         with tempfile.TemporaryDirectory() as d:
             out = Path(d)
@@ -1566,15 +1558,10 @@ def self_test() -> int:
             r = "EMAIL_FROM" in str(e)
         check("EMAIL_TO with no EMAIL_FROM says so, naming the block", r, True)
 
-    check("there is no password constant in the file to commit by accident",
-          "SMTP_PASSWORD" in globals(), False)
-    with _email_config(SMTP_PASSWORD_ENV="_SSR_TEST_PW"):
-        os.environ["_SSR_TEST_PW"] = "hunter2"
-        check("and picked up from the named variable",
-              smtp_config().password, "hunter2")
-        del os.environ["_SSR_TEST_PW"]
-        check("absent when the variable is not set", smtp_config().password,
-              None)
+    check("there is nothing to authenticate with, by design",
+          [f for f in ("SMTP_USER", "SMTP_PASSWORD", "SMTP_PASSWORD_ENV",
+                       "SMTP_STARTTLS") if f in globals()], [])
+    check("port 0 means 25", m.Smtp(host="x").resolved_port(), 25)
 
     check("there are no email flags left on the command line",
           _cli_error(["--email", "a@b.com"]), True)
