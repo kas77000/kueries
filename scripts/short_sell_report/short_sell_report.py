@@ -31,14 +31,16 @@ WHAT THE THREE NUMBERS MEAN
 
   Orders       parent short sell orders - target rows with side=`sellshort.
                A target IS an order, so this is a row count
-  Completion   executed / order qty, quantity weighted.  Order qty is the sum
-               of `size` over the targets in that market - `size` IS the
-               order's quantity, taken as it stands; executed is the sum of
-               workorder `make` - a workorder is a child order and `make` is
-               what it executed, whatever state it ended in.  The headline figure is the same ratio
-               taken over all five markets at once, NOT the average of the
-               five percentages - a market with 500 orders should not weigh
-               the same as one with 5.
+  Completion   PER MARKET, executed / order qty.  Order qty is the sum of
+               `size` over the targets in that market - `size` IS the order's
+               quantity, taken as it stands; executed is the sum of workorder
+               `make` - a workorder is a child order and `make` is what it
+               executed, whatever state it ended in.
+               The HEADLINE is the plain mean of those market percentages,
+               each market counting once whatever its size, and a market with
+               no orders left out rather than averaged in as a zero.  A day on
+               the by day chart is the mean of that day's markets, the same
+               way.
   Rejections   workorder rows whose state is `rejected`.  Counted per child
                order rather than per parent, which is why one order can
                contribute several, and why a market can show more rejections
@@ -455,6 +457,17 @@ def to_splits(records, parents) -> list:
 # ROLLUPS
 # =============================================================================
 
+def _mean(vals) -> "Optional[float]":
+    """The mean of the values that exist.
+
+    A market with no orders has no completion, and it is LEFT OUT rather than
+    counted as a zero - a market we did not trade did not fail to complete, and
+    averaging in a zero for it would say it did.
+    """
+    got = [v for v in vals if v is not None]
+    return (sum(got) / len(got)) if got else None
+
+
 def _completion(executed: int, order_qty: int) -> Optional[float]:
     """Executed as a percentage of order qty, or None where there is nothing to
     divide by.  None prints as an em dash; it never prints as 0%, which would
@@ -478,26 +491,30 @@ class Row(NamedTuple):
 
 
 class DayRow(NamedTuple):
+    """One date.  completion is the mean of THAT DAY's market completions, so a
+    bar on the by day chart means the same thing the headline does."""
     date: dt.date
     orders: int
     order_qty: int
     executed: int
     rejections: int
-
-    @property
-    def completion(self) -> Optional[float]:
-        return _completion(self.executed, self.order_qty)
+    completion: Optional[float]
 
 
 class Totals(NamedTuple):
+    """The headline figures.
+
+    completion is the MEAN of the market completions, not a ratio of the summed
+    quantities.  Quantity weighting let one market with a large unfilled order
+    set the number for the whole page: 81m of Thai quantity that never traded
+    took a day whose markets ran 38% to 76% and printed 12.3%.  The mean is
+    also the one a reader can check against the table with a calculator.
+    """
     orders: int
     order_qty: int
     executed: int
     rejections: int
-
-    @property
-    def completion(self) -> Optional[float]:
-        return _completion(self.executed, self.order_qty)
+    completion: Optional[float]
 
 
 def by_market(parents, splits) -> list:
@@ -530,10 +547,14 @@ def by_day(parents, splits) -> list:
     All five markets folded together: the per day charts answer "how did the
     month go", and splitting them by market there would be a different report.
     """
-    days = {}
+    days, mkt = {}, {}
 
     def slot(d):
+        mkt.setdefault(d, {})
         return days.setdefault(d, [0, 0, 0, 0])   # orders, qty, made, rej
+
+    def cell(d, m):
+        return mkt[d].setdefault(m, [0, 0])       # qty, made - for that market
 
     for p in parents:
         if p.date is None:
@@ -541,6 +562,7 @@ def by_day(parents, splits) -> list:
         s = slot(p.date)
         s[0] += 1
         s[1] += p.size
+        cell(p.date, p.country)[0] += p.size
     for f in splits:
         if f.date is None:
             continue
@@ -548,16 +570,22 @@ def by_day(parents, splits) -> list:
         e[2] += f.make
         if f.rejected:
             e[3] += 1
-    return [DayRow(d, *days[d]) for d in sorted(days)]
+        cell(f.date, f.country)[1] += f.make
+    return [DayRow(d, days[d][0], days[d][1], days[d][2], days[d][3],
+                   _mean(_completion(e, q) for q, e in mkt[d].values()))
+            for d in sorted(days)]
 
 
 def totals(rows) -> Totals:
-    """The headline figures.  Completion is re-derived from the summed
-    quantities, so it is quantity weighted rather than an average of five
-    percentages - one market with 500 orders must not weigh the same as one
-    with 5."""
+    """The headline figures.
+
+    Completion is the MEAN of the market completions - each market counts once,
+    whatever its size - and a market with no orders is left out rather than
+    averaged in as a zero.
+    """
     return Totals(sum(r.orders for r in rows), sum(r.order_qty for r in rows),
-                  sum(r.executed for r in rows), sum(r.rejections for r in rows))
+                  sum(r.executed for r in rows), sum(r.rejections for r in rows),
+                  _mean(r.completion for r in rows))
 
 
 # =============================================================================
@@ -1073,8 +1101,14 @@ def self_test() -> int:
     check("KR rejections", rows[2].rejections, 152)
     check("total orders", tot.orders, 732)
     check("total rejections", tot.rejections, 394)
-    check("headline completion is quantity weighted",
-          round(tot.completion, 1), 55.7)
+    check("the headline is the MEAN of the market completions, not a ratio "
+          "of the sums", round(tot.completion, 1), 58.7)
+    check("which is what the three market rows average to",
+          round(sum(r.completion for r in rows if r.completion is not None)
+                / 3, 1), 58.7)
+    check("a market with no orders is left out, not counted as a zero",
+          round(_mean([50.0, 100.0, None]), 1), 75.0)
+    check("and all-empty has no mean at all", _mean([None, None]), None)
     check("HK completion", round(rows[0].completion, 1), 53.1)
     check("a market with no flow has no completion", rows[3].completion, None)
     check("no restricted orders in this fixture", dropped, 0)
@@ -1206,8 +1240,10 @@ def self_test() -> int:
     check("one row per traded date", [d.date for d in days], [d1, d2, d3])
     check("an id_target repeated across dates is two orders",
           [d.orders for d in days], [1, 2, 1])
-    check("day completion", [round(d.completion, 1) for d in days],
-          [50.0, 30.0, 0.0])
+    #  d2 has HK 1000/4000 = 25% and JP 500/1000 = 50%, so the day is 37.5 -
+    #  the quantity weighted figure would have been 1500/5000 = 30%
+    check("a day is the mean of THAT DAY's markets too",
+          [round(d.completion, 1) for d in days], [50.0, 37.5, 0.0])
     check("day rejections", [d.rejections for d in days], [0, 2, 1])
     check("the month total matches the day series",
           totals(by_market(p5, c5)).executed, sum(d.executed for d in days))
@@ -1340,7 +1376,7 @@ def self_test() -> int:
     dt_ = totals(dr)
     check("the daily demo is the page in the README",
           (dt_.orders, dt_.rejections, round(dt_.completion, 1)),
-          (732, 394, 55.7))
+          (732, 394, 58.7))
     check("and is deterministic", totals(by_market(*demo_session())).executed,
           dt_.executed)
     mp, ms = demo_month()

@@ -22,7 +22,7 @@ The default run is a **real-time snapshot** of the session in progress.
 Short-Sell Order Report
 By market · 2026-07-24 18:37
 ────────────────────────────────────────────────────────
-732                 55.7%                394
+732                 58.7%                394
 Short-sell orders   Overall completion   Rejections
 
 ┌──────────┬────────┬────────────┬────────────┬────────────┬────────────┐
@@ -83,7 +83,8 @@ reach, a network share included.
 | **Orders** | parent short sell orders — `target` rows with ``side=`sellshort``. A target **is** an order, so this is a row count. |
 | **Order qty** | the sum of `size` over the targets in that market. `size` **is** the order's quantity, taken as it stands — nothing is aggregated within an order; the only sum is the one across the market's orders. |
 | **Executed** | the sum of `workorder.make`. A workorder **is** a child order, and `make` is what that child executed — whatever state it ended in, so a cancelled child that part-filled still contributes what it filled. Nothing but `make` says a quantity was executed. |
-| **Completion** | `Executed / Order qty`. The **headline** figure is that same ratio taken over all five markets at once, **not** the average of the five percentages — a market with 500 orders must not weigh the same as one with 5. |
+| **Completion** | per market, `Executed / Order qty`. |
+| **Overall completion** | the plain **mean** of those market percentages — each market counts once whatever its size, and a market with no orders is **left out** rather than averaged in as a zero. Not a ratio of the summed quantities: one market with a large unfilled order was setting the number for the whole page (81m of Thai quantity that never traded printed 12.3% on a day whose markets ran 38% to 76%). The mean is also the one a reader can check against the table with a calculator. |
 | **Rejections** | the `workorder` rows whose state is ``` `rejected ```. Counted per **child** order, not per parent, which is why Hong Kong can show 109 orders and 239 rejections. |
 
 **Nothing is grouped, in either table.** A target is an order and a workorder
@@ -296,9 +297,9 @@ rendering path runs on a machine with no kdb, no pykx and no q licence:
 python scripts/short_sell_report/short_sell_report.py --self-test
 ```
 
-It rebuilds the page above from synthetic records — 132 checks — covering the
+It rebuilds the page above from synthetic records — 135 checks — covering the
 suffix routing (including the suffixes that are *not* ours, like Tokyo's `.T`),
-the market rollup, the quantity weighted headline, the Japan exclusion
+the market rollup, the mean-of-markets headline, the Japan exclusion
 (including that the dropped orders' fills and rejections go with them), the
 counting rules (only `make` executes, a cancelled child still contributes what
 it filled, only ``` `rejected ``` rejects), the day series, the rendering of

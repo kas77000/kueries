@@ -13,7 +13,11 @@ python scripts/luld_report/luld_report.py --self-test
 ```
 
 Sibling of [`short_sell_report`](../short_sell_report/README.md) — same page,
-same conventions, same three headline figures. What is new is the bottom table.
+same conventions, same headline figures. What is new is the bottom table.
+
+**Overall completion is the mean of the eight market percentages**, each market
+counting once whatever its size, with a market that had no LULD orders left out
+rather than averaged in as a zero.
 
 ---
 
@@ -26,7 +30,7 @@ by market:
 Limit Up / Limit Down Order Report
 By market · 2026-07-24 18:37
 ────────────────────────────────────────────────────────────────────
-103                47.9%                309           10
+103                48.3%                309           10
 Orders at a limit  Overall completion   Rejections    Favourable, no split
 
 ┌───────────┬────────┬────────────┬────────────┬────────────┬────────────┐
@@ -235,7 +239,7 @@ python scripts/luld_report/luld_report.py --self-test
 python scripts/luld_report/luld_report.py --demo
 ```
 
-123 checks, no kdb and no pykx: the suffix routing including the many-to-one
+126 checks, no kdb and no pykx: the suffix routing including the many-to-one
 markets, which limit a period was at, what counts as favourable, window
 arithmetic including open-ended splits, what makes a split active, which orders
 the limit touched, every guard on the findings table, the rollups, the mode
