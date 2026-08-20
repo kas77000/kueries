@@ -60,7 +60,8 @@ a chain of subplot calls.
 - The palette is the validated data-viz reference set, light only: these pages
   get printed and pasted into documents, where a themed surface is a liability.
 
-Used by [`short_sell_report`](../short_sell_report/README.md).
+Used by [`short_sell_report`](../short_sell_report/README.md) and
+[`luld_report`](../luld_report/README.md).
 
 ---
 
@@ -135,4 +136,5 @@ nobody received is only harmless if somebody knows it was not received.
 
 Standard library only — `smtplib` and `email`.
 
-Used by [`short_sell_report`](../short_sell_report/README.md).
+Used by [`short_sell_report`](../short_sell_report/README.md) and
+[`luld_report`](../luld_report/README.md).
