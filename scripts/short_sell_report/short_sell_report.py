@@ -90,6 +90,35 @@ _PLACEHOLDER = "CHANGEME"
 OUT_DIR = Path(__file__).resolve().parent / "out"
 DPI = 200
 
+# -----------------------------------------------------------------------------
+# EMAIL.  Edit these.  No command line arguments, by design: who gets this
+# report is part of what the report IS, not of one run of it - a distribution
+# list that lives in whatever someone last typed is a list that quietly loses
+# people.
+#
+# EMAIL_TO empty means DO NOT SEND.  That is the whole switch; there is no
+# separate enable flag to leave in the wrong position.
+# -----------------------------------------------------------------------------
+
+EMAIL_TO = []                  # ["desk@example.com", "compliance@example.com"]
+EMAIL_CC = []
+EMAIL_BCC = []
+EMAIL_FROM = ""                # "algo-reports@example.com"
+
+SMTP_HOST = ""                 # "mail.example.com"
+SMTP_PORT = 0                  # 0 -> 587 when STARTTLS is on, else 25
+SMTP_STARTTLS = False
+SMTP_USER = None               # None on an open relay
+
+# The password is the one thing that does NOT belong in this file.  Name the
+# environment variable holding it instead, so nothing secret is ever committed
+# and nothing secret is ever on a command line where history keeps it.
+SMTP_PASSWORD_ENV = "SMTP_PASSWORD"
+
+# True builds the message and reports who it would go to without opening a
+# socket - the way to check a new recipient list.
+EMAIL_DRY_RUN = False
+
 
 # =============================================================================
 # SCOPE
@@ -913,8 +942,9 @@ def _mailer():
         from lib import mailer
     except ImportError as e:
         raise SystemExit(
-            f"--email needs scripts/lib/mailer.py ({e}).  It sits beside this "
-            f"script's folder; copy scripts/lib too if you moved this one.")
+            f"EMAIL_TO is set but scripts/lib/mailer.py will not import "
+            f"({e}).  It sits beside this script's folder; copy scripts/lib "
+            f"too if you moved this one.")
     return mailer
 
 
@@ -968,40 +998,53 @@ def mail_bodies(rows, tot, subtitle, footer, png_cid=None) -> tuple:
     return text, html
 
 
-def mail_report(rows, tot, subtitle, footer, when, files, args) -> None:
-    """Build the message and send it.  Raises rather than warning: a report
-    nobody received is only harmless if somebody knows it was not received."""
+def email_configured() -> bool:
+    """Is there anyone to send to?  An empty EMAIL_TO is the off switch."""
+    return bool(EMAIL_TO or EMAIL_CC or EMAIL_BCC)
+
+
+def smtp_config():
+    """The SMTP settings, with the password read from the environment."""
+    m = _mailer()
+    return m.Smtp(host=SMTP_HOST, port=SMTP_PORT, user=SMTP_USER,
+                  password=os.environ.get(SMTP_PASSWORD_ENV) or None,
+                  starttls=SMTP_STARTTLS)
+
+
+def mail_report(rows, tot, subtitle, footer, when, files) -> None:
+    """Build the message and send it, per the EMAIL block at the top.
+
+    Raises rather than warning: a report nobody received is only harmless if
+    somebody knows it was not received.
+    """
     m = _mailer()
     pdf = next((p for p in files if p.suffix == ".pdf"), None)
     png = next((p for p in files if p.suffix == ".png"), None)
 
+    if not EMAIL_FROM:
+        raise SystemExit(
+            f"EMAIL_TO is set but EMAIL_FROM is empty. Both live in the EMAIL "
+            f"block near the top of {Path(__file__).name}.")
+
     cid = "report-page" if png else None
     text, html = mail_bodies(rows, tot, subtitle, footer, png_cid=cid)
-    sender = args.email_from or os.environ.get("SMTP_FROM") or ""
-    if not sender:
-        raise SystemExit("--email needs a sender: pass --email-from, or set "
-                         "SMTP_FROM in the environment")
-
     msg = m.build_message(m.Mail(
         subject=f"{TITLE} - {when}",
-        sender=sender,
-        to=args.email,
-        cc=args.email_cc or (),
-        bcc=args.email_bcc or (),
+        sender=EMAIL_FROM,
+        to=EMAIL_TO,
+        cc=EMAIL_CC,
+        bcc=EMAIL_BCC,
         text=text,
         html=html,
         inline_images=[(cid, png)] if png else (),
         attachments=[pdf] if pdf else ()))
 
-    host, _, port = (args.smtp or "").rpartition(":")
-    smtp = m.Smtp.from_env(host=host or args.smtp or None,
-                           port=int(port) if port.isdigit() else None,
-                           starttls=args.smtp_starttls or None)
+    smtp = smtp_config()
     log("  email:")
     log(m.describe(msg))
-    rcpt = m.send(msg, smtp, dry_run=args.email_dry_run)
-    if args.email_dry_run:
-        log(f"  --email-dry-run: NOT sent, {len(rcpt)} recipient"
+    rcpt = m.send(msg, smtp, dry_run=EMAIL_DRY_RUN)
+    if EMAIL_DRY_RUN:
+        log(f"  EMAIL_DRY_RUN: NOT sent, {len(rcpt)} recipient"
             f"{'' if len(rcpt) == 1 else 's'} would have been")
     else:
         log(f"  sent to {len(rcpt)} recipient{'' if len(rcpt) == 1 else 's'} "
@@ -1134,8 +1177,8 @@ def run(args) -> int:
 
     files = save(draw(rows, tot, subtitle, footer, days),
                  Path(args.out_dir), stem)
-    if args.email:
-        mail_report(rows, tot, subtitle, footer, subtitle_when, files, args)
+    if email_configured():
+        mail_report(rows, tot, subtitle, footer, subtitle_when, files)
     return 0
 
 
@@ -1244,6 +1287,7 @@ def _c(idw, idt, make, state, d=None, srv=1):
 
 
 def self_test() -> int:
+    import tempfile
     ok = True
 
     def check(name, got, want):
@@ -1476,42 +1520,64 @@ def self_test() -> int:
     check("the html body has no <style> block clients would strip",
           "<style" in html, False)
 
-    import tempfile
-    with tempfile.TemporaryDirectory() as d:
-        out = Path(d)
-        files = save(fig, out, "short_sell_report_2026-07-24")
-        check("save writes a pdf and a png",
-              [p.name for p in files],
-              ["short_sell_report_2026-07-24.pdf",
-               "short_sell_report_2026-07-24.png"])
+    # the EMAIL block is module state, so the checks set it and put it back
+    print("\nemail is configured in the file, not on the command line")
+    check("an empty EMAIL_TO is the off switch", email_configured(), False)
+    with _email_config(EMAIL_TO=["desk@example.com, compliance@example.com"],
+                       EMAIL_CC=["risk@example.com"],
+                       EMAIL_FROM="algo-reports@example.com",
+                       SMTP_HOST="mail.example.com", SMTP_PORT=2525,
+                       EMAIL_DRY_RUN=True):
+        check("filling EMAIL_TO turns it on", email_configured(), True)
+        check("the port is taken from the config",
+              smtp_config().resolved_port(), 2525)
+        check("and 587 when STARTTLS is on and the port is left at 0",
+              m.Smtp(host="x", starttls=True).resolved_port(), 587)
 
-        class A:
-            email = ["desk@example.com, compliance@example.com"]
-            email_cc = ["risk@example.com"]
-            email_bcc = None
-            email_from = "algo-reports@example.com"
-            smtp = "mail.example.com:2525"
-            smtp_starttls = False
-            email_dry_run = True
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            files = save(fig, out, "short_sell_report_2026-07-24")
+            check("save writes a pdf and a png",
+                  [p.name for p in files],
+                  ["short_sell_report_2026-07-24.pdf",
+                   "short_sell_report_2026-07-24.png"])
+            mail_report(rows, tot, sub, foot, "2026-07-24", files)
+            msg = m.build_message(m.Mail(
+                subject=f"{TITLE} - 2026-07-24", sender=EMAIL_FROM,
+                to=EMAIL_TO, cc=EMAIL_CC, text=text, html=html,
+                inline_images=[("report-page", files[1])],
+                attachments=[files[0]]))
+            check("the pdf is attached and the png inlined",
+                  [p.get_filename() for p in msg.walk() if p.get_filename()],
+                  ["short_sell_report_2026-07-24.png",
+                   "short_sell_report_2026-07-24.pdf"])
+            check("a pasted recipient list is split", m.recipients(msg),
+                  ["desk@example.com", "compliance@example.com",
+                   "risk@example.com"])
+            check("EMAIL_DRY_RUN opens no socket",
+                  m.send(msg, m.Smtp(), dry_run=True), m.recipients(msg))
+    check("and the config goes back afterwards", email_configured(), False)
 
-        mail_report(rows, tot, sub, foot, "2026-07-24", files, A())
-        msg = m.build_message(m.Mail(
-            subject=f"{TITLE} - 2026-07-24", sender=A.email_from,
-            to=A.email, cc=A.email_cc, text=text, html=html,
-            inline_images=[("report-page", files[1])],
-            attachments=[files[0]]))
-        check("the pdf is attached and the png inlined",
-              [p.get_filename() for p in msg.walk() if p.get_filename()],
-              ["short_sell_report_2026-07-24.png",
-               "short_sell_report_2026-07-24.pdf"])
-        check("a pasted recipient list is split", m.recipients(msg),
-              ["desk@example.com", "compliance@example.com",
-               "risk@example.com"])
-        check("--email-dry-run opens no socket",
-              m.send(msg, m.Smtp(), dry_run=True), m.recipients(msg))
+    with _email_config(EMAIL_TO=["desk@example.com"], EMAIL_FROM=""):
+        r = False
+        try:
+            mail_report(rows, tot, sub, foot, "x", [])
+        except SystemExit as e:
+            r = "EMAIL_FROM" in str(e)
+        check("EMAIL_TO with no EMAIL_FROM says so, naming the block", r, True)
 
-    check("--email-from with no --email is rejected",
-          _cli_error(["--email-from", "a@b.com"]), True)
+    check("there is no password constant in the file to commit by accident",
+          "SMTP_PASSWORD" in globals(), False)
+    with _email_config(SMTP_PASSWORD_ENV="_SSR_TEST_PW"):
+        os.environ["_SSR_TEST_PW"] = "hunter2"
+        check("and picked up from the named variable",
+              smtp_config().password, "hunter2")
+        del os.environ["_SSR_TEST_PW"]
+        check("absent when the variable is not set", smtp_config().password,
+              None)
+
+    check("there are no email flags left on the command line",
+          _cli_error(["--email", "a@b.com"]), True)
     check("--monthly with --date is rejected",
           _cli_error(["--monthly", "2026-07", "--date", "2026-07-01"]), True)
     check("a future --date is rejected",
@@ -1595,6 +1661,28 @@ def self_test() -> int:
     return 0 if ok else 1
 
 
+class _email_config:
+    """Set the EMAIL block for the duration of a block of checks, and put it
+    back afterwards.  Module constants rather than arguments is the point of
+    this design; the tests have to reach them the same way a person editing the
+    file does."""
+
+    def __init__(self, **kw):
+        self.kw = kw
+        self.old = {}
+
+    def __enter__(self):
+        g = globals()
+        for k, v in self.kw.items():
+            self.old[k] = g[k]
+            g[k] = v
+        return self
+
+    def __exit__(self, *exc):
+        globals().update(self.old)
+        return False
+
+
 def _cli_error(argv) -> bool:
     """Did argparse reject this command line?  Used by the self-test, which must
     not be able to reach run() and therefore kdb."""
@@ -1615,7 +1703,9 @@ def _cli_error(argv) -> bool:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         description="Short-Sell Order Report - completion and rejections by "
-                    "market, as a one page PDF and PNG.",
+                    "market, as a one page PDF and PNG. Mailing it is "
+                    "configured in the EMAIL block at the top of this file, "
+                    "not here.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--monthly", metavar="YYYY-MM",
                    help="report a whole month off the HISTORICAL server, and "
@@ -1636,28 +1726,6 @@ def main(argv=None) -> int:
                         "the page can be looked at before it is pointed at "
                         "kdb - no connection needed. Stamped SAMPLE")
 
-    e = p.add_argument_group(
-        "email",
-        "Mail the report once it is written. The PDF is attached and the PNG "
-        "is inlined, and the body repeats the headline numbers and the table "
-        "so it reads in a preview pane. Credentials come from the environment "
-        "only - SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_STARTTLS, "
-        "SMTP_FROM - so nothing lands in shell history.")
-    e.add_argument("--email", action="append", metavar="ADDR",
-                   help="recipient. Repeatable, and each may be a comma or "
-                        "semicolon separated list")
-    e.add_argument("--email-cc", action="append", metavar="ADDR")
-    e.add_argument("--email-bcc", action="append", metavar="ADDR")
-    e.add_argument("--email-from", metavar="ADDR",
-                   help="sender. Defaults to SMTP_FROM")
-    e.add_argument("--smtp", metavar="HOST[:PORT]",
-                   help="mail server. Defaults to SMTP_HOST / SMTP_PORT")
-    e.add_argument("--smtp-starttls", action="store_true",
-                   help="upgrade the connection, and default the port to 587")
-    e.add_argument("--email-dry-run", action="store_true",
-                   help="build the message and print who it would go to, "
-                        "without opening a socket")
-
     args = p.parse_args(argv)
 
     if args.self_test:
@@ -1668,11 +1736,6 @@ def main(argv=None) -> int:
         p.error("--monthly and --date are alternatives, not a range")
     if args.date and args.date > dt.date.today():
         p.error(f"--date {args.date} is in the future")
-    for flag in ("email_cc", "email_bcc", "email_from", "smtp",
-                 "smtp_starttls", "email_dry_run"):
-        if getattr(args, flag) and not args.email:
-            p.error(f"--{flag.replace('_', '-')} without --email: there is "
-                    f"nobody to send to")
     return run(args)
 
 

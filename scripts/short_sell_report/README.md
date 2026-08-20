@@ -198,32 +198,45 @@ report is worse than no preview at all.
 
 ## Email
 
+Configured **in the script**, not on the command line — near the top, beside the
+server constants:
+
+```python
+EMAIL_TO   = ["desk@example.com", "compliance@example.com"]
+EMAIL_CC   = []
+EMAIL_BCC  = []
+EMAIL_FROM = "algo-reports@example.com"
+
+SMTP_HOST     = "mail.example.com"
+SMTP_PORT     = 0          # 0 -> 587 when STARTTLS is on, else 25
+SMTP_STARTTLS = False
+SMTP_USER     = None       # None on an open relay
+
+SMTP_PASSWORD_ENV = "SMTP_PASSWORD"   # the env var holding it, not the password
+EMAIL_DRY_RUN     = False
 ```
-python scripts/short_sell_report/short_sell_report.py \
-    --email "desk@example.com, compliance@example.com" \
-    --email-cc risk@example.com \
-    --email-from algo-reports@example.com \
-    --smtp mail.example.com
-```
+
+Who gets this report is part of what the report *is*, not of one run of it — a
+distribution list living in whatever someone last typed is a list that quietly
+loses people. **`EMAIL_TO` empty means do not send**, and that is the whole
+switch: there is no separate enable flag to leave in the wrong position.
 
 The PDF is attached, the PNG is inlined, and the body repeats the headline
 numbers and the whole table — a report that arrives as "see attached" is a
 report most people do not open, and the three numbers that matter fit in a
 preview pane.
 
-`--email` is repeatable and each value may itself be a comma or semicolon
-separated list, so a pasted distribution list works as it is. Nobody is mailed
-twice. An address that does not parse **raises** rather than being dropped: a
-recipient list quietly one short is exactly the failure that goes unnoticed for
-months.
+Each address may itself be a comma or semicolon separated list, so a pasted
+distribution list works as it is. Nobody is mailed twice. An address that does
+not parse **raises** rather than being dropped: a recipient list quietly one
+short is exactly the failure that goes unnoticed for months.
 
-`--email-dry-run` builds the message, prints who it would go to and what is
-attached, and opens no socket.
+`EMAIL_DRY_RUN = True` builds the message, prints who it would go to and what is
+attached, and opens no socket — the way to check a new recipient list.
 
-Server and credentials come from the environment — `SMTP_HOST`, `SMTP_PORT`,
-`SMTP_USER`, `SMTP_PASSWORD`, `SMTP_STARTTLS`, `SMTP_FROM` — so a password never
-lands in shell history. `--smtp`, `--smtp-starttls` and `--email-from` override
-the first, the fifth and the last of those.
+**The password is the one thing not in the file.** `SMTP_PASSWORD_ENV` names the
+environment variable holding it, so nothing secret is committed and nothing
+secret reaches a command line where history keeps it.
 
 The mailer itself is **[`scripts/lib/mailer.py`](../lib/README.md)**, which knows
 nothing about this report and is meant to be reused by the next script that
@@ -242,7 +255,7 @@ rendering path runs on a machine with no kdb, no pykx and no q licence:
 python scripts/short_sell_report/short_sell_report.py --self-test
 ```
 
-It rebuilds the page above from synthetic records — 119 checks — covering the
+It rebuilds the page above from synthetic records — 128 checks — covering the
 suffix routing (including the suffixes that are *not* ours, like Tokyo's `.T`),
 the market rollup, the quantity weighted headline, the Japan exclusion
 (including that the dropped orders' fills and rejections go with them), the
