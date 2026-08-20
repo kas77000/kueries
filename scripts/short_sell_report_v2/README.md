@@ -28,35 +28,30 @@ Dropping the rejected orders would fix the quantity and delete the finding: the
 rejections are what the report is for. So the attempts have to be collapsed
 while every rejection they produced is kept.
 
-## The chain key
+## The chain key: FIX tag 9604
 
-`oes_primoid` is always empty, so the link is the **`oes_oid` stem** — the id
-with its last dot-component (the attempt) removed:
+The client puts **its own order id in tag 9604** of `fixmsg`, and a
+cancel-and-replace carries the **same id** — the client saying "this is still
+that order". That is a fact, not an inference.
 
 ```
-SCB-R.TB.APPD2.1w519.2p5   ->  stem SCB-R.TB.APPD2.1w519   attempt 2p5
-SCB-R.TB.APPD2.1w519.3p1   ->  stem SCB-R.TB.APPD2.1w519   attempt 3p1
+8=FIX.4.2 | 35=D | 9604=CLI-0001 | 59=0     attempt 1
+8=FIX.4.2 | 35=D | 9604=CLI-0001 | 59=0     attempt 2   same order
 ```
 
-which is the q you already had:
+Chained on **(date, id_server, tag 9604)**. A target whose 9604 is empty cannot
+be chained to anything, so it **stands alone** and is counted exactly as v1
+counts it — untagged orders are never grouped together, which would merge every
+order the client did not label.
 
-```q
-by stem:{"." sv -1 _ "." vs string x} each oes_oid
-```
+> An earlier version of this grouped on the `oes_oid` prefix. That was a
+> convention; 9604 is a contract. The prefix version is gone.
 
-Chained on **(date, id_server, stem, basket)**.
-
-**The stem alone is not an order** — two orders in different baskets can share
-one, so the basket is what makes it an order. Side is *not* in the key: this
-whole report is one side, so it could never separate two rows here.
-
-**The rule is tested, not insured against.** `sym` and `side` are deliberately
-kept **out** of the key, so that stem + basket merging two orders that are not
-the same order is something the run can *see* and complain about. Putting them
-in would make the key look right by construction and tell you nothing.
-
-An `oes_oid` with no dot has no attempt to strip and becomes its own chain —
-the safe reading, since it can only ever fail to collapse something.
+**Reading the tag.** Fields are split on SOH (``), pipe, semicolon or caret —
+a space is *not* a separator, since values contain them. The whole tag is
+compared after splitting rather than searching for `"9604="`, so `19604=`,
+`96040=` and a `9604=` appearing inside another field's *value* are all
+correctly ignored.
 
 ## What changes, and what does not
 
@@ -95,67 +90,86 @@ name on the same layout. No number moved.
 
 ---
 
-## Validate it before trusting it
+## The two checks, run every time
 
-Two things are assumed and **neither is proven on your data**. Both are reported
-on every run rather than quietly relied on.
+Both of the checks you asked for are built in and print on every run — they are
+not something to remember to look at.
 
-**1. That stem + basket is an order.** Every run prints:
+### 1. Is tag 9604 populated for the universe we ask for?
 
 ```
 chains: 924 targets -> 871 orders (43 chained, longest 3)
-1 oes_oid stem shared by 2 different orders - the basket kept them apart;
-a stem-only key would have merged them.  --chains lists them
+tag 9604 is populated on every target
 ```
 
-and, if the rule breaks:
+or, when it is not:
 
 ```
-WARNING: 2 chains hold more than one sym or side. stem + basket has merged
-         orders that are NOT the same order and these numbers are WRONG.
+61 of 924 targets (6.6%) carry no tag 9604 and stand alone, as v1 counts
+them: TH 38, JP 19, KR 4
 ```
 
-**That warning must be absent.** It is the one number that says the key is
-wrong, and it exists only because sym and side are kept out of the key.
+Broken down **per market**, because "the client does not tag Thailand" is a
+different problem from "the client tags nothing". A high number does not
+invalidate the report — those orders are simply not chained — but it says how
+much of it the tag is actually doing.
 
-The `stem shared by N orders` line is the opposite direction and is **not** an
-error — it is how much work the basket is doing. Zero means the stem was unique
-anyway.
-
-`--chains` shows the chains, any mixed ones, and the shared stems, so all three
-can be checked against the engine:
+It is also the tripwire for a parse failure. If `fixmsg` uses a separator the
+parser does not know, **every** target reads as untagged and the run says so in
+the strongest terms it has:
 
 ```
-  SCB-R.TB  TH  sellshort  stem SCB-R.TB.A.1w519  basket ALPHA  -> qty 27,000,000
-      id_target 1270254699   size     27,000,000  t     38102
-      id_target 1270254812   size     27,000,000  t     38455
-      id_target 1270255001   size     27,000,000  t     39120
-
-1 stem held more than one order - this is what the basket is in the key FOR:
-
-  stem SCB-R.TB.A.1w519
-      SCB-R.TB       sellshort  basket ALPHA      qty     27,000,000  3 attempts
-      SCB-R.TB       sellshort  basket BETA       qty      4,000,000  1 attempt
+WARNING: NOT ONE of 924 targets carries tag 9604. Either the client sends
+         none, or fixmsg uses a separator fix_tag does not know - check one
+         fixmsg by hand before believing any of this. Nothing has been chained.
 ```
 
-If the warning fires, `--chains` prints the offending chains with each
-attempt's sym and side, so what got merged is visible immediately.
+### 2. Does one id ever cover two different orders?
 
-**2. That the chain's quantity is the last attempt's size.** `CHAIN_QTY` is
-`"last"`. Use `--chain-qty max` if a replace can come back for only the
-**unfilled remainder** — summing fills across attempts against a smaller final
-size would overstate completion. Every run reports:
+A chain must agree on **sym, side, algo and basket**:
+
+```
+no chain mixes sym, side, algo or basket
+```
+
+or:
+
+```
+WARNING: 2 chains disagree on sym, algo - a 9604 is covering more than one
+         order and these numbers are WRONG.  --chains lists them
+```
+
+**That must be zero.** None of those four fields is in the key **on purpose** —
+putting them in would make the key right by construction and silent, and the
+whole question is whether 9604 is trustworthy on its own.
+
+`--chains` prints the offending chains attempt by attempt with each field, so
+what got merged is visible at once:
+
+```
+2 chains cover more than one order - tag 9604 is NOT safe on its own here:
+
+  9604=CLI-X  disagrees on sym, algo
+      id_target 3    XJ.JP        sellshort  vwap    basket B1   size    100
+      id_target 4    OTHER.JP     sellshort  twap    basket B1   size    100
+```
+
+Checks assert the two branches of each are **exclusive** — a run that printed
+both the warning and the all-clear would be worse than one that printed neither,
+and an if/else is exactly what a careless edit breaks.
+
+### One thing still assumed
+
+That the chain's quantity is the **last** attempt's size. `--chain-qty max` if a
+replace can come back for only the unfilled remainder. Every run reports:
 
 ```
 NOTE: 5 chains have attempts of differing size; CHAIN_QTY='last' takes the last
 ```
 
-**While that count is zero the two settings are identical** and the choice does
-not matter. A pure reject-and-replace re-sends the same quantity, so on the
-Thailand case it is zero.
-
-Also reported: targets with **no `oes_oid` at all**, each of which becomes its
-own chain and is therefore counted exactly as v1 counts it.
+While that count is zero the two settings are identical. A chain that resizes is
+**not** reported as mixed — a replace may legitimately change quantity, which is
+the difference between that and a chain that changes stock.
 
 ---
 
@@ -184,7 +198,11 @@ each other.
 python scripts/short_sell_report_v2/short_sell_report_v2.py --self-test
 ```
 
-70 checks, no kdb and no pykx: the stem rule against both ids from your qStudio
+95 checks, no kdb and no pykx: parsing tag 9604 out of a fixmsg in four
+separator styles and refusing the 19604/96040/embedded-value traps, chaining on
+the client id, untagged targets standing alone, which attempt sets the quantity,
+both checks and the exclusivity of their branches, the Thailand rollup end to
+end, and that every reused name really comes from v1.
 session, what does and does not share a chain, which attempt sets the quantity
 (including a replace that shrank and one sent out of order), the validation
 counters, the Thailand rollup end to end, that v1 over the same data still says

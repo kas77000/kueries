@@ -19,33 +19,30 @@ replaced twice, the last attempt cancelled.
 WHY NOT JUST DROP THE REJECTS.  Because the rejections are the report.  The
 fix has to collapse the attempts while keeping every rejection they produced.
 
-THE CHAIN KEY.  oes_primoid is always empty, so the link is the oes_oid STEM -
-the id with its last dot component removed, which is the attempt number:
+THE CHAIN KEY: FIX TAG 9604.  The client puts its own order id in tag 9604 of
+fixmsg, and a cancel-and-replace carries the SAME id - it is the client saying
+"this is still that order", which is a fact rather than an inference.  (An
+earlier version of this file grouped on the oes_oid prefix; that was a
+convention, and conventions are what break silently.)
 
-    SCB-R.TB.APPD2.1w519.2p5   ->  stem SCB-R.TB.APPD2.1w519   attempt 2p5
-    SCB-R.TB.APPD2.1w519.3p1   ->  stem SCB-R.TB.APPD2.1w519   attempt 3p1
+Chained on (date, id_server, tag 9604).  A target whose 9604 is empty cannot be
+chained to anything, so it stands alone and is counted exactly as v1 counts it.
 
-which is the q the user already had:  {"." sv -1 _ "." vs string x} each oes_oid
+BOTH OF THE USER'S CHECKS ARE BUILT IN AND RUN EVERY TIME.
 
-Chained on (date, id_server, STEM, BASKET).
+  1. IS THE TAG POPULATED for the universe we ask for?  Every run reports how
+     many targets carry no 9604, and per market.  A high number does not
+     invalidate the report - those orders are simply not chained - but it says
+     how much of it the tag is actually doing.  It is also the first thing to
+     look at if the parse ever breaks: if the separator in fixmsg is not one
+     this knows about, EVERY target reads as missing and says so loudly.
 
-Two orders in different baskets can share a stem, so the stem alone is not an
-order - the basket is what makes it one.  Side is NOT in the key: this whole
-report is one side, so it could never separate two rows here.
-
-THE RULE IS TESTED RATHER THAN INSURED AGAINST.  The key is the user's, exactly
-as given, and the run then checks what that key produced:
-
-  split stems   stems shared by more than one order, which the basket pulled
-                apart.  Informational - it is the measure of how load bearing
-                the basket is.  Zero means the stem was unique anyway.
-  MIXED CHAINS  a chain holding more than one sym, or more than one side.  A
-                WARNING: it means stem + basket was not enough after all, and
-                those orders have been merged when they should not have been.
-                It must be zero, and --chains lists them.
-
-Adding sym to the key would make that warning impossible to trigger, which
-would hide the answer rather than give it.
+  2. DOES IT MIX TWO DIFFERENT ORDERS?  A chain must agree on sym, side, algo
+     and basket.  Any that does not is reported as MIXED, named field by field,
+     and --chains prints it attempt by attempt.  That count must be zero.  None
+     of those four is in the key ON PURPOSE: putting them in would make the key
+     right by construction and silent, and the whole question is whether 9604
+     is trustworthy on its own.
 
 WHAT CHANGES, AND WHAT DOES NOT
 
@@ -60,17 +57,11 @@ counts as a rejection, the page, the mail - is IMPORTED FROM v1, not copied.
 A second copy of a report is a report that drifts, and the point of this one
 is that the ONLY difference is how orders are counted.
 
-VALIDATE BEFORE TRUSTING IT.  Two things are assumed and neither is proven:
-
-  1. that the stem and the basket together are an order.  Every run reports
-     MIXED CHAINS - chains that ended up holding more than one sym or side -
-     which must be zero, and split stems, which is how much work the basket is
-     doing.  --chains lists both.
-  2. that the chain's quantity is the LAST attempt's size.  CHAIN_QTY = "max"
-     if a replace can shrink an order to its unfilled remainder, in which case
-     summing fills across attempts against the last size would overstate
-     completion.  Every run reports how many chains had attempts of differing
-     size - if that is zero, the choice does not matter.
+ONE THING LEFT ASSUMED: that the chain's quantity is the LAST attempt's size.
+Set CHAIN_QTY = "max" if a replace can come back for only the unfilled
+remainder, where fills summed across attempts against a smaller final size
+would overstate completion.  Every run reports how many chains had attempts of
+differing size; while that is zero the two settings are identical.
 
   --compare runs BOTH rollups over one fetch and prints them side by side.
 =============================================================================
@@ -114,25 +105,27 @@ CHAIN_QTY = "last"
 # =============================================================================
 # Q
 #
-# v1's query plus the three columns the chain key needs: oes_oid, basket and
-# time.  Nothing else differs - same suffix filter, same side filter, same
-# refusal to group anything.
+# v1's query plus what the chain needs: fixmsg is already there for the Japan
+# exclusion and carries tag 9604; oes_oid, basket, side and algo are for the
+# consistency checks, and time orders a chain's attempts.  Nothing else differs
+# - same suffix filter, same side filter, same refusal to group anything.
 # =============================================================================
 
 Q_SESSION = """
 {[hist;d;sfx;sside]
   sside:`$sside;
   et:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; size:0#0i;
-         fixmsg:0#`; oes_oid:0#`; basket:0#`; side:0#`; time:0#0Nt);
+         fixmsg:0#`; oes_oid:0#`; basket:0#`; side:0#`; algo:0#`;
+         time:0#0Nt);
   ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i;
          state:0#`);
 
   t:$[hist;
       select date,id_server,id_target,sym,size,fixmsg,oes_oid,basket,side,
-          time
+          algo,time
         from target where date=d, side=sside, any (upper sym) like/: sfx;
       update date:0Nd from select id_server,id_target,sym,size,fixmsg,oes_oid,
-          basket,side,time
+          basket,side,algo,time
         from target where side=sside, any (upper sym) like/: sfx];
   if[0=count t; :(et;ew)];
 
@@ -158,16 +151,38 @@ def fetch(handle, hist: bool, d: Optional[dt.date]):
 # CHAINS
 # =============================================================================
 
-def oid_stem(oes_oid) -> str:
-    """The oes_oid with its last dot component - the attempt - removed.
+# FIX fields are separated by SOH.  Stored copies commonly rewrite that as a
+# pipe, a semicolon or a caret, so all four are accepted.  A SPACE is not a
+# separator: values contain them.
+#
+# If the real separator is none of these, fix_tag finds nothing and EVERY target
+# reads as having no 9604 - which the run reports in the first line of output
+# rather than quietly failing to chain anything.
+_FIX_SEPS = "\x01|;^\n\r"
+CLIENT_ID_TAG = "9604"
 
-    `SCB-R.TB.APPD2.1w519.2p5` -> `SCB-R.TB.APPD2.1w519`.  An id with no dot has
-    no attempt to strip and is its own stem, which makes it a chain of one - the
-    safe reading, since it can only ever fail to collapse something.
+
+def fix_tag(fixmsg, tag=CLIENT_ID_TAG) -> str:
+    """The value of one FIX tag in a fixmsg, or "" if it is not there.
+
+    Split into fields first and compare the whole tag, rather than searching for
+    "9604=": that would also match 19604= and 9604X=, and a client id taken from
+    the wrong tag is worse than no client id at all.
     """
-    s = v1._s(oes_oid)
-    i = s.rfind(".")
-    return s[:i] if i > 0 else s
+    txt = v1._s(fixmsg)
+    if not txt:
+        return ""
+    field = ""
+    for ch in txt:
+        if ch in _FIX_SEPS:
+            k, sep, val = field.partition("=")
+            if sep and k.strip() == tag:
+                return val.strip()
+            field = ""
+        else:
+            field += ch
+    k, sep, val = field.partition("=")
+    return val.strip() if sep and k.strip() == tag else ""
 
 
 class Attempt(NamedTuple):
@@ -177,22 +192,26 @@ class Attempt(NamedTuple):
     country: str
     sym: str
     size: int
-    stem: str
+    client_id: str             # FIX tag 9604 - "" when the client sent none
+    oes_oid: str               # not the key, just context for --chains
     basket: str
     side: str
+    algo: str
     seq: float                 # target `time`, to find the last attempt
     id_target: int
 
     @property
     def chain_key(self) -> tuple:
-        """What makes an order: the oes_oid prefix and the basket.
+        """What makes an order: the client's own id for it.
 
-        The stem is not enough on its own - two orders in different baskets can
-        share one.  sym and side are deliberately NOT here: keeping them out is
-        what lets a chain holding two of either be DETECTED, which is the check
-        that this key is right.
+        A target with no 9604 keys on its own id_target instead, so it stands
+        alone.  Grouping the un-tagged ones together would merge every unrelated
+        order the client did not label, which is the one mistake here that would
+        be invisible.
         """
-        return (self.date, self.key[1], self.stem, self.basket)
+        if not self.client_id:
+            return (self.date, self.key[1], "", self.id_target)
+        return (self.date, self.key[1], self.client_id)
 
 
 class Chain(NamedTuple):
@@ -203,6 +222,8 @@ class Chain(NamedTuple):
     sym: str
     side: str
     basket: str
+    algo: str
+    client_id: str
     size: int
     attempts: tuple            # every Attempt, in order
 
@@ -213,6 +234,15 @@ class Chain(NamedTuple):
     @property
     def keys(self) -> set:
         return {a.key for a in self.attempts}
+
+    def disagrees_on(self) -> list:
+        """Which of sym, side, algo, basket the attempts do not agree on.
+
+        Empty is what it should be.  Anything in it means one 9604 covered two
+        different orders and this chain is wrong.
+        """
+        return [f for f in ("sym", "side", "algo", "basket")
+                if len({getattr(a, f) for a in self.attempts}) > 1]
 
 
 def to_attempts(records) -> tuple:
@@ -232,8 +262,10 @@ def to_attempts(records) -> tuple:
         out.append(Attempt(
             key=(d, v1._i(r.get("id_server")), idt), date=d, country=country,
             sym=sym, size=abs(v1._i(r.get("size"))),
-            stem=oid_stem(r.get("oes_oid")), basket=v1._s(r.get("basket")),
+            client_id=fix_tag(r.get("fixmsg")),
+            oes_oid=v1._s(r.get("oes_oid")), basket=v1._s(r.get("basket")),
             side=v1._s(r.get("side")) or v1.SHORTSELL_SIDE,
+            algo=v1._s(r.get("algo")),
             seq=_t(r.get("time")), id_target=idt))
     return out, dropped
 
@@ -257,7 +289,7 @@ def _t(v) -> float:
 
 
 def to_chains(attempts, qty=None) -> list:
-    """Collapse attempts into orders.
+    """Collapse attempts into orders on the client's id.
 
     Ordered by (time, id_target) so "the last attempt" is the last one SENT,
     with the id as the tie break - two attempts can share a timestamp, and the
@@ -275,16 +307,17 @@ def to_chains(attempts, qty=None) -> list:
         size = max(a.size for a in got) if qty == "max" else last.size
         out.append(Chain(chain_key=k, date=last.date, country=last.country,
                          sym=last.sym, side=last.side, basket=last.basket,
+                         algo=last.algo, client_id=last.client_id,
                          size=size, attempts=tuple(got)))
     return sorted(out, key=lambda c: (c.attempts[0].seq, c.attempts[0].id_target))
 
 
 # =============================================================================
-# VALIDATION
+# THE TWO CHECKS
 #
-# Two assumptions, both reported on every run rather than trusted:
-# the stem groups one order and nothing else, and the chain's quantity is the
-# last attempt's size.
+# Is the tag populated for the universe we ask for, and does it ever mix two
+# different orders.  Both run on every report rather than being something to
+# remember to look at.
 # =============================================================================
 
 class ChainStats(NamedTuple):
@@ -292,56 +325,58 @@ class ChainStats(NamedTuple):
     chains: int
     multi: int                 # chains of more than one attempt
     longest: int
-    mixed: list                # chains holding >1 sym or >1 side - a FAILURE
-    split_stems: list          # [(stem, [chains])] - stems shared by >1 order
+    no_id: int                 # attempts with no tag 9604
+    no_id_by_market: dict
+    mixed: list                # chains disagreeing on sym/side/algo/basket
     mixed_size: list           # chains whose attempts disagree on size
-    no_oid: int                # attempts with no oes_oid at all
 
 
 def chain_stats(attempts, chs) -> ChainStats:
-    """What the run should say about its own assumptions.
-
-    `mixed` is the one that matters: a chain holding more than one sym or side
-    means stem + basket merged two orders that are not the same order, and the
-    numbers are wrong.  It is only detectable BECAUSE sym and side are kept out
-    of the key - putting them in would make the key silently right-looking.
-
-    `split_stems` is the other direction and is not an error: stems that belong
-    to more than one order, which the basket pulled apart.  It says how much
-    work the basket is doing.
-    """
-    by_stem = {}
-    for c in chs:
-        by_stem.setdefault(c.chain_key[2], []).append(c)
+    no_id = [a for a in attempts if not a.client_id]
+    by_mkt = {}
+    for a in no_id:
+        by_mkt[a.country] = by_mkt.get(a.country, 0) + 1
     return ChainStats(
         attempts=len(attempts), chains=len(chs),
         multi=sum(1 for c in chs if c.n > 1),
         longest=max([c.n for c in chs], default=0),
-        mixed=[c for c in chs
-               if len({a.sym for a in c.attempts}) > 1
-               or len({a.side for a in c.attempts}) > 1],
-        split_stems=[(k, v) for k, v in by_stem.items() if len(v) > 1 and k],
-        mixed_size=[c for c in chs if len({a.size for a in c.attempts}) > 1],
-        no_oid=sum(1 for a in attempts if not a.stem))
+        no_id=len(no_id), no_id_by_market=by_mkt,
+        mixed=[c for c in chs if c.disagrees_on()],
+        mixed_size=[c for c in chs if len({a.size for a in c.attempts}) > 1])
 
 
 def report_stats(st: ChainStats, quiet=False):
-    log(f"  chains: {st.attempts:,} targets -> {st.chains:,} orders "
+    log(f"  chains: {st.attempts:,} targets -> {st.chains:,} order"
+        f"{'' if st.chains == 1 else 's'} "
         f"({st.multi:,} chained, longest {st.longest})")
-    if st.no_oid:
-        log(f"  NOTE: {st.no_oid:,} targets have no oes_oid - each is its own "
-            f"chain, so they are counted exactly as v1 counts them")
+
+    #  CHECK 1 - is tag 9604 populated for the universe we asked for
+    if st.no_id == st.attempts and st.attempts:
+        log(f"  WARNING: NOT ONE of {st.attempts:,} targets carries tag "
+            f"{CLIENT_ID_TAG}. Either the client sends none, or fixmsg uses a "
+            f"separator fix_tag does not know - check one fixmsg by hand "
+            f"before believing any of this. Nothing has been chained.")
+    elif st.no_id:
+        pct = 100.0 * st.no_id / max(st.attempts, 1)
+        worst = ", ".join(f"{k} {v:,}" for k, v in
+                          sorted(st.no_id_by_market.items(),
+                                 key=lambda kv: -kv[1]))
+        log(f"  {st.no_id:,} of {st.attempts:,} targets ({pct:.1f}%) carry no "
+            f"tag {CLIENT_ID_TAG} and stand alone, as v1 counts them: {worst}")
+    else:
+        log(f"  tag {CLIENT_ID_TAG} is populated on every target")
+
+    #  CHECK 2 - does one id ever cover two different orders
     if st.mixed:
-        log(f"  WARNING: {len(st.mixed):,} chain"
-            f"{'' if len(st.mixed) == 1 else 's'} hold more than one sym or "
-            f"side. stem + basket has merged orders that are NOT the same "
-            f"order and these numbers are WRONG.  --chains lists them")
-    if st.split_stems:
-        n = sum(len(v) for _k, v in st.split_stems)
-        log(f"  {len(st.split_stems):,} oes_oid stem"
-            f"{'' if len(st.split_stems) == 1 else 's'} shared by {n:,} "
-            f"different orders - the basket kept them apart; a stem-only key "
-            f"would have merged them.  --chains lists them")
+        fields = sorted({f for c in st.mixed for f in c.disagrees_on()})
+        one = len(st.mixed) == 1
+        log(f"  WARNING: {len(st.mixed):,} chain{'' if one else 's'} "
+            f"{'disagrees' if one else 'disagree'} on {', '.join(fields)} - "
+            f"a {CLIENT_ID_TAG} is covering more than one order and these "
+            f"numbers are WRONG.  --chains lists them")
+    else:
+        log(f"  no chain mixes sym, side, algo or basket")
+
     if st.mixed_size:
         log(f"  NOTE: {len(st.mixed_size):,} chains have attempts of differing "
             f"size; CHAIN_QTY={CHAIN_QTY!r} takes the "
@@ -350,8 +385,8 @@ def report_stats(st: ChainStats, quiet=False):
 
 
 def dump_chains(chs, limit=40):
-    """The multi attempt chains, and the stems that turned out to hold more than
-    one order.  Both are for eyeballing against the engine."""
+    """The chained orders, and any chain that mixes - both for eyeballing
+    against the engine."""
     st = chain_stats([a for c in chs for a in c.attempts], chs)
 
     multi = [c for c in chs if c.n > 1]
@@ -361,47 +396,29 @@ def dump_chains(chs, limit=40):
         print(f"{len(multi):,} chained orders"
               + (f", showing the first {limit}" if len(multi) > limit else ""))
         for c in multi[:limit]:
-            if len({a.sym for a in c.attempts}) > 1 \
-                    or len({a.side for a in c.attempts}) > 1:
-                flag = "   <-- MIXED, stem + basket is not enough here"
-            elif len({a.size for a in c.attempts}) > 1:
-                flag = "   <-- sizes differ across attempts"
-            else:
-                flag = ""
-            print(f"\n  {c.sym}  {c.country}  {c.side}  "
-                  f"stem {c.chain_key[2]}  basket {c.basket or '-'}"
-                  f"  -> qty {c.size:,}{flag}")
+            bad = c.disagrees_on()
+            flag = (f"   <-- MIXED on {', '.join(bad)}" if bad else
+                    "   <-- sizes differ across attempts"
+                    if len({a.size for a in c.attempts}) > 1 else "")
+            print(f"\n  {CLIENT_ID_TAG}={c.client_id or '(none)'}  {c.sym}  "
+                  f"{c.country}  {c.side}  {c.algo or '-'}  "
+                  f"basket {c.basket or '-'}  -> qty {c.size:,}{flag}")
             for a in c.attempts:
                 print(f"      id_target {a.id_target:<12} size {a.size:>14,}  "
-                      f"t {a.seq:>9.0f}")
+                      f"t {a.seq:>9.0f}  oes_oid {a.oes_oid or '-'}")
 
     if st.mixed:
-        print(f"\n{len(st.mixed):,} chains hold more than one sym or side - "
-              f"stem + basket MERGED orders that are not the same order:")
+        print(f"\n{len(st.mixed):,} chains cover more than one order - tag "
+              f"{CLIENT_ID_TAG} is NOT safe on its own here:")
         for c in st.mixed[:limit]:
-            print(f"\n  stem {c.chain_key[2]}  basket {c.basket or '-'}")
+            print(f"\n  {CLIENT_ID_TAG}={c.client_id}  disagrees on "
+                  f"{', '.join(c.disagrees_on())}")
             for a in c.attempts:
                 print(f"      id_target {a.id_target:<12} {a.sym:<14} "
-                      f"{a.side:<10} size {a.size:>14,}")
-
-    if st.split_stems:
-        print(f"\n{len(st.split_stems):,} stems held more than one order - "
-              f"this is what the basket is in the key FOR:")
-        for stem, got in st.split_stems[:limit]:
-            print(f"\n  stem {stem}")
-            for c in got:
-                print(f"      {c.sym:<14} {c.side:<10} basket "
-                      f"{c.basket or '-':<10} qty {c.size:>14,}  "
-                      f"{c.n} attempt{'' if c.n == 1 else 's'}")
+                      f"{a.side:<10} {a.algo or '-':<10} "
+                      f"basket {a.basket or '-':<10} size {a.size:>14,}")
     return 0
 
-
-# =============================================================================
-# ROLLUP
-#
-# The only arithmetic that differs from v1: orders and qty come from the
-# chains, executed and rejections from the same workorder rows v1 uses.
-# =============================================================================
 
 def by_market(chs, splits) -> list:
     orders = {c: 0 for c in v1.MARKET_CODES}
@@ -550,12 +567,20 @@ def run(args) -> int:
 # SELF TEST
 # =============================================================================
 
-def _a(idt, country, size, oid, basket="B1", side="sellshort", t=0.0,
-       d=None, srv=1):
-    """One target row, as q returns it."""
+def _a(idt, country, size, cid, basket="B1", side="sellshort",
+       algo="vwap", t=0.0, d=None, srv=1, sym=None, extra=""):
+    """One target row, as q returns it.  cid goes into fixmsg as tag 9604, the
+    way the client actually sends it - so the fixture exercises the PARSE, not
+    just the grouping."""
     r = v1._p(idt, country, size, d=d, srv=srv)
-    r.update({"oes_oid": oid, "basket": basket, "side": side,
-              "time": dt.timedelta(seconds=t)})
+    if sym:
+        r["sym"] = sym
+    fix = "8=FIX.4.2\x0135=D\x01"
+    if cid:
+        fix += f"{CLIENT_ID_TAG}={cid}\x01"
+    r.update({"fixmsg": fix + extra + "59=0",
+              "oes_oid": f"OID.{idt}", "basket": basket, "side": side,
+              "algo": algo, "time": dt.timedelta(seconds=t)})
     return r
 
 
@@ -569,128 +594,167 @@ def self_test() -> int:
         print(f"  {'ok  ' if good else 'FAIL'}  {name}"
               + ("" if good else f"   got {got!r}, want {want!r}"))
 
-    print("short_sell_report_v2 --self-test\n\nthe oes_oid stem")
-    check("the attempt is the last dot component",
-          oid_stem("SCB-R.TB.APPD2.1w519.2p5"), "SCB-R.TB.APPD2.1w519")
-    check("a second attempt has the same stem",
-          oid_stem("SCB-R.TB.APPD2.1w519.3p1"), "SCB-R.TB.APPD2.1w519")
-    check("and the screenshot's other id",
-          oid_stem("1.HK.APPD.1w51b.7"), "1.HK.APPD.1w51b")
-    check("a different order does NOT share it",
-          oid_stem("SCB-R.TB.APPD2.1w520.2p5"), "SCB-R.TB.APPD2.1w520")
-    check("an id with no dot is its own chain", oid_stem("ABC"), "ABC")
-    check("an empty id stays empty", oid_stem(""), "")
-    check("it is the same rule as the q",
-          oid_stem("a.b.c.d"), ".".join("a.b.c.d".split(".")[:-1]))
+    print("short_sell_report_v2 --self-test\n\nreading tag 9604 out of fixmsg")
+    SOH = "\x01"
+    check("a normal SOH separated message",
+          fix_tag(f"8=FIX.4.2{SOH}35=D{SOH}9604=ABC123{SOH}59=0"), "ABC123")
+    check("the tag at the very end, with no trailing separator",
+          fix_tag(f"35=D{SOH}9604=ABC123"), "ABC123")
+    check("the tag first", fix_tag(f"9604=ABC123{SOH}35=D"), "ABC123")
+    check("pipe separated, as logs rewrite it",
+          fix_tag("8=FIX.4.2|9604=ABC123|59=0"), "ABC123")
+    check("semicolon separated", fix_tag("35=D;9604=ABC123;59=0"), "ABC123")
+    check("caret separated", fix_tag("35=D^9604=ABC123^59=0"), "ABC123")
+    check("a value containing a space survives",
+          fix_tag(f"9604=ABC 123{SOH}59=0"), "ABC 123")
+    check("a value containing an = survives",
+          fix_tag(f"9604=A=B{SOH}59=0"), "A=B")
+    check("absent is empty", fix_tag(f"35=D{SOH}59=0"), "")
+    check("present but empty is empty", fix_tag(f"9604={SOH}59=0"), "")
+    check("no fixmsg at all is empty", fix_tag(""), "")
+    check("None is empty, not a crash", fix_tag(None), "")
 
-    print("\nchaining")
+    #  the traps: a tag that merely CONTAINS 9604 must not be read as it
+    check("19604 is not 9604", fix_tag(f"19604=WRONG{SOH}59=0"), "")
+    check("96040 is not 9604", fix_tag(f"96040=WRONG{SOH}59=0"), "")
+    check("and 9604 inside a VALUE is not 9604",
+          fix_tag(f"58=see 9604=WRONG{SOH}59=0"), "")
+    check("the right tag still wins beside a decoy",
+          fix_tag(f"19604=WRONG{SOH}9604=RIGHT{SOH}59=0"), "RIGHT")
+    check("another tag can be read too",
+          fix_tag(f"9604=A{SOH}RSHO=1{SOH}", tag="RSHO"), "1")
+
+    print("\nchaining on the client's id")
     #  three sends of one 27m Thai order, then a different order
     att, _ = to_attempts([
-        _a(1, "TH", 27_000_000, "SCB-R.TB.APPD2.1w519.1p0", t=1),
-        _a(2, "TH", 27_000_000, "SCB-R.TB.APPD2.1w519.2p5", t=2),
-        _a(3, "TH", 27_000_000, "SCB-R.TB.APPD2.1w519.3p1", t=3),
-        _a(4, "TH", 5_000_000, "SCB-R.TB.APPD2.1w520.1p0", t=4)])
+        _a(1, "TH", 27_000_000, "CLI-0001", t=1),
+        _a(2, "TH", 27_000_000, "CLI-0001", t=2),
+        _a(3, "TH", 27_000_000, "CLI-0001", t=3),
+        _a(4, "TH", 5_000_000, "CLI-0002", t=4)])
     chs = to_chains(att)
     check("four targets", len(att), 4)
+    check("the id was parsed off fixmsg", att[0].client_id, "CLI-0001")
     check("two orders", len(chs), 2)
     check("the chain holds all three attempts", chs[0].n, 3)
     check("and its quantity is counted ONCE", chs[0].size, 27_000_000)
-    check("the standalone order is untouched", chs[1].size, 5_000_000)
+    check("the other order is untouched", chs[1].size, 5_000_000)
     check("total qty is 32m, not 86m",
           sum(c.size for c in chs), 32_000_000)
 
-    print("\nwhat the key is made of")
-    diff_side, _ = to_attempts([_a(1, "TH", 100, "X.TB.A.1.1p0", basket="B1"),
-                               _a(2, "TH", 100, "X.TB.A.1.2p0", basket="B2")])
-    check("a different basket is a different order",
-          len(to_chains(diff_side)), 2)
-    check("side is NOT in the key - this whole report is one side",
+    print("\nwhat the key is, and is not")
+    check("a different basket does NOT split one client id",
           len(to_chains(to_attempts([
-              _a(1, "TH", 100, "X.TB.A.1.1p0", side="sellshort"),
-              _a(2, "TH", 100, "X.TB.A.1.2p0", side="buy")])[0])), 1)
-    two_days, _ = to_attempts([_a(1, "TH", 100, "X.TB.A.1.1p0",
-                                  d=dt.date(2026, 7, 1)),
-                               _a(2, "TH", 100, "X.TB.A.1.2p0",
-                                  d=dt.date(2026, 7, 2))])
-    check("and so is a different day", len(to_chains(two_days)), 2)
+              _a(1, "TH", 100, "CLI-1", basket="B1", t=1),
+              _a(2, "TH", 100, "CLI-1", basket="B2", t=2)])[0])), 1)
+    check("nor does a different sym - it is REPORTED instead",
+          len(to_chains(to_attempts([
+              _a(1, "TH", 100, "CLI-1", sym="A.TB", t=1),
+              _a(2, "TH", 100, "CLI-1", sym="B.TB", t=2)])[0])), 1)
+    check("a different day IS a different order",
+          len(to_chains(to_attempts([
+              _a(1, "TH", 100, "CLI-1", d=dt.date(2026, 7, 1)),
+              _a(2, "TH", 100, "CLI-1", d=dt.date(2026, 7, 2))])[0])), 2)
+
+    print("\ntargets the client did not label")
+    blank, _ = to_attempts([_a(1, "TH", 100, ""), _a(2, "TH", 700, ""),
+                            _a(3, "TH", 300, "CLI-9")])
+    bc = to_chains(blank)
+    check("two untagged targets do NOT become one order", len(bc), 3)
+    check("each keeps its own quantity",
+          sorted(c.size for c in bc), [100, 300, 700])
+    check("which is exactly what v1 would have said",
+          sum(c.size for c in bc), 1100)
 
     print("\nwhich attempt sets the quantity")
-    grew, _ = to_attempts([_a(1, "TH", 100, "X.TB.A.1.1p0", t=1),
-                           _a(2, "TH", 250, "X.TB.A.1.2p0", t=2)])
+    grew, _ = to_attempts([_a(1, "TH", 100, "CLI-1", t=1),
+                           _a(2, "TH", 250, "CLI-1", t=2)])
     check("last takes the order as it finally stood",
           to_chains(grew, "last")[0].size, 250)
     check("max takes the largest attempt",
           to_chains(grew, "max")[0].size, 250)
-    shrank, _ = to_attempts([_a(1, "TH", 250, "X.TB.A.1.1p0", t=1),
-                             _a(2, "TH", 100, "X.TB.A.1.2p0", t=2)])
+    shrank, _ = to_attempts([_a(1, "TH", 250, "CLI-1", t=1),
+                             _a(2, "TH", 100, "CLI-1", t=2)])
     check("where a replace shrank it, last and max differ",
           (to_chains(shrank, "last")[0].size, to_chains(shrank, "max")[0].size),
           (100, 250))
-    out_of_order, _ = to_attempts([_a(2, "TH", 100, "X.TB.A.1.2p0", t=9),
-                                   _a(1, "TH", 250, "X.TB.A.1.1p0", t=1)])
+    out_of_order, _ = to_attempts([_a(2, "TH", 100, "CLI-1", t=9),
+                                   _a(1, "TH", 250, "CLI-1", t=1)])
     check("the last attempt is the last one SENT, not the first row seen",
           to_chains(out_of_order, "last")[0].size, 100)
-    same_time, _ = to_attempts([_a(7, "TH", 100, "X.TB.A.1.a", t=5),
-                                _a(9, "TH", 300, "X.TB.A.1.b", t=5)])
+    same_time, _ = to_attempts([_a(7, "TH", 100, "CLI-1", t=5),
+                                _a(9, "TH", 300, "CLI-1", t=5)])
     check("a tied timestamp falls back to id_target",
           to_chains(same_time, "last")[0].size, 300)
 
-    print("\nvalidation")
+    print("\ncheck 1 - is tag 9604 populated")
     st = chain_stats(att, chs)
     check("it counts the attempts", st.attempts, 4)
     check("and the orders", st.chains, 2)
     check("and how many collapsed", st.multi, 1)
     check("and the longest chain", st.longest, 3)
-    check("nothing shared, mixed or resized in a clean fixture",
-          (st.mixed, st.split_stems, st.mixed_size), ([], [], []))
+    check("nothing missing in a fully tagged fixture", st.no_id, 0)
+    stb = chain_stats(blank, bc)
+    check("it counts the targets carrying no id", stb.no_id, 2)
+    check("and says which market they were in", stb.no_id_by_market, {"TH": 2})
+    none_tagged, _ = to_attempts([_a(1, "TH", 100, ""), _a(2, "JP", 100, "")])
+    stn = chain_stats(none_tagged, to_chains(none_tagged))
+    check("all of them missing is its own case", stn.no_id, stn.attempts)
+    check("counted per market", stn.no_id_by_market, {"TH": 1, "JP": 1})
 
-    #  THE CASE THE USER RAISED: one stem, two baskets, two real orders
-    shared, _ = to_attempts([
-        _a(1, "TH", 100, "X.TB.A.1.1p0", basket="ALPHA", t=1),
-        _a(2, "TH", 100, "X.TB.A.1.2p0", basket="ALPHA", t=2),
-        _a(3, "TH", 700, "X.TB.A.1.1p0", basket="BETA", t=1)])
-    sh = to_chains(shared)
-    check("a shared stem does NOT merge two baskets", len(sh), 2)
-    check("each keeps its own quantity",
-          sorted(c.size for c in sh), [100, 700])
-    check("and the run says the stem was shared",
-          len(chain_stats(shared, sh).split_stems), 1)
-    check("naming which stem",
-          chain_stats(shared, sh).split_stems[0][0], "X.TB.A.1")
+    print("\ncheck 2 - does one id cover two different orders")
+    check("a clean chain disagrees on nothing", chs[0].disagrees_on(), [])
+    for field, kw in (("sym", dict(sym="OTHER.TB")), ("side", dict(side="buy")),
+                      ("algo", dict(algo="twap")),
+                      ("basket", dict(basket="OTHER"))):
+        mixed, _ = to_attempts([_a(1, "TH", 100, "CLI-1", t=1),
+                                _a(2, "TH", 100, "CLI-1", t=2, **kw)])
+        mc = to_chains(mixed)
+        check(f"a chain disagreeing on {field} is named",
+              mc[0].disagrees_on(), [field])
+        check(f"and reported as mixed", len(chain_stats(mixed, mc).mixed), 1)
+    two_at_once, _ = to_attempts([
+        _a(1, "TH", 100, "CLI-1", t=1),
+        _a(2, "TH", 100, "CLI-1", t=2, sym="OTHER.TB", algo="twap")])
+    check("both fields are named when both differ",
+          to_chains(two_at_once)[0].disagrees_on(), ["sym", "algo"])
+    check("a clean fixture reports no mixing", st.mixed, [])
 
-    #  THE RULE IS TESTED, NOT INSURED AGAINST.  sym and side are kept OUT of
-    #  the key on purpose, so that stem+basket merging two orders that are not
-    #  the same order is something the run can SEE and complain about.  Putting
-    #  them in would make the key look right by construction and say nothing.
-    two_syms, _ = to_attempts([_a(1, "TH", 100, "X.TB.A.1.1p0", t=1),
-                               _a(2, "TH", 100, "X.TB.A.1.2p0", t=2)])
-    two_syms = [two_syms[0], two_syms[1]._replace(sym="OTHER.TB")]
-    st2 = chain_stats(two_syms, to_chains(two_syms))
-    check("two syms on one stem and basket DO merge - that is the rule",
-          len(to_chains(two_syms)), 1)
-    check("and the run warns that they should not have", len(st2.mixed), 1)
+    #  the two branches of each check are exclusive - a run that printed both
+    #  the warning and the all-clear would be worse than one that printed
+    #  neither, and an if/else is exactly what a line edit breaks
+    import contextlib
+    import io as _io
 
-    two_sides, _ = to_attempts([
-        _a(1, "TH", 100, "X.TB.A.1.1p0", side="sellshort", t=1),
-        _a(2, "TH", 100, "X.TB.A.1.2p0", side="buy", t=2)])
-    check("two sides likewise merge",
-          len(to_chains(two_sides)), 1)
-    check("and are likewise warned about",
-          len(chain_stats(two_sides, to_chains(two_sides)).mixed), 1)
-    check("a clean chain raises no warning", len(st.mixed), 0)
+    def said(attempts, chains):
+        buf = _io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            report_stats(chain_stats(attempts, chains))
+        return buf.getvalue()
+
+    clean = said(att, chs)
+    check("a clean run says the tag is populated",
+          "populated on every target" in clean, True)
+    check("and does not warn", "WARNING" in clean, False)
+    dirty = said(two_at_once, to_chains(two_at_once))
+    check("a mixed run warns", "WARNING" in dirty, True)
+    check("and does NOT also give the all clear",
+          "no chain mixes" in dirty, False)
+    untagged = said(none_tagged, to_chains(none_tagged))
+    check("a wholly untagged run says so in the strongest terms",
+          "NOT ONE of" in untagged, True)
+    check("and does not claim the tag is populated",
+          "populated on every target" in untagged, False)
     st3 = chain_stats(shrank, to_chains(shrank))
-    check("so is a chain whose attempts disagree on size",
-          len(st3.mixed_size), 1)
-    noid, _ = to_attempts([_a(1, "TH", 100, ""), _a(2, "TH", 100, "")])
-    check("targets with no oes_oid are counted", chain_stats(noid,
-          to_chains(noid)).no_oid, 2)
+    check("a chain whose attempts disagree on SIZE is separate - a replace "
+          "may legitimately resize", (len(st3.mixed), len(st3.mixed_size)),
+          (0, 1))
 
     print("\nthe rollup")
     #  the live Thailand case, with its rejections
     att2, _ = to_attempts([
-        _a(1, "TH", 27_000_000, "SCB-R.TB.A.1.1p0", t=1),
-        _a(2, "TH", 27_000_000, "SCB-R.TB.A.1.2p0", t=2),
-        _a(3, "TH", 27_000_000, "SCB-R.TB.A.1.3p0", t=3)])
+        _a(1, "TH", 27_000_000, "CLI-0001", t=1),
+        _a(2, "TH", 27_000_000, "CLI-0001", t=2),
+        _a(3, "TH", 27_000_000, "CLI-0001", t=3)])
     sp = v1.to_splits([v1._c(10, 1, 0, "rejected"), v1._c(11, 2, 0, "rejected"),
                        v1._c(12, 3, 0, "cxl")], att2)
     chs2 = to_chains(att2)
@@ -754,8 +818,8 @@ def self_test() -> int:
     #  by_day needs dated rows - the realtime side has none, and skipping them
     #  is what keeps a realtime run from inventing a day
     day = dt.date(2026, 7, 1)
-    dat, _ = to_attempts([_a(1, "TH", 100, "X.TB.A.1.1p0", t=1, d=day),
-                          _a(2, "TH", 100, "X.TB.A.1.2p0", t=2, d=day)])
+    dat, _ = to_attempts([_a(1, "TH", 100, "CLI-1", t=1, d=day),
+                          _a(2, "TH", 100, "CLI-1", t=2, d=day)])
     dsp = v1.to_splits([v1._c(1, 2, 40, "filled", d=day)], dat)
     d1 = by_day(to_chains(dat), dsp)
     check("the day series works over chains too", len(d1), 1)
@@ -787,7 +851,7 @@ def main(argv=None) -> int:
                         "so any difference is the counting and nothing else")
     p.add_argument("--chains", action="store_true",
                    help="list the chained orders and their attempts, and exit "
-                        "- the way to check the stem against the engine")
+                        "- the way to check tag 9604 against the engine")
     p.add_argument("--out-dir", default=str(OUT_DIR))
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--self-test", action="store_true",
