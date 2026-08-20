@@ -538,6 +538,27 @@ def dump_chains(chs, limit=40):
     return 0
 
 
+def draw(rows, tot, subtitle, foot, days=None):
+    """v1's page, under v2's title.
+
+    The title is set by swapping v1's module global for the duration of the
+    call, NOT by passing a keyword to v1.draw().  v1 is the file that has to be
+    EDITED - the servers and the mail live in it - so a copy of it in the wild
+    is very often not the copy in git, and v2 must not need a particular
+    signature from it.  A module global has been there since the first version.
+
+    This is also why nothing else here calls into v1 with keywords it has not
+    always had.
+    """
+    old = getattr(v1, "TITLE", None)
+    try:
+        v1.TITLE = TITLE
+        return v1.draw(rows, tot, subtitle, foot, days)
+    finally:
+        if old is not None:
+            v1.TITLE = old
+
+
 def by_market(chs, splits) -> list:
     orders = {c: 0 for c in v1.MARKET_CODES}
     qty = {c: 0 for c in v1.MARKET_CODES}
@@ -678,7 +699,7 @@ def run(args) -> int:
     if dropped:
         foot += f"  ·  {dropped:,} restricted JP excluded"
 
-    fig = v1.draw(rows, tot, subtitle, foot, days, title=TITLE)
+    fig = draw(rows, tot, subtitle, foot, days)
     files = v1.save(fig, Path(args.out_dir), pl.stem.replace(
         "short_sell_report", "short_sell_report_v2"))
     if v1.email_configured():
@@ -1021,11 +1042,30 @@ def self_test() -> int:
         print("\n" + ("all checks passed" if ok else "SOME CHECKS FAILED"))
         return 0 if ok else 1
     import io
-    fig = v1.draw(rows2, v1.totals(rows2), "By market  ·  x",
-                  "Generated  ·  x", title=TITLE)
+    fig = draw(rows2, v1.totals(rows2), "By market  ·  x", "Generated  ·  x")
     buf = io.BytesIO()
     fig.savefig(buf, format="pdf")
     check("it renders on v1's page", buf.getvalue()[:5], b"%PDF-")
+    check("v1's own title is put back afterwards",
+          v1.TITLE, "Short-Sell Order Report")
+
+    #  A v1 IN THE WILD IS OFTEN NOT THE v1 IN GIT: it is the file that has to
+    #  be edited for the servers and the mail.  Prove the page still draws
+    #  against one whose draw() predates any keyword v2 might have wanted.
+    real_draw = v1.draw
+
+    def old_draw(rows_, tot_, subtitle_, footer_, days_=None):
+        return real_draw(rows_, tot_, subtitle_, footer_, days_)
+
+    try:
+        v1.draw = old_draw
+        buf_old = io.BytesIO()
+        draw(rows2, v1.totals(rows2), "x", "y").savefig(buf_old, format="pdf")
+        check("and against a v1 whose draw() takes no title at all",
+              buf_old.getvalue()[:5], b"%PDF-")
+    finally:
+        v1.draw = real_draw
+    check("with v1 left exactly as it was found", v1.draw, real_draw)
 
     #  by_day needs dated rows - the realtime side has none, and skipping them
     #  is what keeps a realtime run from inventing a day

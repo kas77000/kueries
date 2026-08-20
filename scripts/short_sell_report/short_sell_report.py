@@ -682,18 +682,18 @@ def _sorted_pairs(rows, key):
     return sorted(rows, key=key, reverse=True)
 
 
-def draw(rows, tot, subtitle, footer, days=None, title=None):
+def draw(rows, tot, subtitle, footer, days=None):
     """The whole page.  Pure: takes rollups, returns a figure.
 
-    title exists so short_sell_report_v2 can put its own name on the same
-    layout rather than copying it - a second copy of a page is a page that
-    drifts, and the whole point of the v2 is that everything except the way
-    orders are counted is identical.
+    short_sell_report_v2 draws on this too, and reaches the title through the
+    TITLE global rather than through an argument - this file is the one that
+    gets EDITED for the servers and the mail, so a copy of it in the wild is
+    often not the copy in git, and v2 must not need a particular signature.
     """
     monthly = days is not None
 
     fig = figure()
-    heading(fig, title or TITLE, subtitle, Y_TITLE, Y_SUBTITLE, Y_RULE_TOP)
+    heading(fig, TITLE, subtitle, Y_TITLE, Y_SUBTITLE, Y_RULE_TOP)
     _kpis(fig, tot)
 
     row_h = 0.030 if monthly else 0.040

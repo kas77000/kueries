@@ -111,8 +111,12 @@ That is deliberate: a second copy of a report is a report that drifts, and a
 comparison is only meaningful if the *only* difference is the thing being
 compared. Checks assert each reused name really comes from v1.
 
-The one change to v1 was an optional `title=` on `draw()`, so v2 can put its own
-name on the same layout. No number moved.
+**v1 is not modified at all.** v2 reaches v1's title through its `TITLE` global
+rather than through an argument, precisely because `short_sell_report.py` is the
+file you have to *edit* — the servers and the mail live in it — so a copy in the
+wild is often not the copy in git. v2 must not need a particular signature from
+it. A check draws the page against a simulated v1 whose `draw()` predates any
+keyword v2 might have wanted.
 
 ---
 
@@ -262,7 +266,7 @@ each other.
 python scripts/short_sell_report_v2/short_sell_report_v2.py --self-test
 ```
 
-119 checks, no kdb and no pykx: parsing tag 9604 out of a fixmsg in four
+122 checks, no kdb and no pykx: parsing tag 9604 out of a fixmsg in four
 separator styles and refusing the 19604/96040/embedded-value traps, chaining on
 the client id, untagged targets standing alone, which attempt sets the quantity,
 both checks and the exclusivity of their branches, the Thailand rollup end to
