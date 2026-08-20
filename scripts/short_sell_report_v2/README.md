@@ -205,39 +205,67 @@ Checks assert the two branches of each are **exclusive** — a run that printed
 both the warning and the all-clear would be worse than one that printed neither,
 and an if/else is exactly what a careless edit breaks.
 
-### 3. Can completion come out over 100%?
+### 3. What quantity did a chain ask for?
 
-Executed is summed over **every** attempt's fills, so the chain's quantity has
-to be one that no combination of fills can exceed. Your case — a partial fill,
-then a replace for the remainder — is exactly where that goes wrong:
+Executed is summed over **every** attempt, so this decides what those fills are
+measured against — and the attempts are not all the same *kind* of thing:
 
-```
-partial fill, replace for the remainder      replace GROWS the order
-  attempt 1  size 100  fills  30               attempt 1  size 100  fills 100
-  attempt 2  size  70  fills  70               attempt 2  size 150  fills  50
-  executed 100                                 executed 150
+| | |
+|---|---|
+| a **replacement** | supersedes the one before it. Three sends of 27m that never traded are **one 27m order**, not 81m — the whole reason v2 exists. |
+| a **top-up** | extra quantity on an order that already finished. Sizes 900, 1700, 2500 filling 3,600 in total asked for **5,100**, not 2,500. |
 
-  first  100%                                  first  150%   <-- over
-  last   143%   <-- over                       last   100%
-  max    100%                                  max    100%
-```
-
-`first` fixes your case and breaks the other one. **`max` is the only choice
-safe in both directions**, so it is the default. `--chain-qty first` and
-`--chain-qty last` are there to compare with.
-
-And the reasoning is not trusted either — any chain that fills more than its
-quantity is reported **whatever the setting**:
+Both are real, they pull opposite ways, and no "take the Nth size" rule handles
+both. `asked` reads it off the fills instead:
 
 ```
-WARNING: 2 chains executed MORE than the quantity taken for them, so completion
-         is over 100% there. With CHAIN_QTY='max' that should be impossible -
-         check these before believing the page:
-      9604=CLI-0001  SCB-R.TB  qty 70  executed 100  (143%)  sizes [70, 100]
+asked = (what every attempt filled) + (what the LAST one still had to do)
 ```
 
-A chain that merely **resizes** is reported separately and is not an error — a
-replace may legitimately change quantity, unlike stock.
+|  | sizes | fills | executed | asked |
+|---|---|---|---|---|
+| top-ups | 900, 1700, 2500 | 900, 1700, 1000 | 3,600 | **5,100** |
+| reject ×3 | 27m, 27m, 27m | 0, 0, 0 | 0 | **27m** |
+| remainder replace | 100, 70 | 30, 70 | 100 | **100** |
+
+A superseded attempt contributes only what it *traded*, so a replacement is not
+counted twice; a top-up contributes its whole size, because it filled it. A
+single attempt is just its own size.
+
+The others are kept for `--chain-qty` comparison: **`sum`** is right for top-ups
+and puts a rejected-and-replaced order straight back to v1's number; **`max`**
+is right for replacements and reads 144% on top-ups; **`first`** / **`last`**
+each fail one of the two.
+
+### The tripwires
+
+`asked` cannot print over 100% — `qty − executed` *is* the last attempt's
+residual, which is never negative. But that also means the chain-level check
+**can never fire under it**, so it would validate nothing on its own. Two other
+checks carry it:
+
+**A target that filled more than its own size** — independent of `CHAIN_QTY`,
+because the anomaly is per target, not per grouping:
+
+```
+WARNING: 1 individual target executed MORE than their own size. That is not a
+         grouping question - a workorder is filling more than the target it
+         belongs to:
+      id_target 1270254699  6103.JP  size 100  executed 400  (400%)
+```
+
+**A chain that still over-fills gets un-chained.** Under `--chain-qty max` or
+`sum` a chain can still exceed its quantity; whatever grouped it was wrong, so
+it is exploded back into one order per target — exactly what v1 would have said
+— rather than printing 144% on the page:
+
+```
+2 chains above have been UN-CHAINED into their 5 targets and counted the way
+v1 counts them, so the page does not read over 100%. Those are the ones to
+look at with --chains
+```
+
+`--keep-over` leaves them chained if you would rather see the raw number.
 
 ### 4. Orders that never produced a workorder
 
@@ -295,7 +323,7 @@ each other.
 python scripts/short_sell_report_v2/short_sell_report_v2.py --self-test
 ```
 
-135 checks, no kdb and no pykx: parsing tag 9604 out of a fixmsg in four
+167 checks, no kdb and no pykx: parsing tag 9604 out of a fixmsg in four
 separator styles and refusing the 19604/96040/embedded-value traps, chaining on
 the client id, untagged targets standing alone, which attempt sets the quantity,
 both checks and the exclusivity of their branches, the Thailand rollup end to

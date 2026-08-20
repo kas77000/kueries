@@ -97,26 +97,33 @@ OUT_DIR = _HERE.parent / "out"
 
 TITLE = "Short-Sell Order Report"
 
-# Which attempt's size is the chain's quantity.  Executed is summed over EVERY
-# attempt's fills, so this decides what those fills are measured against.
+# What quantity a chain asked for.  Executed is summed over EVERY attempt, so
+# this decides what those fills are measured against - and the attempts are not
+# all the same KIND of thing:
 #
-#   "max"    the largest attempt asked for.  THE DEFAULT, and the only one that
-#            cannot print a completion over 100%.
-#   "first"  the original order.  Safe when a replace comes back for the
-#            unfilled remainder; WRONG when a replace grows the order.
-#   "last"   the order as it finally stood.  Safe when a replace grows it;
-#            WRONG when it comes back for the remainder.
+#   a REPLACEMENT supersedes the one before it.  Three sends of 27m that never
+#     traded are one 27m order, not 81m - that is the whole reason v2 exists.
+#   a TOP UP is extra quantity on an order that already finished.  Sizes
+#     900, 1700, 2500 filling 3,600 in total are 5,100 asked for, not 2,500.
 #
-#   partial fill, replace for the remainder      replace GROWS the order
-#     attempt 1  size 100  fills  30               attempt 1  size 100  fills 100
-#     attempt 2  size  70  fills  70               attempt 2  size 150  fills  50
-#     executed 100                                 executed 150
-#       first 100%   last 143%   max 100%            first 150%   last 100%   max 100%
+# Both are real and they pull opposite ways, so no single "take the Nth size"
+# rule works.  "asked" reads it off the fills instead:
 #
-# Every run reports chains whose attempts differ in size, and separately any
-# chain whose fills exceed its quantity - which should be impossible under
-# "max" and is the tripwire if it is not.
-CHAIN_QTY = "max"
+#     asked = (what every attempt filled) + (what the LAST one still had to do)
+#
+#                        sizes            fills        executed   asked
+#   top ups        900, 1700, 2500   900, 1700, 1000      3,600   5,100
+#   reject x3      27m, 27m, 27m           0, 0, 0            0     27m
+#   remainder          100, 70             30, 70          100     100
+#
+# It cannot print over 100%: qty minus executed IS the last attempt's residual,
+# which is never negative.  The others are kept for comparison:
+#
+#   "sum"    every size added up.  Right for top ups, and puts a rejected and
+#            replaced order straight back to v1's number.
+#   "max"    the largest attempt.  Right for replacements, over 100% on top ups.
+#   "first" / "last"   the original, or the order as it finally stood.
+CHAIN_QTY = "asked"
 
 
 # =============================================================================
@@ -321,14 +328,27 @@ def _t(v) -> float:
         return 0.0
 
 
-def to_chains(attempts, qty=None) -> list:
+def attempt_fills(splits) -> dict:
+    """What each ATTEMPT executed, keyed on the target it belongs to."""
+    out = {}
+    for sp in splits:
+        out[sp.key] = out.get(sp.key, 0) + sp.make
+    return out
+
+
+def to_chains(attempts, qty=None, splits=()) -> list:
     """Collapse attempts into orders on the client's id.
 
     Ordered by (time, id_target) so "the last attempt" is the last one SENT,
     with the id as the tie break - two attempts can share a timestamp, and the
     id is monotonic where the clock is only nearly so.
+
+    splits is only needed for qty="asked", which reads the quantity off what
+    each attempt actually did.  Passing none makes "asked" fall back to the
+    last attempt's size, which is what it degenerates to when nothing filled.
     """
     qty = qty or CHAIN_QTY
+    fills = attempt_fills(splits)
     groups = {}
     for a in attempts:
         groups.setdefault(a.chain_key, []).append(a)
@@ -337,7 +357,16 @@ def to_chains(attempts, qty=None) -> list:
     for k, got in groups.items():
         got = sorted(got, key=lambda a: (a.seq, a.id_target))
         last = got[-1]
-        if qty == "max":
+        if qty == "asked":
+            #  every attempt's fills, plus whatever the last one still had left
+            #  to do.  A superseded attempt contributes only what it traded, so
+            #  a replacement is not counted twice; a top up contributes its
+            #  whole size, because it filled it.
+            done = [fills.get(a.key, 0) for a in got]
+            size = sum(done) + max(0, last.size - done[-1])
+        elif qty == "sum":
+            size = sum(a.size for a in got)
+        elif qty == "max":
             size = max(a.size for a in got)
         elif qty == "first":
             size = got[0].size
@@ -509,12 +538,86 @@ def report_stats(st: ChainStats, quiet=False):
             f"on id_server would have split these back apart")
 
     if st.mixed_size:
-        which = {"max": "the largest", "first": "the first",
-                 "last": "the last"}[CHAIN_QTY]
+        which = {"asked": "what they filled plus the last residual",
+                 "sum": "all of them added up", "max": "the largest",
+                 "first": "the first", "last": "the last"}.get(
+                     CHAIN_QTY, CHAIN_QTY)
         log(f"  {len(st.mixed_size):,} chains have attempts of differing size "
-            f"- a replace resized the order; CHAIN_QTY={CHAIN_QTY!r} takes "
-            f"{which}. --chains")
+            f"- a replace resized the order, or topped it up; "
+            f"CHAIN_QTY={CHAIN_QTY!r} takes {which}. --chains")
     return st
+
+
+def over_filled_attempts(attempts, splits) -> list:
+    """Individual targets that executed more than their own size.
+
+    THIS is the tripwire under CHAIN_QTY="asked", and it has to exist, because
+    under that rule the chain level check CANNOT fire: asked is defined as the
+    fills plus the last residual, so quantity minus executed is that residual
+    and is never negative.  A rule that makes its own check vacuous needs
+    another one, and this is it - a target filling more than it asked for is a
+    data question, and it is the only thing left that could put a completion
+    over 100% honestly.
+    """
+    fills = attempt_fills(splits)
+    return [(a, fills.get(a.key, 0)) for a in attempts
+            if a.size > 0 and fills.get(a.key, 0) > a.size]
+
+
+def report_over_filled_attempts(over) -> None:
+    if not over:
+        return
+    log(f"  WARNING: {len(over):,} individual target"
+        f"{'' if len(over) == 1 else 's'} executed MORE than their own size. "
+        f"That is not a grouping question - a workorder is filling more than "
+        f"the target it belongs to:")
+    for a, made in over[:10]:
+        log(f"      id_target {a.id_target}  {a.sym}  size {a.size:,}  "
+            f"executed {made:,}  ({100.0 * made / a.size:.0f}%)")
+
+
+def unchain(chs, over) -> list:
+    """Explode the over-filled chains back into one order per attempt.
+
+    `over` is what over_filled() returns: [(chain, executed), ...].
+
+    The escape hatch: a chain that still executes more than it asked for has
+    been grouped wrongly, whatever the reason, and one order per target is
+    exactly what v1 would have said about it - a number that is defensible even
+    when it is not ideal.  Better a chain we could not explain counted the old
+    way than a completion of 144% on the page.
+    """
+    bad = {c.chain_key for c, _made in over}
+    out = [c for c in chs if c.chain_key not in bad]
+    for c in chs:
+        if c.chain_key not in bad:
+            continue
+        for a in c.attempts:
+            out.append(Chain(chain_key=(a.date, "", a.key[1], a.id_target),
+                             date=a.date, country=a.country, sym=a.sym,
+                             side=a.side, basket=a.basket, algo=a.algo,
+                             client_id=a.client_id, size=a.size,
+                             attempts=(a,)))
+    return sorted(out, key=lambda c: (c.attempts[0].seq,
+                                      c.attempts[0].id_target))
+
+
+def report_unchained(over, still=()) -> None:
+    """Say what was un-chained, and be honest about what that could not fix."""
+    if not over:
+        return
+    n = sum(c.n for c, _made in over)
+    log(f"  {len(over):,} chain{'' if len(over) == 1 else 's'} above have been "
+        f"UN-CHAINED into their {n:,} targets and counted the way v1 counts "
+        f"them, so the page does not read over 100%. Those are the ones to "
+        f"look at with --chains")
+    if still:
+        log(f"  WARNING: {len(still):,} of them STILL execute more than their "
+            f"own size as single targets, so this is not a grouping problem - "
+            f"a workorder is filling more than the target it belongs to:")
+        for c, made in still[:5]:
+            log(f"      id_target {c.attempts[0].id_target}  {c.sym}  "
+                f"size {c.size:,}  executed {made:,}")
 
 
 def report_over_filled(over) -> None:
@@ -704,6 +807,56 @@ def compare_lines(v1_rows, v2_rows) -> list:
 
 
 # =============================================================================
+# EMAIL
+#
+# The settings are v1's - the same servers, the same people, edited in one
+# place - but they are read with getattr and the message is built HERE, against
+# lib.mailer.  v1 is the file that gets edited; lib is not.  Calling v1's
+# mail_report() coupled this to a signature that then changed under it, which
+# is the same mistake the title argument was.
+# =============================================================================
+
+def _cfg(name, default):
+    return getattr(v1, name, default)
+
+
+def email_configured() -> bool:
+    return bool(_cfg("EMAIL_TO", []) or _cfg("EMAIL_CC", [])
+                or _cfg("EMAIL_BCC", []))
+
+
+def mail_report(when, files) -> None:
+    """Send the report: the PDF, and a body that is just the sign-off."""
+    m = _mailer()
+    pdf = next((q for q in files if q.suffix == ".pdf"), None)
+    sender = _cfg("EMAIL_FROM", "")
+    if not sender:
+        raise SystemExit(
+            "EMAIL_TO is set but EMAIL_FROM is empty. Both live in the EMAIL "
+            "block near the top of short_sell_report.py, which this shares.")
+    if pdf is None:
+        raise SystemExit("nothing to attach: no PDF was written")
+
+    msg = m.build_message(m.Mail(
+        subject=f"{TITLE} v2 - {when}", sender=sender,
+        to=_cfg("EMAIL_TO", []), cc=_cfg("EMAIL_CC", []),
+        bcc=_cfg("EMAIL_BCC", []),
+        text=_cfg("EMAIL_SIGNATURE", "Best Regards,"),
+        attachments=[pdf]))
+    smtp = m.Smtp(host=_cfg("SMTP_HOST", ""), port=_cfg("SMTP_PORT", 0),
+                  timeout=_cfg("SMTP_TIMEOUT", 30))
+    log("  email:")
+    log(m.describe(msg))
+    rcpt = m.send(msg, smtp, dry_run=_cfg("EMAIL_DRY_RUN", False))
+    if _cfg("EMAIL_DRY_RUN", False):
+        log(f"  EMAIL_DRY_RUN: NOT sent, {len(rcpt)} recipient"
+            f"{'' if len(rcpt) == 1 else 's'} would have been")
+    else:
+        log(f"  sent to {len(rcpt)} recipient{'' if len(rcpt) == 1 else 's'} "
+            f"via {smtp.host}:{smtp.resolved_port()}")
+
+
+# =============================================================================
 # RUN
 # =============================================================================
 
@@ -730,9 +883,17 @@ def run(args) -> int:
     if args.no_tag:
         return dump_untagged(attempts)
 
-    chs = to_chains(attempts, args.chain_qty)
+    chs = to_chains(attempts, args.chain_qty, splits)
+    over = over_filled(chs, splits)
+    if over and not args.keep_over:
+        #  the escape hatch: whatever grouped these was wrong, so count them the
+        #  way v1 counts them rather than print a completion over 100%
+        chs = unchain(chs, over)
     st = report_stats(chain_stats(attempts, chs), args.quiet)
-    report_over_filled(over_filled(chs, splits))
+    report_over_filled(over)
+    if over and not args.keep_over:
+        report_unchained(over, over_filled(chs, splits))
+    report_over_filled_attempts(over_filled_attempts(attempts, splits))
     report_no_workorder(*no_workorder(chs, splits))
     if args.chains:
         return dump_chains(chs)
@@ -762,8 +923,8 @@ def run(args) -> int:
     fig = draw(rows, tot, subtitle, foot, days)
     files = v1.save(fig, Path(args.out_dir), pl.stem.replace(
         "short_sell_report", "short_sell_report_v2"))
-    if v1.email_configured():
-        v1.mail_report(pl.when, files)
+    if email_configured():
+        mail_report(pl.when, files)
     return 0
 
 
@@ -924,7 +1085,7 @@ def self_test() -> int:
     check("where a replace shrank it, the three differ",
           tuple(to_chains(shrank, q)[0].size
                 for q in ("first", "last", "max")), (250, 100, 250))
-    check("max is the default", CHAIN_QTY, "max")
+    check("asked is the default", CHAIN_QTY, "asked")
     out_of_order, _ = to_attempts([_a(2, "TH", 100, "CLI-1", t=9),
                                    _a(1, "TH", 250, "CLI-1", t=1)])
     check("the last attempt is the last one SENT, not the first row seen",
@@ -936,6 +1097,52 @@ def self_test() -> int:
 
     #  THE CASE THAT DECIDES IT.  Executed is summed over EVERY attempt, so the
     #  quantity has to be one that no combination of fills can exceed.
+    print("\nwhat quantity a chain asked for")
+    #  THE TWO KINDS OF ATTEMPT, and they pull opposite ways.
+    #
+    #  a TOP UP: 6103.JP off the live run - sizes 900, 1700, 2500 executing
+    #  3,600 in total.  900 and 1700 finished; the last did 1,000 of 2,500.
+    top, _ = to_attempts([_a(1, "JP", 900, "VFMAA4246", t=1),
+                          _a(2, "JP", 1700, "VFMAA4246", t=2),
+                          _a(3, "JP", 2500, "VFMAA4246", t=3)])
+    tsp = v1.to_splits([v1._c(1, 1, 900, "filled"),
+                        v1._c(2, 2, 1700, "filled"),
+                        v1._c(3, 3, 1000, "filled")], top)
+    check("asked adds the top ups up",
+          to_chains(top, "asked", tsp)[0].size, 5100)
+    check("sum agrees here", to_chains(top, "sum", tsp)[0].size, 5100)
+    check("max does NOT - this is the 144% on the live run",
+          to_chains(top, "max", tsp)[0].size, 2500)
+
+    #  a REPLACEMENT: Thailand, three sends of 27m that never traded
+    rep, _ = to_attempts([_a(i, "TH", 27_000_000, "CLI-TH", t=i)
+                          for i in (1, 2, 3)])
+    rsp = v1.to_splits([], rep)
+    check("asked counts a rejected-and-replaced order ONCE",
+          to_chains(rep, "asked", rsp)[0].size, 27_000_000)
+    check("sum puts it straight back to v1's 81m",
+          to_chains(rep, "sum", rsp)[0].size, 81_000_000)
+    check("max is right here", to_chains(rep, "max", rsp)[0].size, 27_000_000)
+    check("so only asked is right in BOTH",
+          [q for q in ("asked", "sum", "max", "first", "last")
+           if to_chains(top, q, tsp)[0].size == 5100
+           and to_chains(rep, q, rsp)[0].size == 27_000_000], ["asked"])
+
+    #  a remainder replace: 100 filling 30, replaced by 70 filling 70
+    rem, _ = to_attempts([_a(1, "TH", 100, "CLI-R", t=1),
+                          _a(2, "TH", 70, "CLI-R", t=2)])
+    rmsp = v1.to_splits([v1._c(1, 1, 30, "filled"), v1._c(2, 2, 70, "filled")],
+                        rem)
+    check("and on a remainder replace it is the original size",
+          to_chains(rem, "asked", rmsp)[0].size, 100)
+    check("a single attempt is just its size",
+          to_chains(to_attempts([_a(1, "TH", 500, "CLI-S")])[0], "asked",
+                    v1.to_splits([v1._c(1, 1, 200, "filled")],
+                                 to_attempts([_a(1, "TH", 500, "CLI-S")])[0])
+                    )[0].size, 500)
+    check("with nothing filled at all it is the last size",
+          to_chains(rem, "asked", [])[0].size, 70)
+
     print("\ncompletion can never exceed 100%")
     #  partial fill, then a replace for the remainder: 30 of 100, then 70 of 70
     part, _ = to_attempts([_a(1, "TH", 100, "CLI-1", t=1),
@@ -968,6 +1175,63 @@ def self_test() -> int:
     check("nor is one that fills less",
           over_filled(to_chains(part, "max"),
                       v1.to_splits([v1._c(1, 1, 10, "filled")], part)), [])
+    #  asked is safe in every one of these BY CONSTRUCTION: quantity minus
+    #  executed IS the last attempt's residual, which is never negative
+    for name, at, sp in (("top ups", top, tsp), ("replacement", rep, rsp),
+                         ("remainder", rem, rmsp), ("grown", grow, gsp),
+                         ("partial", part, psp)):
+        check(f"asked never exceeds 100% - {name}",
+              over_filled(to_chains(at, "asked", sp), sp), [])
+
+    print("\nand if one still does, it is un-chained")
+    #  two targets of 100 each filling 80: the CHAIN over fills under max, but
+    #  neither target does on its own - which is what un-chaining is for
+    odd, _ = to_attempts([_a(1, "TH", 100, "CLI-X", t=1),
+                          _a(2, "TH", 100, "CLI-X", t=2)])
+    osp = v1.to_splits([v1._c(1, 1, 80, "filled"), v1._c(2, 2, 80, "filled")],
+                       odd)
+    oc = to_chains(odd, "max", osp)
+    over_odd = over_filled(oc, osp)
+    check("the chain is over filled", len(over_odd), 1)
+    check("at 160%", round(100 * over_odd[0][1] / over_odd[0][0].size), 160)
+    un = unchain(oc, over_odd)
+    check("un-chaining turns it back into its targets", len(un), 2)
+    check("each with its own size", sorted(c.size for c in un), [100, 100])
+    check("and nothing reads over 100% any more", over_filled(un, osp), [])
+    check("which is exactly what v1 would have said",
+          sum(c.size for c in un), sum(a.size for a in odd))
+    check("a chain that is fine is left alone",
+          len(unchain(to_chains(top, "asked", tsp), [])), 1)
+    said_un = printed_err(report_unchained, over_odd, [])
+    check("and the run says it happened", "UN-CHAINED" in said_un, True)
+    check("naming how many targets", "2 targets" in said_un, True)
+
+    print("\nthe tripwire that still works under asked")
+    #  asked is defined as fills plus the last residual, so the CHAIN level
+    #  check can never fire under it.  A rule that makes its own check vacuous
+    #  needs another one, at the level where the anomaly actually is.
+    solo, _ = to_attempts([_a(1, "TH", 100, "CLI-Y", t=1)])
+    ssp = v1.to_splits([v1._c(1, 1, 400, "filled")], solo)
+    check("under asked the chain level check cannot fire, by construction",
+          over_filled(to_chains(solo, "asked", ssp), ssp), [])
+    check("but the target DID fill four times its size",
+          [(a.id_target, made) for a, made in
+           over_filled_attempts(solo, ssp)], [(1, 400)])
+    said_att = printed_err(report_over_filled_attempts,
+                           over_filled_attempts(solo, ssp))
+    check("and the run says so, plainly",
+          "not a grouping question" in said_att, True)
+    check("naming the target and the percentage",
+          ("id_target 1" in said_att and "400%" in said_att), True)
+    check("a healthy session trips nothing",
+          over_filled_attempts(top, tsp), [])
+    check("nor does one where a target exactly fills",
+          over_filled_attempts(*(lambda a: (a, v1.to_splits(
+              [v1._c(1, 1, 100, "filled")], a)))(
+                  to_attempts([_a(1, "TH", 100, "CLI-Z")])[0])), [])
+    check("it is independent of CHAIN_QTY - the anomaly is per target",
+          all(len(over_filled_attempts(solo, ssp)) == 1
+              for _q in ("asked", "sum", "max", "first", "last")), True)
 
     print("\norders that never produced a workorder")
     #  three orders: one pulled in 5s, one that sat for an hour with nothing
@@ -1061,6 +1325,10 @@ def self_test() -> int:
     check("both fields are named when both differ",
           to_chains(two_at_once)[0].disagrees_on(), ["sym", "algo"])
     check("a clean fixture reports no mixing", st.mixed, [])
+    check("the size-mismatch line names every CHAIN_QTY without blowing up",
+          all("differing size" in printed_err(
+              lambda: report_stats(chain_stats(top, to_chains(top, q, tsp))))
+              for q in ("asked", "sum", "max", "first", "last")), True)
 
     #  the two branches of each check are exclusive - a run that printed both
     #  the warning and the all-clear would be worse than one that printed
@@ -1206,10 +1474,15 @@ def main(argv=None) -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--monthly", metavar="YYYY-MM")
     p.add_argument("--date", type=dt.date.fromisoformat, metavar="YYYY-MM-DD")
-    p.add_argument("--chain-qty", choices=("max", "first", "last"),
+    p.add_argument("--chain-qty",
+                   choices=("asked", "sum", "max", "first", "last"),
                    default=CHAIN_QTY,
-                   help="which attempt's size is the chain's quantity. max is "
-                        "the only one that cannot print a completion over 100%%")
+                   help="what quantity a chain asked for. asked reads it off "
+                        "the fills and cannot print over 100%%")
+    p.add_argument("--keep-over", action="store_true",
+                   help="do NOT un-chain the orders that still execute more "
+                        "than they asked for - leave them chained, and let the "
+                        "page read over 100%%")
     p.add_argument("--compare", action="store_true",
                    help="print v1 and v2 side by side over ONE fetch and exit, "
                         "so any difference is the counting and nothing else")
