@@ -44,13 +44,16 @@ which is the q you already had:
 by stem:{"." sv -1 _ "." vs string x} each oes_oid
 ```
 
-Chained on **(date, id_server, stem, market, basket)**.
+Chained on **(date, id_server, stem, side, basket, sym)**.
 
-You said stem + side + basket. *Side* is in the key only in the sense that the
-whole report is one side — the query filters ``side=`sellshort`` before anything
-else — so adding it could never separate two rows. **Market** is there instead:
-it is the thing a stem could plausibly collide across, and it costs nothing.
-Basket is yours, kept as given.
+**The stem alone is not an order.** Two orders in different baskets can share
+one — so side and basket are what make it an order, exactly as you said, and
+they are taken as given.
+
+*Side* is in the key even though this report filters to one side. A key that
+leans on what its caller happens to filter is a key that breaks the first time
+it is reused, and the LULD report has both sides. *Sym* is there for the same
+reason: two syms in one basket would otherwise merge.
 
 An `oes_oid` with no dot has no attempt to strip and becomes its own chain —
 the safe reading, since it can only ever fail to collapse something.
@@ -97,28 +100,33 @@ name on the same layout. No number moved.
 Two things are assumed and **neither is proven on your data**. Both are reported
 on every run rather than quietly relied on.
 
-**1. That a stem groups one order and nothing else.** If a stem is broader than
-an order, v2 under-counts. Every run prints:
+**1. That stem + side + basket + sym is an order.** Every run prints:
 
 ```
 chains: 924 targets -> 871 orders (43 chained, longest 3)
+1 oes_oid stem shared by 2 different orders - side, basket and sym kept them
+apart; a stem-only key would have merged them.  --chains lists them
 ```
 
-and, if it happens:
+That second line is **not an error** — it is the measure of how much work the
+rest of the key is doing. Zero means the stem was unique anyway; a number means
+keying on the stem alone would have merged real orders. Either way nothing is
+silently merged.
+
+`--chains` shows both the chains and the shared stems, so they can be checked
+against the engine:
 
 ```
-WARNING: 2 chains hold more than one sym. The stem is over-grouping
-         and these numbers are WRONG. --chains
-```
-
-**That warning must be absent.** `--chains` lists every multi-attempt chain with
-its attempts, so it can be checked against the engine:
-
-```
-  SCB-R.TB  TH  stem SCB-R.TB.APPD2.1w519  basket B1  -> qty 27,000,000
+  SCB-R.TB  TH  sellshort  stem SCB-R.TB.A.1w519  basket ALPHA  -> qty 27,000,000
       id_target 1270254699   size     27,000,000  t     38102
       id_target 1270254812   size     27,000,000  t     38455
       id_target 1270255001   size     27,000,000  t     39120
+
+1 stem held more than one order - this is what side, basket and sym are in the key FOR:
+
+  stem SCB-R.TB.A.1w519
+      SCB-R.TB       sellshort  basket ALPHA      qty     27,000,000  3 attempts
+      SCB-R.TB       sellshort  basket BETA       qty      4,000,000  1 attempt
 ```
 
 **2. That the chain's quantity is the last attempt's size.** `CHAIN_QTY` is
@@ -164,7 +172,7 @@ each other.
 python scripts/short_sell_report_v2/short_sell_report_v2.py --self-test
 ```
 
-62 checks, no kdb and no pykx: the stem rule against both ids from your qStudio
+68 checks, no kdb and no pykx: the stem rule against both ids from your qStudio
 session, what does and does not share a chain, which attempt sets the quantity
 (including a replace that shrank and one sent out of order), the validation
 counters, the Thailand rollup end to end, that v1 over the same data still says

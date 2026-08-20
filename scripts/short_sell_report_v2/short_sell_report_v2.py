@@ -27,13 +27,20 @@ the id with its last dot component removed, which is the attempt number:
 
 which is the q the user already had:  {"." sv -1 _ "." vs string x} each oes_oid
 
-Chained on (date, id_server, stem, MARKET, basket).
+Chained on (date, id_server, stem, SIDE, BASKET, SYM).
 
-You said stem + side + basket.  Side is in the key only in the sense that this
-whole report is one side - the query filters side=`sellshort before anything
-else - so adding it would never separate two rows.  Market is there instead:
-it is the thing a stem could plausibly collide across, and it costs nothing.
-Basket is yours, kept as given.
+Two orders in different baskets can share a stem - so the stem alone is not an
+order, and side and basket are what make it one.  That is the user's rule and
+it is taken as given: side is in the key even though this report filters to one
+side, because a key that leans on what its caller happens to filter is a key
+that breaks the first time it is reused.  sym is there for the same reason -
+two syms in one basket could otherwise merge.
+
+HOW LOAD BEARING THAT IS gets reported on every run: `split stems` counts the
+stems that turned out to be shared by more than one order.  A number there
+means the stem alone WOULD have over-grouped and the rest of the key stopped
+it.  Zero means the stem was unique anyway.  Either way nothing is silently
+merged, which is the difference between this and keying on the stem alone.
 
 WHAT CHANGES, AND WHAT DOES NOT
 
@@ -50,9 +57,10 @@ is that the ONLY difference is how orders are counted.
 
 VALIDATE BEFORE TRUSTING IT.  Two things are assumed and neither is proven:
 
-  1. that a stem groups attempts of one order and nothing else.  Every run
-     reports chains whose attempts disagree on sym, side or market; that count
-     must be zero.  --chains lists them.
+  1. that the stem, side, basket and sym together are an order.  Every run
+     reports how many stems were shared by more than one order - not an error,
+     but the measure of how much work the rest of the key is doing.  --chains
+     shows them side by side.
   2. that the chain's quantity is the LAST attempt's size.  CHAIN_QTY = "max"
      if a replace can shrink an order to its unfilled remainder, in which case
      summing fills across attempts against the last size would overstate
@@ -110,15 +118,16 @@ Q_SESSION = """
 {[hist;d;sfx;sside]
   sside:`$sside;
   et:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; size:0#0i;
-         fixmsg:0#`; oes_oid:0#`; basket:0#`; time:0#0Nt);
+         fixmsg:0#`; oes_oid:0#`; basket:0#`; side:0#`; time:0#0Nt);
   ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i;
          state:0#`);
 
   t:$[hist;
-      select date,id_server,id_target,sym,size,fixmsg,oes_oid,basket,time
+      select date,id_server,id_target,sym,size,fixmsg,oes_oid,basket,side,
+          time
         from target where date=d, side=sside, any (upper sym) like/: sfx;
       update date:0Nd from select id_server,id_target,sym,size,fixmsg,oes_oid,
-          basket,time
+          basket,side,time
         from target where side=sside, any (upper sym) like/: sfx];
   if[0=count t; :(et;ew)];
 
@@ -165,12 +174,16 @@ class Attempt(NamedTuple):
     size: int
     stem: str
     basket: str
+    side: str
     seq: float                 # target `time`, to find the last attempt
     id_target: int
 
     @property
     def chain_key(self) -> tuple:
-        return (self.date, self.key[1], self.stem, self.country, self.basket)
+        """What makes an order.  The stem is not enough on its own: two orders
+        in different baskets can share one."""
+        return (self.date, self.key[1], self.stem, self.side, self.basket,
+                self.sym)
 
 
 class Chain(NamedTuple):
@@ -179,6 +192,8 @@ class Chain(NamedTuple):
     date: Optional[dt.date]
     country: str
     sym: str
+    side: str
+    basket: str
     size: int
     attempts: tuple            # every Attempt, in order
 
@@ -209,6 +224,7 @@ def to_attempts(records) -> tuple:
             key=(d, v1._i(r.get("id_server")), idt), date=d, country=country,
             sym=sym, size=abs(v1._i(r.get("size"))),
             stem=oid_stem(r.get("oes_oid")), basket=v1._s(r.get("basket")),
+            side=v1._s(r.get("side")) or v1.SHORTSELL_SIDE,
             seq=_t(r.get("time")), id_target=idt))
     return out, dropped
 
@@ -249,7 +265,8 @@ def to_chains(attempts, qty=None) -> list:
         last = got[-1]
         size = max(a.size for a in got) if qty == "max" else last.size
         out.append(Chain(chain_key=k, date=last.date, country=last.country,
-                         sym=last.sym, size=size, attempts=tuple(got)))
+                         sym=last.sym, side=last.side, basket=last.basket,
+                         size=size, attempts=tuple(got)))
     return sorted(out, key=lambda c: (c.attempts[0].seq, c.attempts[0].id_target))
 
 
@@ -266,19 +283,28 @@ class ChainStats(NamedTuple):
     chains: int
     multi: int                 # chains of more than one attempt
     longest: int
-    mixed_sym: list            # chains whose attempts disagree on sym
+    split_stems: list          # [(stem, [chains])] - stems shared by >1 order
     mixed_size: list           # chains whose attempts disagree on size
     no_oid: int                # attempts with no oes_oid at all
 
 
 def chain_stats(attempts, chs) -> ChainStats:
-    mixed_sym = [c for c in chs if len({a.sym for a in c.attempts}) > 1]
-    mixed_size = [c for c in chs if len({a.size for a in c.attempts}) > 1]
+    """What the run should say about its own assumptions.
+
+    split_stems is the interesting one: stems that turned out to belong to more
+    than one order, which side, basket and sym pulled apart.  It cannot be an
+    error - the key handled it - but it is the measure of how much the rest of
+    the key is doing, and a stem-only key would have merged every one of them.
+    """
+    by_stem = {}
+    for c in chs:
+        by_stem.setdefault(c.chain_key[2], []).append(c)
     return ChainStats(
         attempts=len(attempts), chains=len(chs),
         multi=sum(1 for c in chs if c.n > 1),
         longest=max([c.n for c in chs], default=0),
-        mixed_sym=mixed_sym, mixed_size=mixed_size,
+        split_stems=[(k, v) for k, v in by_stem.items() if len(v) > 1 and k],
+        mixed_size=[c for c in chs if len({a.size for a in c.attempts}) > 1],
         no_oid=sum(1 for a in attempts if not a.stem))
 
 
@@ -288,9 +314,12 @@ def report_stats(st: ChainStats, quiet=False):
     if st.no_oid:
         log(f"  NOTE: {st.no_oid:,} targets have no oes_oid - each is its own "
             f"chain, so they are counted exactly as v1 counts them")
-    if st.mixed_sym:
-        log(f"  WARNING: {len(st.mixed_sym):,} chains hold more than one sym. "
-            f"The stem is over-grouping and these numbers are WRONG. --chains")
+    if st.split_stems:
+        n = sum(len(v) for _k, v in st.split_stems)
+        log(f"  {len(st.split_stems):,} oes_oid stem"
+            f"{'' if len(st.split_stems) == 1 else 's'} shared by {n:,} "
+            f"different orders - side, basket and sym kept them apart; a "
+            f"stem-only key would have merged them.  --chains lists them")
     if st.mixed_size:
         log(f"  NOTE: {len(st.mixed_size):,} chains have attempts of differing "
             f"size; CHAIN_QTY={CHAIN_QTY!r} takes the "
@@ -299,24 +328,35 @@ def report_stats(st: ChainStats, quiet=False):
 
 
 def dump_chains(chs, limit=40):
-    """The multi attempt chains, for eyeballing against the engine."""
+    """The multi attempt chains, and the stems that turned out to hold more than
+    one order.  Both are for eyeballing against the engine."""
+    st = chain_stats([a for c in chs for a in c.attempts], chs)
+
     multi = [c for c in chs if c.n > 1]
     if not multi:
         print("no chained orders: every target stands alone")
-        return 0
-    print(f"{len(multi):,} chained orders"
-          + (f", showing the first {limit}" if len(multi) > limit else ""))
-    for c in multi[:limit]:
-        flag = ""
-        if len({a.sym for a in c.attempts}) > 1:
-            flag = "   <-- MIXED SYM, the stem is over-grouping"
-        elif len({a.size for a in c.attempts}) > 1:
-            flag = "   <-- sizes differ across attempts"
-        print(f"\n  {c.sym}  {c.country}  stem {c.chain_key[2]}  "
-              f"basket {c.chain_key[4] or '-'}  -> qty {c.size:,}{flag}")
-        for a in c.attempts:
-            print(f"      id_target {a.id_target:<12} size {a.size:>14,}  "
-                  f"t {a.seq:>9.0f}")
+    else:
+        print(f"{len(multi):,} chained orders"
+              + (f", showing the first {limit}" if len(multi) > limit else ""))
+        for c in multi[:limit]:
+            flag = ("   <-- sizes differ across attempts"
+                    if len({a.size for a in c.attempts}) > 1 else "")
+            print(f"\n  {c.sym}  {c.country}  {c.side}  "
+                  f"stem {c.chain_key[2]}  basket {c.basket or '-'}"
+                  f"  -> qty {c.size:,}{flag}")
+            for a in c.attempts:
+                print(f"      id_target {a.id_target:<12} size {a.size:>14,}  "
+                      f"t {a.seq:>9.0f}")
+
+    if st.split_stems:
+        print(f"\n{len(st.split_stems):,} stems held more than one order - "
+              f"this is what side, basket and sym are in the key FOR:")
+        for stem, got in st.split_stems[:limit]:
+            print(f"\n  stem {stem}")
+            for c in got:
+                print(f"      {c.sym:<14} {c.side:<10} basket "
+                      f"{c.basket or '-':<10} qty {c.size:>14,}  "
+                      f"{c.n} attempt{'' if c.n == 1 else 's'}")
     return 0
 
 
@@ -474,10 +514,11 @@ def run(args) -> int:
 # SELF TEST
 # =============================================================================
 
-def _a(idt, country, size, oid, basket="B1", t=0.0, d=None, srv=1):
+def _a(idt, country, size, oid, basket="B1", side="sellshort", t=0.0,
+       d=None, srv=1):
     """One target row, as q returns it."""
     r = v1._p(idt, country, size, d=d, srv=srv)
-    r.update({"oes_oid": oid, "basket": basket,
+    r.update({"oes_oid": oid, "basket": basket, "side": side,
               "time": dt.timedelta(seconds=t)})
     return r
 
@@ -564,15 +605,35 @@ def self_test() -> int:
     check("and the orders", st.chains, 2)
     check("and how many collapsed", st.multi, 1)
     check("and the longest chain", st.longest, 3)
-    check("nothing mixed in a clean fixture",
-          (st.mixed_sym, st.mixed_size), ([], []))
+    check("nothing shared or mixed in a clean fixture",
+          (st.split_stems, st.mixed_size), ([], []))
 
-    bad, _ = to_attempts([_a(1, "TH", 100, "X.TB.A.1.1p0", t=1),
-                          _a(2, "TH", 100, "X.TB.A.1.2p0", t=2)])
-    bad = [bad[0], bad[1]._replace(sym="OTHER.TB")]
-    st2 = chain_stats(bad, to_chains(bad))
-    check("a stem holding two syms is REPORTED, not absorbed",
-          len(st2.mixed_sym), 1)
+    #  THE CASE THE USER RAISED: one stem, two baskets, two real orders
+    shared, _ = to_attempts([
+        _a(1, "TH", 100, "X.TB.A.1.1p0", basket="ALPHA", t=1),
+        _a(2, "TH", 100, "X.TB.A.1.2p0", basket="ALPHA", t=2),
+        _a(3, "TH", 700, "X.TB.A.1.1p0", basket="BETA", t=1)])
+    sh = to_chains(shared)
+    check("a shared stem does NOT merge two baskets", len(sh), 2)
+    check("each keeps its own quantity",
+          sorted(c.size for c in sh), [100, 700])
+    check("and the run says the stem was shared",
+          len(chain_stats(shared, sh).split_stems), 1)
+    check("naming which stem",
+          chain_stats(shared, sh).split_stems[0][0], "X.TB.A.1")
+
+    two_syms, _ = to_attempts([_a(1, "TH", 100, "X.TB.A.1.1p0", t=1),
+                               _a(2, "TH", 100, "X.TB.A.1.2p0", t=2)])
+    two_syms = [two_syms[0], two_syms[1]._replace(sym="OTHER.TB")]
+    st2 = chain_stats(two_syms, to_chains(two_syms))
+    check("two syms on one stem stay two orders",
+          len(to_chains(two_syms)), 2)
+    check("and that is reported too", len(st2.split_stems), 1)
+
+    two_sides, _ = to_attempts([_a(1, "TH", 100, "X.TB.A.1.1p0", side="sellshort"),
+                                _a(2, "TH", 100, "X.TB.A.1.2p0", side="buy")])
+    check("side is in the key even though this report filters on it",
+          len(to_chains(two_sides)), 2)
     st3 = chain_stats(shrank, to_chains(shrank))
     check("so is a chain whose attempts disagree on size",
           len(st3.mixed_size), 1)
