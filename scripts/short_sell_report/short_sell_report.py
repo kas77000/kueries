@@ -88,6 +88,7 @@ from typing import NamedTuple, Optional
 # Copy scripts/lib alongside this folder if you move it.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from lib.local_config import apply_local              # noqa: E402
 from lib.order_chains import (                                   # noqa: E402
     CLIENT_ID_TAG, QTY_CHOICES, chain_key, chain_size, fix_tag)
 from lib.report_page import (                                    # noqa: E402
@@ -169,6 +170,14 @@ EMAIL_SIGNATURE = "Best Regards,\n\nKhalife"
 #   "max"    the largest attempt.  Right for replacements, over 100% on top ups.
 #   "first" / "last"   the original, or the order as it finally stood.
 CHAIN_QTY = "asked"
+
+# -----------------------------------------------------------------------------
+# Anything above can be overridden from a local_settings.py beside this script,
+# which git ignores - so the servers and the recipients survive a pull and this
+# file never has to be edited.  See scripts/lib/README.md.
+# -----------------------------------------------------------------------------
+
+apply_local(globals(), __file__)
 
 # =============================================================================
 # SCOPE

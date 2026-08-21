@@ -10,3 +10,6 @@ __pycache__/
 
 # report output written by the scripts
 scripts/*/out/
+
+# local, untracked settings: servers, recipients - see scripts/lib/README.md
+scripts/*/local_settings.py

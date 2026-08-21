@@ -81,6 +81,7 @@ from typing import NamedTuple, Optional
 # `python scripts/luld_report/luld_report.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from lib.local_config import apply_local              # noqa: E402
 from lib.order_chains import (                                   # noqa: E402
     CLIENT_ID_TAG, DEFAULT_QTY, QTY_CHOICES, chain_key, chain_size, fix_tag)
 from lib.report_page import (                                    # noqa: E402
@@ -133,6 +134,14 @@ CHAIN_QTY = DEFAULT_QTY
 # restates it is a second copy to keep in step and one more thing to render
 # wrong in somebody's client.
 EMAIL_SIGNATURE = "Best Regards,\n\nKhalife"
+
+# -----------------------------------------------------------------------------
+# Anything above can be overridden from a local_settings.py beside this script,
+# which git ignores - so the servers and the recipients survive a pull and this
+# file never has to be edited.  See scripts/lib/README.md.
+# -----------------------------------------------------------------------------
+
+apply_local(globals(), __file__)
 
 
 # =============================================================================

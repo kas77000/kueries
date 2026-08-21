@@ -65,6 +65,39 @@ Used by [`short_sell_report`](../short_sell_report/README.md) and
 
 ---
 
+## `local_config.py`
+
+Keeps the servers and the mail **out of the tracked file**.
+
+Every script ships with placeholders — `ORDER_SERVER_RT`, `EMAIL_TO`,
+`SMTP_HOST` — that must be edited before a first run. Editing them *in the
+script* means the file you run is never the file in git, so `git pull`
+conflicts. A half-pulled tree is what produced four crashes in a row: a
+`draw()` without a parameter, a `mail_report()` with the wrong signature, a
+`totals()` that silently returned a different number, and a v2 that no longer
+existed.
+
+Put them beside the script instead:
+
+```python
+# scripts/short_sell_report/local_settings.py     (git ignores it)
+ORDER_SERVER_RT   = "prod-oms-1:5012"
+ORDER_SERVER_HIST = "prod-oms-hist:5010"
+EMAIL_TO          = ["desk@example.com"]
+EMAIL_FROM        = "algo-reports@example.com"
+SMTP_HOST         = "mail.example.com"
+```
+
+Every constant above the `apply_local(globals(), __file__)` line can be
+overridden. `git pull` is then always clean and the settings survive it.
+
+**Strict on purpose.** A name the script does not define is an **error**, not a
+new setting — `EMAIL_T0` with a zero would otherwise sit there doing nothing
+while the report quietly went to no one. A broken settings file names itself and
+stops. On startup it prints *which* names it took and **never the values**.
+
+---
+
 ## `order_chains.py`
 
 Putting a rejected-and-replaced order back together. The engine writes a **new
