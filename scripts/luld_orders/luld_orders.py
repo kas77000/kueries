@@ -161,11 +161,12 @@ def region_of(sym) -> Optional[str]:
 Q_ORDERS = """
 {[hist;d;sfx]
   et:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; side:0#`;
-         sidesign:0#0i; size:0#0i; otype:0#`; basket:0#`; t_gen:0#0Nt;
-         t_start:0#0Nt; t_end:0#0Nt; fixmsg:0#`; adjclose:0#0n;
-         orgclose:0#0n);
+         sidesign:0#0i; size:0#0i; otype:0#`; basket:0#`; limit_price:0#0n;
+         t_gen:0#0Nt; t_start:0#0Nt; t_end:0#0Nt; fixmsg:0#`;
+         fxlast:0#0n; adjclose:0#0n; orgclose:0#0n);
   ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i;
-         t_gen:0#0Nt; t_off_market:0#0Nt);
+         t_gen:0#0Nt; t_off_market:0#0Nt; avg_fill_price:0#0n;
+         t_transmit:0#0Nt; transmit_bidprice:0#0n; transmit_askprice:0#0n);
   es:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; time:0#0Nt; state:0#`);
 
   / parents.  Every side: a limit up is favourable to a seller and a limit down
@@ -173,10 +174,10 @@ Q_ORDERS = """
   / filtered away on side here.
   t:$[hist;
       select date,id_server,id_target,sym,side,sidesign,size,otype,basket,
-          t_gen,t_start,t_end,fixmsg
+          limit_price,t_gen,t_start,t_end,fixmsg
         from target where date=d, any (upper sym) like/: sfx;
       update date:0Nd from select id_server,id_target,sym,side,sidesign,size,
-          otype,basket,t_gen,t_start,t_end,fixmsg
+          otype,basket,limit_price,t_gen,t_start,t_end,fixmsg
         from target where any (upper sym) like/: sfx];
   if[0=count t; :(et;ew;es)];
 
@@ -188,20 +189,24 @@ Q_ORDERS = """
   / neither did.  target_stock carries the close per target, so this is a
   / lookup on the key the row already has rather than a second symbology.
   x:$[hist;
-      `date`id_server`id_target xkey select date,id_server,id_target,adjclose,
-          orgclose from target_stock where date=d, id_target in ids;
-      `id_server`id_target xkey select id_server,id_target,adjclose,orgclose
-        from target_stock where id_target in ids];
+      `date`id_server`id_target xkey select date,id_server,id_target,fxlast,
+          adjclose,orgclose from target_stock where date=d, id_target in ids;
+      `id_server`id_target xkey select id_server,id_target,fxlast,adjclose,
+          orgclose from target_stock where id_target in ids];
   t:t lj x;
 
   / children.  make is what the child executed, whatever state it ended in.
   / t_gen is when the split was CREATED and t_off_market when it left the
   / book.  t_transmit and t_oes_send say when we SENT it, a third question.
+  / avg_fill_price is what the child really paid, and the transmit quote is
+  / the market the order actually met - both are what put it in USD.
   w:$[hist;
-      select date,id_server,id_work,id_target,make,t_gen,t_off_market
+      select date,id_server,id_work,id_target,make,t_gen,t_off_market,
+          avg_fill_price,t_transmit,transmit_bidprice,transmit_askprice
         from workorder where date=d, id_target in ids;
       update date:0Nd from select id_server,id_work,id_target,make,t_gen,
-          t_off_market
+          t_off_market,avg_fill_price,t_transmit,transmit_bidprice,
+          transmit_askprice
         from workorder where id_target in ids];
   / every state row, ungrouped.  Which one is LAST is decided in Python,
   / where the self test can prove it - grouping it down to one row per order
@@ -381,7 +386,10 @@ class Order(NamedTuple):
     side: str
     otype: str                 # `market`, `limit`, ... - as the feed sends it
     basket: str                # what the order was sent as part of, if any
-    size: int
+    size: int                  # SHARES
+    sidesign: int              # +1 buy, -1 sell
+    limit_price: float         # 0.0 on a market order
+    fx: float                  # target_stock.fxlast, local -> USD
     t_gen: Optional[int]       # when the order was CREATED, ms since midnight
     t_start: Optional[int]     # ms since midnight
     t_end: Optional[int]
@@ -488,7 +496,9 @@ def to_orders(records) -> list:
             date=_d(r.get("date")), region=region, sym=sym,
             side=_s(r.get("side")), otype=_s(r.get("otype")),
             basket=_s(r.get("basket")), size=_i(r.get("size")),
-            t_gen=_ms(r.get("t_gen")),
+            sidesign=_i(r.get("sidesign")),
+            limit_price=_f(r.get("limit_price")),
+            fx=_f(r.get("fxlast")), t_gen=_ms(r.get("t_gen")),
             t_start=_ms(r.get("t_start")), t_end=_ms(r.get("t_end")),
             client_id=fix_tag(r.get("fixmsg")),
             id_target=_i(r.get("id_target")),
@@ -505,21 +515,33 @@ class Splits(NamedTuple):
     that quietly left those out would say the order tried less than it did.
     """
     n: int = 0
-    made: int = 0
+    made: int = 0                      # SHARES
     first_gen: Optional[int] = None    # earliest CREATED, ms since midnight
     last_off: Optional[int] = None     # latest OFF the book
+    filled_local: float = 0.0          # sum of make * what it really paid
+    quote: tuple = ()                  # (t_transmit, bid, ask), earliest
 
-    def add(self, make, gen, off) -> "Splits":
+    def add(self, make, gen, off, px=0.0, tx=None, bid=0.0,
+            ask=0.0) -> "Splits":
         """One more child.  A missing time cannot move a bound: a split
         that never reached the market has no t_off_market, and taking that
         as an end would date the order's last child to midnight.
+
+        The quote kept is the EARLIEST child's that carried one - the market
+        the order actually met.  A child with no fill price adds nothing to
+        filled_local rather than adding its shares at zero.
         """
+        q = self.quote
+        if (bid > 0 or ask > 0) and (not q or (tx is not None
+                                               and tx < q[0])):
+            q = (tx if tx is not None else 0, bid, ask)
         return Splits(
             self.n + 1, self.made + make,
             gen if self.first_gen is None else (
                 self.first_gen if gen is None else min(self.first_gen, gen)),
             off if self.last_off is None else (
-                self.last_off if off is None else max(self.last_off, off)))
+                self.last_off if off is None else max(self.last_off, off)),
+            self.filled_local + (make * px if px > 0 else 0.0), q)
 
 
 def splits_by_order(records, orders) -> dict:
@@ -538,7 +560,9 @@ def splits_by_order(records, orders) -> dict:
             continue
         out[key] = out.get(key, Splits()).add(
             abs(_i(r.get("make"))), _ms(r.get("t_gen")),
-            _ms(r.get("t_off_market")))
+            _ms(r.get("t_off_market")), _f(r.get("avg_fill_price")),
+            _ms(r.get("t_transmit")), _f(r.get("transmit_bidprice")),
+            _f(r.get("transmit_askprice")))
     return out
 
 
@@ -677,6 +701,47 @@ def touched(orders, limits) -> tuple:
 # ONE RECORD PER LINE
 # =============================================================================
 
+# =============================================================================
+# NOTIONAL
+#
+# `size` is a share count, so putting an order in USD needs a price - and the
+# UNFILLED part of an order never traded at one.  The ladder, best first, is
+# short_sell_report's:
+#
+#   limit_price   a limit order is worth what the client said it was worth
+#   the quote     a market order has no limit, so it is valued at the side we
+#                 would actually have traded - the BID for a sell, the ASK
+#                 for a buy - as at the moment the FIRST child was sent
+#   ref close     adjclose, else orgclose.  The fallback for an order that
+#                 never produced a child at all, which on this page is not a
+#                 rare branch: an order that sent nothing is the thing the
+#                 report exists to find
+#
+# EXECUTED is not priced this way at all: it is the sum of make * the child's
+# own avg_fill_price, which is what those shares really cost.  So notional
+# completion is NOT share completion - it cannot be, because the two sides
+# traded at different prices.
+#
+# Everything is multiplied by target_stock.fxlast, local -> USD.  An order
+# with no price or no fx contributes NOTHING and is COUNTED: a notional that
+# quietly omits a market is worse than one that admits a gap.
+# =============================================================================
+
+def order_price(o, sp) -> tuple:
+    """(price in local currency, where it came from) for one order."""
+    if o.limit_price > 0:
+        return o.limit_price, "limit"
+    if sp.quote:
+        _tx, bid, ask = sp.quote
+        #  sell into the bid, buy from the ask - the side we would have hit
+        px = bid if o.sidesign < 0 else ask
+        if px > 0:
+            return px, "quote"
+    if o.ref > 0:
+        return o.ref, "close"
+    return 0.0, "none"
+
+
 def favourable_for(side: str, direction: str) -> Optional[bool]:
     """Was the band on the side we could have traded into?
 
@@ -715,13 +780,36 @@ class Line(NamedTuple):
     periods: tuple
     direction: str
     favourable: Optional[bool]
+    price: float = 0.0         # local currency, from the ladder
+    price_source: str = "none"
 
     @property
     def executed(self) -> int:
+        """SHARES."""
         return self.sp.made
 
     @property
+    def priced(self) -> bool:
+        return self.price > 0 and self.o.fx > 0
+
+    @property
+    def ordered_usd(self) -> float:
+        return self.o.size * self.price * self.o.fx if self.priced else 0.0
+
+    @property
+    def executed_usd(self) -> float:
+        """What the fills really cost, never the ladder's price."""
+        return self.sp.filled_local * self.o.fx if self.o.fx > 0 else 0.0
+
+    @property
     def completion(self) -> Optional[float]:
+        """NOTIONAL completion, so the percentage is of the columns it
+        sits beside.  Not the share completion: the two sides traded at
+        different prices, so they are not the same number."""
+        return _completion(self.executed_usd, self.ordered_usd)
+
+    @property
+    def share_completion(self) -> Optional[float]:
         return _completion(self.executed, self.o.size)
 
     @property
@@ -730,8 +818,10 @@ class Line(NamedTuple):
 
     @property
     def incomplete(self) -> bool:
-        """Did it fail to finish?  Quantity, not percentage: an order
-        showing 100.0% on a rounded figure still has quantity left."""
+        """Did it fail to finish?  SHARES, not notional and not a
+        percentage: an order showing 100.0% on a rounded figure still has
+        quantity left, and whether it finished is a question about the order
+        rather than about what the shares were worth."""
         return self.o.size > 0 and self.executed < self.o.size
 
 
@@ -741,8 +831,9 @@ def to_lines(orders, splits, hits) -> list:
     for o in orders:
         got = tuple(sorted(hits.get(o.key, ()), key=lambda w: w.start))
         d = line_direction(got, o.ref)
-        out.append(Line(o, splits.get(o.key, Splits()), got, d,
-                        favourable_for(o.side, d)))
+        sp = splits.get(o.key, Splits())
+        px, src = order_price(o, sp)
+        out.append(Line(o, sp, got, d, favourable_for(o.side, d), px, src))
     return out
 
 
@@ -761,26 +852,28 @@ class Row(NamedTuple):
     code: str
     name: str
     orders: int
-    order_qty: int
-    executed: int
+    ordered_usd: float
+    executed_usd: float
     fav_short: int = 0        # favourable band, and still did not finish
     adv_short: int = 0        # adverse band, and still did not finish
+    unpriced: int = 0         # no price or no fx - contribute NOTHING
 
     @property
     def completion(self) -> Optional[float]:
-        return _completion(self.executed, self.order_qty)
+        return _completion(self.executed_usd, self.ordered_usd)
 
 
 class Totals(NamedTuple):
     orders: int
-    order_qty: int
-    executed: int
+    ordered_usd: float
+    executed_usd: float
     fav_short: int = 0
     adv_short: int = 0
+    unpriced: int = 0
 
     @property
     def completion(self) -> Optional[float]:
-        return _completion(self.executed, self.order_qty)
+        return _completion(self.executed_usd, self.ordered_usd)
 
 
 def by_region(lines) -> list:
@@ -790,30 +883,35 @@ def by_region(lines) -> list:
     one its own sym says - so a row's two halves are always the same orders'.
     """
     n = {c: 0 for c in REGION_CODES}
-    qty = {c: 0 for c in REGION_CODES}
-    made = {c: 0 for c in REGION_CODES}
+    ordered = {c: 0.0 for c in REGION_CODES}
+    made = {c: 0.0 for c in REGION_CODES}
     fav = {c: 0 for c in REGION_CODES}
     adv = {c: 0 for c in REGION_CODES}
+    nopx = {c: 0 for c in REGION_CODES}
     for ln in lines:
         c = ln.o.region
         n[c] += 1
-        qty[c] += ln.o.size
-        made[c] += ln.executed
+        ordered[c] += ln.ordered_usd
+        made[c] += ln.executed_usd
+        if not ln.priced:
+            nopx[c] += 1
         if ln.incomplete and ln.favourable is True:
             fav[c] += 1
         elif ln.incomplete and ln.favourable is False:
             adv[c] += 1
-    return [Row(r.code, r.name, n[r.code], qty[r.code], made[r.code],
-                fav[r.code], adv[r.code]) for r in REGIONS]
+    return [Row(r.code, r.name, n[r.code], ordered[r.code], made[r.code],
+                fav[r.code], adv[r.code], nopx[r.code]) for r in REGIONS]
 
 
 def totals(rows) -> Totals:
     """The headline.  Completion is summed executed over summed order qty, so
     it is the same ratio the rows are, not an average of percentages."""
-    return Totals(sum(r.orders for r in rows), sum(r.order_qty for r in rows),
-                  sum(r.executed for r in rows),
+    return Totals(sum(r.orders for r in rows),
+                  sum(r.ordered_usd for r in rows),
+                  sum(r.executed_usd for r in rows),
                   sum(r.fav_short for r in rows),
-                  sum(r.adv_short for r in rows))
+                  sum(r.adv_short for r in rows),
+                  sum(r.unpriced for r in rows))
 
 
 def shared_ids(orders) -> tuple:
@@ -848,21 +946,21 @@ Y_RULE_BOTTOM, Y_FOOTER = 0.066, 0.048
 #  first is the one we could have traded into, the second is still a
 #  question whenever the order was marketable anyway.
 REGION_COLS = (
-    ("Region", 0.22, False),
-    ("Orders", 0.10, True),
-    ("Order qty", 0.15, True),
-    ("Executed", 0.15, True),
+    ("Region", 0.15, False),
+    ("Orders", 0.08, True),
+    ("Notional Ordered (USD)", 0.20, True),
+    ("Notional Executed (USD)", 0.21, True),
     ("Completion", 0.12, True),
-    ("Short, fav.", 0.13, True),
-    ("Short, adv.", 0.13, True),
+    ("Short, fav.", 0.12, True),
+    ("Short, adv.", 0.12, True),
 )
 
 
 def _row_cells(r):
     return [(r.name, INK, "normal"),
             (fmt_int(r.orders), INK if r.orders else INK3, "normal"),
-            (fmt_int(r.order_qty), INK if r.orders else INK3, "normal"),
-            (fmt_int(r.executed), INK if r.orders else INK3, "normal"),
+            (fmt_usd(r.ordered_usd), INK if r.orders else INK3, "normal"),
+            (fmt_usd(r.executed_usd), INK if r.orders else INK3, "normal"),
             (fmt_pct1(r.completion), INK, "bold"),
             (fmt_int(r.fav_short), RED if r.fav_short else INK3,
              "bold" if r.fav_short else "normal"),
@@ -878,12 +976,22 @@ def draw(rows, tot, subtitle, foot, note=""):
                (fmt_pct1(tot.completion), "Overall completion", GREEN)],
          0.860, 0.836)
 
-    fig.text(L, 0.775, "Orders whose stock was limit up OR limit down while "
+    fig.text(L, 0.788, "Orders whose stock was limit up OR limit down while "
                        "the order was live. Both sides count: an unfavourable "
                        "limit can still be marketable.",
              fontsize=8, color=INK2, va="baseline")
+    fig.text(L, 0.772,
+             "Notional is USD. Ordered is valued at the order's own limit "
+             "price, else the quote its first child met, else the previous "
+             "close.",
+             fontsize=8, color=INK2, va="baseline")
+    fig.text(L, 0.756,
+             "Executed is what the fills really paid, so completion is the "
+             "notional one — not the share completion, which is a different "
+             "number.",
+             fontsize=8, color=INK2, va="baseline")
 
-    y = table(fig, REGION_COLS, [_row_cells(r) for r in rows], 0.750, 0.030,
+    y = table(fig, REGION_COLS, [_row_cells(r) for r in rows], 0.730, 0.030,
               fs=9, head_fs=8.5)
     #  the total sits under the rows, on the same column edges, with no second
     #  header band over it
@@ -916,8 +1024,8 @@ def _total_line(fig, tot, y):
     x = L
     for (label, frac, right), text in zip(
             REGION_COLS,
-            ["", fmt_int(tot.orders), fmt_int(tot.order_qty),
-             fmt_int(tot.executed), fmt_pct1(tot.completion),
+            ["", fmt_int(tot.orders), fmt_usd(tot.ordered_usd),
+             fmt_usd(tot.executed_usd), fmt_pct1(tot.completion),
              fmt_int(tot.fav_short), fmt_int(tot.adv_short)]):
         w = frac * (R - L)
         if text:
@@ -930,16 +1038,16 @@ def _total_line(fig, tot, y):
 #  problem: what it was, how much of it got done, what the book was doing,
 #  and how long the two overlapped.  Everything else is in --raw.
 ORDER_LIST_COLS = (
-    ("Region", 0.10, False),
-    ("Symbol", 0.12, False),
-    ("Target id", 0.09, True),
-    ("Side", 0.05, False),
-    ("Type", 0.06, False),
-    ("Order qty", 0.09, True),
-    ("Executed", 0.09, True),
+    ("Region", 0.09, False),
+    ("Symbol", 0.11, False),
+    ("Target id", 0.08, True),
+    ("Side", 0.045, False),
+    ("Type", 0.055, False),
+    ("Ordered (USD)", 0.115, True),
+    ("Executed (USD)", 0.12, True),
     ("Completion", 0.09, True),
-    ("Limit", 0.07, False),
-    ("Limit window", 0.14, False),
+    ("Limit", 0.065, False),
+    ("Limit window", 0.13, False),
     ("Mins", 0.05, True),
     ("Splits", 0.05, True),
 )
@@ -961,8 +1069,8 @@ def _list_cells(ln):
         (str(ln.o.id_target), INK2, "normal"),
         (ln.o.side or DASH, INK, "normal"),
         (ln.o.otype or DASH, INK2, "normal"),
-        (fmt_int(ln.o.size), INK, "normal"),
-        (fmt_int(ln.executed), INK, "normal"),
+        (fmt_usd(ln.ordered_usd), INK, "normal"),
+        (fmt_usd(ln.executed_usd), INK, "normal"),
         (fmt_pct1(ln.completion), comp_ink, "bold"),
         (_dir_label(ln), INK if fav is True else INK2, "normal"),
         (f"{fmt_hm(w[0].start)}–{fmt_hm(w[-1].end)}" if w else DASH,
@@ -1032,8 +1140,9 @@ def pages_for(rows, tot, subtitle, foot, note="", lines=()):
 # CSV
 # =============================================================================
 
-CSV_HEADER = ("region", "orders", "order_qty", "executed", "completion_pct",
-              "short_favourable", "short_adverse")
+CSV_HEADER = ("region", "orders", "notional_ordered_usd",
+              "notional_executed_usd", "completion_pct",
+              "short_favourable", "short_adverse", "unpriced_orders")
 
 
 def csv_rows(rows, tot) -> list:
@@ -1041,9 +1150,12 @@ def csv_rows(rows, tot) -> list:
     disagree - a CSV re-derived from the source would be a second answer to
     keep in step."""
     def one(name, r):
-        return [name, r.orders, r.order_qty, r.executed,
+        #  full precision here, not the page's 79.2m: this is the file
+        #  somebody adds up
+        return [name, r.orders, round(r.ordered_usd, 2),
+                round(r.executed_usd, 2),
                 "" if r.completion is None else f"{r.completion:.1f}",
-                r.fav_short, r.adv_short]
+                r.fav_short, r.adv_short, r.unpriced]
     out = [one(r.name, r) for r in rows]
     out.append(one("Total", tot))
     return out
@@ -1075,9 +1187,12 @@ def write_csv(rows, tot, out_dir, stem) -> Path:
 #  book was doing second, and only then anything that needed both - and a
 #  column's block says which side to go and check when it looks wrong.
 ORDER_COLS = (
-    "date", "region", "sym", "side", "otype", "id_server", "id_target",
-    "tag_9604", "basket", "order_qty", "executed", "completion_pct", "t_gen",
-    "order_start", "order_end", "splits", "split_first_gen", "split_last_off",
+    "date", "region", "sym", "side", "otype", "id_server", "id_target",  # noqa: E501
+    #  order_qty and executed stay in SHARES; the money rides beside them
+    "tag_9604", "basket", "order_qty", "executed", "completion_pct",
+    "ordered_usd", "executed_usd", "notional_completion_pct", "price",
+    "price_source", "fxlast", "t_gen", "order_start", "order_end", "splits",
+    "split_first_gen", "split_last_off",
 )
 
 LIMIT_COLS = (
@@ -1105,6 +1220,23 @@ def line_direction(periods, ref: float = 0.0) -> str:
     if len(got) == 1:
         return got.pop()
     return "mixed"
+
+
+def fmt_usd(v) -> str:
+    """A USD notional, in the unit the number is actually in.
+
+    A trading day runs from thousands to hundreds of millions, and
+    79,241,883 is a number nobody reads - 79.2m is.  Zero prints as a dash:
+    it means the orders could not be valued, not that they were worth
+    nothing.  Same formatter as short_sell_report, deliberately.
+    """
+    v = float(v or 0.0)
+    if v <= 0:
+        return DASH
+    for cut, suf in ((1e9, "bn"), (1e6, "m"), (1e3, "k")):
+        if v >= cut:
+            return f"{v / cut:,.1f}{suf}"
+    return f"{v:,.0f}"
 
 
 def _pct(v) -> str:
@@ -1140,13 +1272,17 @@ def raw_rows(lines) -> list:
     for ln in lines:
         o, sp, got = ln.o, ln.sp, ln.periods
         ex = ln.executed
-        comp = ln.completion
+        comp = ln.share_completion
         out.append([
             #  ORDER_COLS - what we did
             o.date.isoformat() if o.date else "",
             REGION_NAME[o.region], o.sym, o.side, o.otype, o.key[1],
             o.id_target, o.client_id, o.basket, o.size, ex,
             "" if comp is None else f"{comp:.1f}",
+            round(ln.ordered_usd, 2) if ln.ordered_usd else "",
+            round(ln.executed_usd, 2) if ln.executed_usd else "",
+            _pct(ln.completion), f"{ln.price:g}" if ln.price else "",
+            ln.price_source, f"{o.fx:g}" if o.fx else "",
             _hms(o.t_gen), _hms(o.t_start), _hms(o.t_end),
             sp.n, _hms(sp.first_gen), _hms(sp.last_off),
             #  LIMIT_COLS - what the book was doing
@@ -1274,6 +1410,10 @@ def run(args) -> int:
     rows = by_region(lines)
     tot = totals(rows)
 
+    if tot.unpriced:
+        log(f"  {tot.unpriced:,} of {tot.orders:,} orders could not be valued "
+            f"- no price or no fxlast - and contribute NOTHING to the notional "
+            f"columns")
     if cancelled:
         log(f"  {cancelled:,} of {seen:,} orders were over before their own "
             f"t_start - cancelled before they worked - and are out")
@@ -1314,9 +1454,9 @@ def run(args) -> int:
 # =============================================================================
 
 def _t(idt, region, size, d=None, srv=1, sym=None, side="sell",
-       otype="limit", basket="B1", t_gen=9 * 3_600_000,
-       t_start=9 * 3_600_000 + 1_800_000, t_end=15 * 3_600_000, cid=None,
-       adjclose=100.0, orgclose=None):
+       otype="limit", basket="B1", limit_price=0.0, fxlast=1.0,
+       t_gen=9 * 3_600_000, t_start=9 * 3_600_000 + 1_800_000,
+       t_end=15 * 3_600_000, cid=None, adjclose=100.0, orgclose=None):
     """One target row.  cid goes into fixmsg as tag 9604 the way the client
     really sends it, so the fixture exercises the parse too."""
     sfx = dict((r.code, r.suffixes[0]) for r in REGIONS).get(region,
@@ -1328,7 +1468,8 @@ def _t(idt, region, size, d=None, srv=1, sym=None, side="sell",
     return {"date": d, "id_server": srv, "id_target": idt,
             "sym": sym or f"{1000 + idt}{sfx}", "side": side,
             "sidesign": -1 if side == "sell" else 1, "size": size,
-            "otype": otype, "basket": basket,
+            "otype": otype, "basket": basket, "limit_price": limit_price,
+            "fxlast": fxlast,
             #  None is a real value here: a target still working has no t_end
             "t_gen": _td(t_gen),
             "t_start": _td(t_start), "t_end": _td(t_end),
@@ -1340,12 +1481,15 @@ def _td(ms):
     return None if ms is None else dt.timedelta(milliseconds=ms)
 
 
-def _wo(idw, idt, make, d=None, srv=1, gen=None, off=None):
+def _wo(idw, idt, make, d=None, srv=1, gen=None, off=None, fill=0.0,
+        tx=None, bid=0.0, ask=0.0):
     """gen is when the split was CREATED, off when it left the book.  Both
     are None on a split that never reached the market, which is a real row.
     """
     return {"date": d, "id_server": srv, "id_work": idw, "id_target": idt,
-            "make": make, "t_gen": _td(gen), "t_off_market": _td(off)}
+            "make": make, "t_gen": _td(gen), "t_off_market": _td(off),
+            "avg_fill_price": fill, "t_transmit": _td(tx),
+            "transmit_bidprice": bid, "transmit_askprice": ask}
 
 
 def _ts(idt, at, state="cancelled", d=None, srv=1):
@@ -1366,6 +1510,12 @@ def _lim(sym, start, end, price=100.0, ticks=50, d=None, noask=50, nobid=0,
             "ticks": ticks, "noask": noask, "nobid": nobid, "net": net}
 
 
+#  a plausible local -> USD rate per region, so the sample is not eight
+#  markets all priced as if they were dollars
+FX = {"JP": 0.0067, "KR": 0.00072, "MY": 0.22, "TH": 0.028, "ID": 0.000062,
+      "CN": 0.14, "TW": 0.031, "IN": 0.012}
+
+
 def demo_session(d=None):
     """(orders, executed, rows, totals) for one made up session."""
     H = 3_600_000
@@ -1378,24 +1528,30 @@ def demo_session(d=None):
         for _i2 in range(n):
             k += 1
             size = 20_000 + ((k * 7919) % 400) * 500
+            px = 10.0 + (k % 400) / 4.0
             #  the band, and whether we were on the side that could trade
             #  into it - both, so the page has each to show
             up, down = ((50, 0), (0, 50), (0, 0))[k % 3]
-            went_up = up > down                  # a locked one reads as down
+            #  the close sits below the band here, so a LOCKED run reads as up
+            went_up = up >= down
             fav = k % 2 == 0
             side = ("sell" if fav else "buy") if went_up else (
                 "buy" if fav else "sell")
             #  market orders among them: marketable into a limit whichever way
             #  the band went, which is why otype is on the line
             otype = "market" if k % 4 == 0 else "limit"
-            tr.append(_t(k, region, size, d=d, side=side, otype=otype))
+            #  a limit order is worth what the client said; a market order
+            #  has to be valued off the quote its first child met
+            tr.append(_t(k, region, size, d=d, side=side, otype=otype,
+                         limit_price=px if otype == "limit" else 0.0,
+                         adjclose=px * 0.9, fxlast=FX.get(region, 1.0)))
             sym = tr[-1]["sym"]
             start = 11 * H + (k % 90) * 60_000
             end = start + (25 + (k % 40)) * 60_000     # all over --min-mins
             #  a spread of directions, including LOCKED runs the book cannot
             #  call from the sides alone - all stay in scope, which is the point
-            lims.append(_lim(sym, start, end, price=10.0 + (k % 400) / 4.0,
-                             d=d, noask=up, nobid=down))
+            lims.append(_lim(sym, start, end, price=px, d=d, noask=up,
+                             nobid=down))
             #  one to three children, created inside the limit and coming
             #  off the book after it - the times the raw file reports
             done = int(size * fill)
@@ -1403,7 +1559,9 @@ def demo_session(d=None):
             for j in range(n_sp):
                 wr.append(_wo(1000 * k + j, k, done // n_sp, d=d,
                               gen=start + j * 60_000,
-                              off=start + (j + 1) * 300_000))
+                              off=start + (j + 1) * 300_000,
+                              fill=px * 0.999, tx=start + j * 60_000,
+                              bid=px * 0.999, ask=px * 1.001))
     #  an order CANCELLED BEFORE IT STARTED: its last state row is earlier
     #  than its own t_start, so it never worked and is not one of ours
     k += 1
@@ -1577,38 +1735,44 @@ def self_test() -> int:
 
     print("\nthe rollup")
     ro = to_orders([_t(1, "JP", 1000), _t(2, "JP", 3000), _t(3, "KR", 2000)])
-    ex = splits_by_order([_wo(11, 1, 400), _wo(12, 1, 300), _wo(13, 3, 500)],
-                         ro)
+    ex = splits_by_order([_wo(11, 1, 400, fill=50.0),
+                          _wo(12, 1, 300, fill=50.0),
+                          _wo(13, 3, 500, fill=50.0)], ro)
     check("a target's children are added up", ex[ro[0].key].made, 700)
     check("and counted", ex[ro[0].key].n, 2)
     rol = to_lines(ro, ex, {})
     rows = {r.code: r for r in by_region(rol)}
     check("orders are counted per region", rows["JP"].orders, 2)
-    check("quantity is summed per region", rows["JP"].order_qty, 4000)
-    check("executed is summed per region", rows["JP"].executed, 700)
-    check("completion is executed over quantity",
-          round(rows["JP"].completion, 4), 17.5)
+    check("notional ordered is summed per region",
+          rows["JP"].ordered_usd, 4000 * 100.0)
+    check("and so is what the fills really paid",
+          rows["JP"].executed_usd, 700 * 50.0)
+    check("completion is the NOTIONAL one, off the columns beside it",
+          round(rows["JP"].completion, 4),
+          round(100.0 * (700 * 50.0) / (4000 * 100.0), 4))
     check("a region with no order shows no percentage, not 0%",
           rows["TH"].completion, None)
     check("all eight regions are always there", len(by_region(rol)), 8)
     check("and always in the same order",
           [r.code for r in by_region(rol)], list(REGION_CODES))
     tot = totals(by_region(rol))
-    check("the total is the sum of the rows", (tot.orders, tot.order_qty),
-          (3, 6000))
-    check("and its completion is quantity weighted, not a mean of the rows",
-          round(tot.completion, 4), round(100.0 * 1200 / 6000, 4))
+    check("the total is the sum of the rows", (tot.orders, tot.ordered_usd),
+          (3, 6000 * 100.0))
+    check("and its completion is notional weighted, not a mean of the rows",
+          round(tot.completion, 4),
+          round(100.0 * tot.executed_usd / tot.ordered_usd, 4))
 
     print("\nfills cannot land in a region with no order")
     #  the fault that made the old report print Korea 161.9%: quantity counted
     #  off one grouping, fills off another
     mix = to_orders([_t(1, "JP", 1000)])
-    mex = splits_by_order([_wo(11, 1, 500), _wo(12, 99, 5000)], mix)
+    mex = splits_by_order([_wo(11, 1, 500, fill=10.0),
+                           _wo(12, 99, 5000, fill=10.0)], mix)
     mrows = by_region(to_lines(mix, mex, {}))
     check("a workorder whose parent is out of scope is dropped",
-          sum(r.executed for r in mrows), 500)
+          sum(r.executed_usd for r in mrows), 5000.0)
     check("no region executes what it had no order for",
-          [r.code for r in mrows if r.executed and not r.orders], [])
+          [r.code for r in mrows if r.executed_usd and not r.orders], [])
     check("and no row completes more than it asked for",
           [r.code for r in mrows
            if r.completion is not None and r.completion > 100.0], [])
@@ -1635,11 +1799,12 @@ def self_test() -> int:
           round(sum(c[1] for c in REGION_COLS), 6), 1.0)
     check("the page shows what was asked, what was done, and what came short",
           [c[0] for c in REGION_COLS],
-          ["Region", "Orders", "Order qty", "Executed", "Completion",
-           "Short, fav.", "Short, adv."])
+          ["Region", "Orders", "Notional Ordered (USD)",
+           "Notional Executed (USD)", "Completion", "Short, fav.",
+           "Short, adv."])
     check("the listing columns add up to the full width",
           round(sum(c[1] for c in ORDER_LIST_COLS), 6), 1.0)
-    tid = ORDER_LIST_COLS.index(("Target id", 0.09, True))
+    tid = ORDER_LIST_COLS.index(("Target id", 0.08, True))
     idcell = _list_cells(to_lines(
         to_orders([_t(1_105_432, "JP", 1000)]), {}, {})[0])[tid][0]
     check("a target id is an id, not a quantity - no thousands separator",
@@ -1662,12 +1827,15 @@ def self_test() -> int:
     check("the last line is the total", cr[-1][0], "Total")
     check("the csv is the SAME numbers the page drew",
           [cr[0][1], cr[0][2], cr[0][3]],
-          [drows[0].orders, drows[0].order_qty, drows[0].executed])
+          [drows[0].orders, round(drows[0].ordered_usd, 2),
+           round(drows[0].executed_usd, 2)])
     check("and it carries the two short columns too",
           [cr[0][5], cr[0][6]], [drows[0].fav_short, drows[0].adv_short])
+    check("full precision in the file, not the page's 79.2m",
+          cr[0][2], round(drows[0].ordered_usd, 2))
     check("a percentage with nothing to measure is empty, not 0.0",
-          csv_rows([Row("TH", "Thailand", 0, 0, 0)],
-                   Totals(0, 0, 0))[0][4], "")
+          csv_rows([Row("TH", "Thailand", 0, 0.0, 0.0)],
+                   Totals(0, 0.0, 0.0))[0][4], "")
     check("the demo has orders on both sides of the band",
           (dtot.fav_short > 0, dtot.adv_short > 0), (True, True))
 
@@ -1796,15 +1964,21 @@ def self_test() -> int:
           ORDER_COLS[-3:], ("splits", "split_first_gen", "split_last_off"))
     check("and the only column needing both of them is the last one",
           (BOTH_COLS, RAW_HEADER[-1]), (("overlap_mins",), "overlap_mins"))
-    qi = RAW_HEADER.index("order_qty")
-    ei = RAW_HEADER.index("executed")
-    check("the raw file adds back up to the page - quantity",
-          sum(r[qi] for r in rr), dtot.order_qty)
-    check("and executed", sum(r[ei] for r in rr), dtot.executed)
+    qi = RAW_HEADER.index("ordered_usd")
+    ei = RAW_HEADER.index("executed_usd")
+    #  each line is rounded to the cent, the page rounds the sum, so they
+    #  agree to within the rounding and not to the last digit
+    check("the raw file adds back up to the page - notional ordered",
+          abs(sum(r[qi] or 0 for r in rr) - dtot.ordered_usd) < 1.0, True)
+    check("and notional executed",
+          abs(sum(r[ei] or 0 for r in rr) - dtot.executed_usd) < 1.0, True)
     ri = RAW_HEADER.index("region")
     check("region by region too",
-          sum(r[qi] for r in rr if r[ri] == "Japan"),
-          {x.code: x for x in drows}["JP"].order_qty)
+          abs(sum(r[qi] or 0 for r in rr if r[ri] == "Japan")
+              - {x.code: x for x in drows}["JP"].ordered_usd) < 1.0, True)
+    check("and the SHARES are still on the line beside the money",
+          [RAW_HEADER.index("order_qty") < qi,
+           RAW_HEADER.index("executed") < ei], [True, True])
     check("every line names a limit period, or it would not be a line",
           [r for r in rr if not r[RAW_HEADER.index("limit_periods")]], [])
     si = RAW_HEADER.index("splits")
@@ -1829,8 +2003,15 @@ def self_test() -> int:
     check("the tick counts that decided it are on the line too",
           [RAW_HEADER[di + 1], RAW_HEADER[di + 2]],
           ["limit_noask", "limit_nobid"])
+    #  the demo's unknown line is the stock with no close on file, so it
+    #  cannot be priced either - it keeps its SHARES and contributes no money
+    qsh = RAW_HEADER.index("order_qty")
     check("an unknown direction does not cost the line its quantity",
-          sum(r[qi] for r in rr if r[di] == UNKNOWN) > 0, True)
+          sum(r[qsh] for r in rr if r[di] == UNKNOWN) > 0, True)
+    check("and an order that cannot be valued contributes no notional",
+          [r[qi] for r in rr if not r[RAW_HEADER.index("fxlast")]
+           or not r[RAW_HEADER.index("price")]], [""])
+    check("which the page counts rather than hides", dtot.unpriced, 1)
     #  one order, one period, overlapping by half an hour of the period's hour
     ro = to_orders([_t(1, "JP", 1000, t_start=11 * H + 1_800_000,
                        t_end=15 * H)])

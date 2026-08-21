@@ -24,12 +24,46 @@ bottom of this file.
 One row per region, always all eight, plus a total.
 
 ```
-Region      Orders   Order qty   Executed   Completion   Short, fav.   Short, adv.
-Japan           27   3,624,500   2,583,240        71.3%            13            13
-Korea           19   2,278,000     933,972        41.0%             9            10
+Region      Orders   Notional Ordered (USD)   Notional Executed (USD)   Completion   Short, fav.   Short, adv.
+Japan           27                   313.6k                    225.6k        71.9%            13            13
+China           22                     8.4m                      4.6m        55.0%            11            11
 ...
-Total          105  12,737,000   7,135,485        56.0%            52            52
+Total          105                    23.3m                      8.5m        36.6%            52            52
 ```
+
+### Notional, and why completion is not the share completion
+
+`size` is a **share count**, so putting an order in USD needs a price — and the
+**unfilled** part of an order never traded at one. The ladder is
+[`short_sell_report`](../short_sell_report/README.md)'s, best first:
+
+| | |
+|---|---|
+| **`limit_price`** | a limit order is worth what the client said it was worth |
+| **the quote** | a market order has no limit, so it is valued at the side we would actually have traded — the **bid** for a sell, the **ask** for a buy — as at the moment the **first child was sent** |
+| **the close** | `adjclose`, else `orgclose`. The fallback for an order that never produced a child at all — on *this* page not a rare branch, because an order that sent nothing is the thing the report exists to find |
+
+**Executed is not priced that way at all.** It is `make × the child's own
+avg_fill_price` — what those shares really cost. So **notional completion is
+not share completion**: the two sides traded at different prices, and they
+cannot be the same number.
+
+Everything is multiplied by `target_stock.fxlast`, local → USD.
+
+**An order with no price or no fx contributes nothing, and is counted.** The run
+says so, and the region CSV carries `unpriced_orders`:
+
+```
+1 of 105 orders could not be valued - no price or no fxlast - and
+contribute NOTHING to the notional columns
+```
+
+A notional that quietly omits a market is worse than one that admits a gap.
+
+`fmt_usd` prints the unit the number is actually in — `23.3m`, `765.5k`, `442` —
+because `23,263,496` is a number nobody reads. **Zero prints as a dash**: it
+means the orders could not be valued, not that they were worth nothing. The CSV
+keeps full precision, since that is the file somebody adds up.
 
 **`Short, fav.` and `Short, adv.`** count orders that **came up short** — did
 not fully execute — split by which side of the band they were on:
@@ -63,9 +97,9 @@ Behind the summary, one line per order, **28 to a page**, sorted by quantity
 missed with the ones we could have traded into first:
 
 ```
-Region     Symbol    Target id  Side  Type    Order qty  Executed  Completion  Limit    Limit window   Mins  Splits
-Indonesia  1094.IJ          94  buy   limit     213,000    61,768       29.0%  down *   11:04–11:43      39       2
-Taiwan     1105.TT         105  sell  limit      75,000         0        0.0%  up *     11:00–12:00      60       0
+Region     Symbol    Target id  Side  Type    Ordered (USD)  Executed (USD)  Completion  Limit    Limit window   Mins  Splits
+Indonesia  1094.IJ          94  buy   limit               442             128       29.0%  down *   11:04–11:43      39       2
+Taiwan     1105.TT         105  sell  limit              7.5m               —        0.0%  up *     11:00–12:00      60       0
 ```
 
 Chosen for someone deciding whether a line is a problem — what the order was,
@@ -75,6 +109,7 @@ overlapped. Everything else is in `--raw`.
 | column | what it means |
 |---|---|
 | `Target id` | the row to look up when the line needs checking. Printed with **no thousands separator** — it is an id, and `1,105,432` is not what anyone types into a query |
+| `Ordered (USD)`, `Executed (USD)` | the same notional as the summary, per order. A dash means the order could not be valued |
 | `Type` | `market` or `limit` — a market order was marketable whichever way the band went |
 | `Limit` | the direction, with a **star** when that was the side we could trade into. One column rather than two: the direction alone does not say whether it was ours to take without the side beside it, and a reader should not have to do that join by eye on every row |
 | `Limit window` | first period start to last period end. Not one continuous period when the order met several |
@@ -134,9 +169,15 @@ in the wrong block.
 | `id_server`, `id_target` | `target` | **the row this line is.** Look it up with these two and the date |
 | `tag_9604` | FIX tag 9604 in `target.fixmsg` | the client's own order id. Empty when the client sent none. Two lines sharing one are the same order re-sent — not chained here, see below |
 | `basket` | `target.basket` | what the order was sent as part of. Empty when it was sent on its own — a basket that pinned on one name will show up as several lines sharing this |
-| `order_qty` | `target.size` | what this send asked for |
-| `executed` | Σ `workorder.make` | what its children did, whatever state they ended in |
-| `completion_pct` | `executed / order_qty` | empty when there was no quantity to measure against — which is not the same as 0% |
+| `order_qty` | `target.size` | what this send asked for, in **shares** |
+| `executed` | Σ `workorder.make` | what its children did, in **shares**, whatever state they ended in |
+| `completion_pct` | `executed / order_qty` | the **share** completion. Empty when there was no quantity to measure against — which is not the same as 0% |
+| `ordered_usd` | `size × price × fxlast` | the notional, full precision. Empty when the order could not be valued |
+| `executed_usd` | Σ `make × avg_fill_price × fxlast` | what the fills really paid |
+| `notional_completion_pct` | `executed_usd / ordered_usd` | the one the page shows. Not the same number as `completion_pct` |
+| `price` | the ladder's answer | what `ordered_usd` was valued at, in local currency |
+| `price_source` | `limit` / `quote` / `close` / `none` | which rung of the ladder it came from — the column to check when a notional looks wrong |
+| `fxlast` | `target_stock.fxlast` | local → USD |
 | `t_gen` | `target.t_gen` | when the **order** was created. Not `split_first_gen`, which is the first child's |
 | `order_start`, `order_end` | `target.t_start`, `t_end` | the order's live window, `HH:MM:SS`, ready to type back into a query. **Empty end = still working** |
 
@@ -435,7 +476,7 @@ conversion anywhere. That is relied on and is not a gap.
 
 Nothing is grouped in q: a `target` row is one send and a `workorder` row is one
 child. Every sum and count happens in Python, where `--self-test` can prove it —
-144 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
+148 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
 synthetic data.
 
 ---
