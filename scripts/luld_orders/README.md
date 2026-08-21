@@ -56,7 +56,8 @@ looks wrong.
 ```
 date,region,sym,side,id_server,id_target,tag_9604,order_qty,executed,
 completion_pct,order_start,order_end,limit_periods,limit_first_start,
-limit_last_end,limit_mins,limit_price,overlap_mins
+limit_last_end,limit_mins,limit_price,limit_dir,limit_noask,limit_nobid,
+overlap_mins
 ```
 
 | column | what it is |
@@ -67,7 +68,35 @@ limit_last_end,limit_mins,limit_price,overlap_mins
 | `limit_periods` | how many qualifying periods the order was live through |
 | `limit_first_start`, `limit_last_end` | the span those periods cover |
 | `limit_mins` | how long the periods lasted, summed |
+| `limit_dir` | `up`, `down`, `unknown`, or `mixed` — see below |
+| `limit_noask`, `limit_nobid` | the tick counts `limit_dir` was decided from |
 | `overlap_mins` | how long the order and the limit actually **coexisted** — each period clipped to the order's own window |
+
+### `limit_dir`
+
+At limit up nobody will offer, so the **ask** goes missing; at limit down
+nobody bids. The direction is whichever side went away, counted across the
+**whole run** rather than read off one tick, because a pinned book flickers.
+`limit_noask` and `limit_nobid` are those counts, on the line, so the call can
+be checked rather than taken.
+
+- **`unknown`** is a real answer, not a failure. A **locked** run — bid = ask,
+  both present — has neither side missing, and the book alone cannot say which
+  band it sits at; telling those apart needs the previous close, which this
+  report does not read. An equal count cannot say either.
+- **`mixed`** means the order was live through periods that disagreed — limit
+  down in the morning, limit up in the afternoon. Picking the first would
+  quietly claim it was only that one.
+
+**Direction is reported, never filtered on.** Nothing is dropped for being
+unfavourable or for being unknown — an unfavourable limit can still be
+marketable, and a limit the book cannot call is still a limit. This is the one
+place the old `luld_report` lost data: it needed the side to decide whether a
+finding was favourable, so a period whose side was a tie was **thrown away**.
+
+Whether a limit was favourable to a given order is `side` against `limit_dir`
+— selling into `up`, or buying into `down` — and is left to whoever reads the
+file, since it is the interpretation rather than the observation.
 
 `limit_mins` and `overlap_mins` differ whenever the order arrived late or
 finished early: a 60-minute limit an order only saw the second half of is
@@ -91,7 +120,8 @@ the band, and the report never has to decide which side a period was at.
 
 That decision is what the old `luld_report` spent its `noask`/`nobid`
 comparison on — and a period whose side could not be told was **dropped**.
-Here there is no such branch and no such loss.
+Here the same evidence is still read, but only to REPORT the direction in
+`--raw`; it never decides whether an order is in scope, so nothing is lost.
 
 ---
 
@@ -228,7 +258,7 @@ conversion anywhere. That is relied on and is not a gap.
 
 Nothing is grouped in q: a `target` row is one send and a `workorder` row is one
 child. Every sum and count happens in Python, where `--self-test` can prove it —
-72 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
+86 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
 synthetic data.
 
 ---

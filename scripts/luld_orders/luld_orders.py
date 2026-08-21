@@ -195,7 +195,8 @@ Q_LIMITS = """
   / back with no limit periods, no orders in scope, and a page of zeros that
   / reads exactly like a calm market.
   syms:`$syms;
-  ep:([] sym:0#`; grp:0#0j; start:0#0Nt; end:0#0Nt; price:0#0n; ticks:0#0j);
+  ep:([] sym:0#`; grp:0#0j; start:0#0Nt; end:0#0Nt; price:0#0n; ticks:0#0j;
+         noask:0#0j; nobid:0#0j);
   / rows with nothing on either side are trade prints or pre-open gaps - they
   / would read as one sided and break a run in two
   q:$[hist;
@@ -209,8 +210,12 @@ Q_LIMITS = """
   q:update lim:((qbid=qask)&0<qbid)|((0=qbid)&0<qask)|((0=qask)&0<qbid) from q;
   / contiguous runs.  The NORMAL ticks between two runs are what separate them
   q:update grp:sums differ lim by sym from q;
+  / noask and nobid are the evidence for WHICH limit it was, counted across the
+  / whole run rather than read off one tick: at limit up nobody will offer, so
+  / the ask goes missing, and at limit down nobody bids
   0!select start:first time, end:last time,
-      price:last ?[0=qask;qbid;qask], ticks:count i
+      price:last ?[0=qask;qbid;qask], ticks:count i,
+      noask:sum 0=qask, nobid:sum 0=qbid
     by sym,grp from q where lim
   }
 """
@@ -337,18 +342,49 @@ class Order(NamedTuple):
     id_target: int
 
 
+UP, DOWN, UNKNOWN = "up", "down", "unknown"
+
+
+def direction_of(noask: int, nobid: int) -> str:
+    """Which limit a period was at, from the side of the book that went away.
+
+    At limit up nobody will offer, so the ask goes missing; at limit down
+    nobody bids.  Counted across the WHOLE run rather than read off one tick,
+    because a pinned book flickers.
+
+    UNKNOWN is a real answer and not a failure.  A LOCKED run - bid = ask, both
+    present - has neither side missing and the book alone cannot say which band
+    it sits at; telling those apart needs the previous close, which this report
+    does not read.  An equal count cannot say either.  Nothing is DROPPED for
+    being unknown: both sides count here, so direction is reported, never used
+    to decide whether an order is in scope.
+    """
+    if noask > nobid:
+        return UP
+    if nobid > noask:
+        return DOWN
+    return UNKNOWN
+
+
 class Limit(NamedTuple):
-    """ONE LIMIT PERIOD on one stock.  No side: both count."""
+    """ONE LIMIT PERIOD on one stock.  Its direction is reported, not filtered
+    on: an unfavourable limit can still be marketable."""
     sym: str
     date: Optional[dt.date]
     start: int
     end: int
     price: float
     ticks: int
+    noask: int = 0
+    nobid: int = 0
 
     @property
     def minutes(self) -> float:
         return (self.end - self.start) / 60_000.0
+
+    @property
+    def direction(self) -> str:
+        return direction_of(self.noask, self.nobid)
 
 
 def to_orders(records) -> list:
@@ -405,7 +441,8 @@ def to_limits(records, d=None, min_mins=MIN_LIMIT_MINS) -> list:
             price = 0.0
         lim = Limit(sym=_s(r.get("sym")), date=_d(r.get("date")) or d,
                     start=start, end=end, price=price,
-                    ticks=_i(r.get("ticks")))
+                    ticks=_i(r.get("ticks")), noask=_i(r.get("noask")),
+                    nobid=_i(r.get("nobid")))
         if lim.minutes < min_mins:
             continue
         out.append(lim)
@@ -645,8 +682,23 @@ RAW_HEADER = (
     "date", "region", "sym", "side", "id_server", "id_target", "tag_9604",
     "order_qty", "executed", "completion_pct", "order_start", "order_end",
     "limit_periods", "limit_first_start", "limit_last_end", "limit_mins",
-    "limit_price", "overlap_mins",
+    "limit_price", "limit_dir", "limit_noask", "limit_nobid", "overlap_mins",
 )
+
+
+def line_direction(periods) -> str:
+    """One direction for a line that may cover several periods.
+
+    `mixed` when they disagree - a stock that was limit down in the morning and
+    limit up in the afternoon is not one or the other, and picking the first
+    would quietly say it was.
+    """
+    if not periods:
+        return ""
+    got = {w.direction for w in periods}
+    if len(got) == 1:
+        return got.pop()
+    return "mixed"
 
 
 def _hms(ms) -> str:
@@ -690,6 +742,8 @@ def raw_rows(orders, executed, hits) -> list:
             _hms(got[-1].end) if got else "",
             f"{sum(w.minutes for w in got):.1f}" if got else "",
             f"{got[0].price:g}" if got else "",
+            line_direction(got),
+            sum(w.noask for w in got), sum(w.nobid for w in got),
             f"{overlap_mins(o, got):.1f}",
         ])
     return out
@@ -856,10 +910,11 @@ def _wo(idw, idt, make, d=None, srv=1):
             "make": make}
 
 
-def _lim(sym, start, end, price=100.0, ticks=50, d=None):
+def _lim(sym, start, end, price=100.0, ticks=50, d=None, noask=50, nobid=0):
+    """Default is a limit UP: the ask is the side that went missing."""
     return {"sym": sym, "date": d, "start": dt.timedelta(milliseconds=start),
             "end": dt.timedelta(milliseconds=end), "price": price,
-            "ticks": ticks}
+            "ticks": ticks, "noask": noask, "nobid": nobid}
 
 
 def demo_session(d=None):
@@ -879,8 +934,11 @@ def demo_session(d=None):
             sym = tr[-1]["sym"]
             start = 11 * H + (k % 90) * 60_000
             end = start + (25 + (k % 40)) * 60_000     # all over --min-mins
+            #  a spread of directions, including LOCKED runs the book cannot
+            #  call - all of them stay in scope, which is the point
+            up, down = ((50, 0), (0, 50), (0, 0))[k % 3]
             lims.append(_lim(sym, start, end, price=10.0 + (k % 400) / 4.0,
-                             d=d))
+                             d=d, noask=up, nobid=down))
             wr.append(_wo(k, k, int(size * fill), d=d))
     #  one stock that only blipped: under the minimum, so its order is out
     k += 1
@@ -1075,6 +1133,32 @@ def self_test() -> int:
           csv_rows([Row("TH", "Thailand", 0, 0, 0)],
                    Totals(0, 0, 0))[0][4], "")
 
+    print("\nwhich limit it was")
+    check("no ask means nobody will offer: limit up", direction_of(60, 0), UP)
+    check("no bid means limit down", direction_of(0, 60), DOWN)
+    check("a locked run has neither side missing and cannot be called",
+          direction_of(0, 0), UNKNOWN)
+    check("nor can an equal count", direction_of(30, 30), UNKNOWN)
+    check("it is the run that decides, not the last tick",
+          direction_of(59, 1), UP)
+    check("a period carries its own direction",
+          to_limits([_lim("7203.JP", 11 * H, 12 * H, noask=0,
+                          nobid=60)])[0].direction, DOWN)
+    #  unknown is REPORTED, never dropped - the old report threw these away
+    unk = to_orders([_t(1, "JP", 1000, t_start=9 * H, t_end=15 * H)])
+    ul = to_limits([_lim(unk[0].sym, 11 * H, 12 * H, noask=0, nobid=0)])
+    check("a period the book cannot call still puts its order in scope",
+          len(touched(unk, ul)[0]), 1)
+    check("one line, several periods, one answer",
+          line_direction(to_limits([_lim("a", 10 * H, 11 * H, noask=9),
+                                    _lim("a", 12 * H, 13 * H, noask=9)])), UP)
+    check("and `mixed` when they disagree, never the first one silently",
+          line_direction(to_limits([_lim("a", 10 * H, 11 * H, noask=9,
+                                         nobid=0),
+                                    _lim("a", 12 * H, 13 * H, noask=0,
+                                         nobid=9)])), "mixed")
+    check("no period at all is empty, not a direction", line_direction([]), "")
+
     print("\nthe raw rows")
     rr = raw_rows(dorders, dex, dhits)
     check("a line per order in scope, and no more", len(rr), dtot.orders)
@@ -1090,6 +1174,16 @@ def self_test() -> int:
           {x.code: x for x in drows}["JP"].order_qty)
     check("every line names a limit period, or it would not be a line",
           [r for r in rr if not r[RAW_HEADER.index("limit_periods")]], [])
+    di = RAW_HEADER.index("limit_dir")
+    check("every line says which limit it was, unknown included",
+          sorted({r[di] for r in rr}), [DOWN, UNKNOWN, UP])
+    check("and none of them is blank",
+          [r for r in rr if not r[di]], [])
+    check("the tick counts that decided it are on the line too",
+          [RAW_HEADER[di + 1], RAW_HEADER[di + 2]],
+          ["limit_noask", "limit_nobid"])
+    check("an unknown direction does not cost the line its quantity",
+          sum(r[qi] for r in rr if r[di] == UNKNOWN) > 0, True)
     #  one order, one period, overlapping by half an hour of the period's hour
     ro = to_orders([_t(1, "JP", 1000, t_start=11 * H + 1_800_000,
                        t_end=15 * H)])
