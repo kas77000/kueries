@@ -24,12 +24,30 @@ bottom of this file.
 One row per region, always all eight, plus a total.
 
 ```
-Region      Orders   Order qty   Executed   Completion
-Japan           26   3,504,500   2,523,240        72.0%
-Korea           19   2,278,000     933,977        41.0%
+Region      Orders   Order qty   Executed   Completion   Short, fav.   Short, adv.
+Japan           27   3,624,500   2,583,240        71.3%            13            13
+Korea           19   2,278,000     933,972        41.0%             9            10
 ...
-Total          103  12,542,000   7,075,504        56.4%
+Total          105  12,737,000   7,135,485        56.0%            52            52
 ```
+
+**`Short, fav.` and `Short, adv.`** count orders that **came up short** — did
+not fully execute — split by which side of the band they were on:
+
+| | |
+|---|---|
+| **Short, fav.** | the band was on the side we could trade into: **selling into a limit up**, or **buying into a limit down**. There was a queue resting at the band and we were the other side of it, and we still did not finish. This is the column to read first, and it is red when it is not zero |
+| **Short, adv.** | the same on the other side. **Not an excuse** — a market order is marketable into a band either way, which is why it is on the page rather than filtered out |
+
+Neither counts an order the book could not call: a `limit_dir` of `unknown` or
+`mixed` is in **neither** column, because an order nobody can classify is not
+an order that was on the wrong side. The two therefore need not add up to the
+incomplete orders in the row, and that gap is the size of what the close could
+not settle.
+
+*Short* is the trading sense — the order came up short of what it asked for —
+and both count **orders**, not quantity. "Came up short" is deliberate: an
+order that finished is not in either column however unfavourable the band was.
 
 **Completion is quantity weighted** — summed executed over summed order
 quantity, both for a row and for the total. Not a mean of the rows: a region
@@ -38,6 +56,37 @@ four hundred.
 
 A region with no order shows an **em dash, not 0%**. Nothing to measure against
 is a different statement from nothing done.
+
+### Page 2 onwards — every order at a limit
+
+Behind the summary, one line per order, **28 to a page**, sorted by quantity
+missed with the ones we could have traded into first:
+
+```
+Region     Symbol    Target id  Side  Type    Order qty  Executed  Completion  Limit    Limit window   Mins  Splits
+Indonesia  1094.IJ          94  buy   limit     213,000    61,768       29.0%  down *   11:04–11:43      39       2
+Taiwan     1105.TT         105  sell  limit      75,000         0        0.0%  up *     11:00–12:00      60       0
+```
+
+Chosen for someone deciding whether a line is a problem — what the order was,
+how much of it got done, what the book was doing, and how long the two
+overlapped. Everything else is in `--raw`.
+
+| column | what it means |
+|---|---|
+| `Target id` | the row to look up when the line needs checking |
+| `Type` | `market` or `limit` — a market order was marketable whichever way the band went |
+| `Limit` | the direction, with a **star** when that was the side we could trade into. One column rather than two: the direction alone does not say whether it was ours to take without the side beside it, and a reader should not have to do that join by eye on every row |
+| `Limit window` | first period start to last period end. Not one continuous period when the order met several |
+| `Mins` | how long the order and the limit actually **overlapped** — not how long the stock was pinned |
+| `Splits` | how many children the order sent. **Zero is red**: it never tried |
+
+`Completion` is red where the order came up short *and* the band was
+favourable — the same test as `Short, fav.` on the summary, so a count there
+and the lines under it cannot disagree.
+
+Nothing is truncated: every order in scope is on one of these pages, and the
+run logs how many pages it took.
 
 Written to `--out-dir` as a PDF and a PNG. `--csv` writes the same rows beside
 it as `luld_orders_<stamp>.csv` — built from **the same `Row` objects the page
@@ -386,7 +435,7 @@ conversion anywhere. That is relied on and is not a gap.
 
 Nothing is grouped in q: a `target` row is one send and a `workorder` row is one
 child. Every sum and count happens in Python, where `--self-test` can prove it —
-138 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
+143 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
 synthetic data.
 
 ---

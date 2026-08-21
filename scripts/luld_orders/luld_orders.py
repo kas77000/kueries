@@ -68,8 +68,8 @@ from lib.order_chains import CLIENT_ID_TAG, fix_tag             # noqa: E402
 from lib.q_lint import (                                        # noqa: E402
     balanced, groups_in_q, reserved_used, uncast_symbols)
 from lib.report_page import (                                   # noqa: E402
-    GREEN, INK, INK2, INK3, L, figure, fmt_int, fmt_pct1, footer, heading,
-    kpis, log, save, table)
+    DASH, GREEN, INK, INK2, INK3, L, RED, figure, fmt_hm, fmt_int, fmt_pct1,
+    footer, heading, kpis, log, save, table)
 
 # -----------------------------------------------------------------------------
 # CONNECTIONS.  Edit these, or put them in a local_settings.py beside this
@@ -674,6 +674,79 @@ def touched(orders, limits) -> tuple:
 
 
 # =============================================================================
+# ONE RECORD PER LINE
+# =============================================================================
+
+def favourable_for(side: str, direction: str) -> Optional[bool]:
+    """Was the band on the side we could have traded into?
+
+    SELLING into a limit UP, or BUYING into a limit DOWN: there is a queue
+    resting at the band and we are the other side of it.
+
+    None where it cannot be said - a direction the book could not call, an
+    order live through periods that went both ways, or a side the feed did
+    not send.  None is NOT False: an order nobody can classify is not an
+    order that was on the wrong side, and counting it as one would put a
+    number on the page that no line supports.
+
+    Adverse is not an excuse and is never a filter.  A market order is
+    marketable into a band on either side, which is the whole reason both
+    are counted and shown next to each other.
+    """
+    sd = (side or "").strip().lower()
+    if direction == UP and sd == "sell":
+        return True
+    if direction == DOWN and sd == "buy":
+        return True
+    if direction in (UP, DOWN) and sd in ("buy", "sell"):
+        return False
+    return None
+
+
+class Line(NamedTuple):
+    """One order in scope, with everything already worked out.
+
+    The region table, the order listing and the raw file are all built from
+    these, so the count on the page and the line under it cannot disagree
+    about whether an order was favourable or whether it finished.
+    """
+    o: Order
+    sp: Splits
+    periods: tuple
+    direction: str
+    favourable: Optional[bool]
+
+    @property
+    def executed(self) -> int:
+        return self.sp.made
+
+    @property
+    def completion(self) -> Optional[float]:
+        return _completion(self.executed, self.o.size)
+
+    @property
+    def unfilled(self) -> int:
+        return max(0, self.o.size - self.executed)
+
+    @property
+    def incomplete(self) -> bool:
+        """Did it fail to finish?  Quantity, not percentage: an order
+        showing 100.0% on a rounded figure still has quantity left."""
+        return self.o.size > 0 and self.executed < self.o.size
+
+
+def to_lines(orders, splits, hits) -> list:
+    """One Line per order, in the order the report counted them."""
+    out = []
+    for o in orders:
+        got = tuple(sorted(hits.get(o.key, ()), key=lambda w: w.start))
+        d = line_direction(got, o.ref)
+        out.append(Line(o, splits.get(o.key, Splits()), got, d,
+                        favourable_for(o.side, d)))
+    return out
+
+
+# =============================================================================
 # ROLLUP
 # =============================================================================
 
@@ -690,6 +763,8 @@ class Row(NamedTuple):
     orders: int
     order_qty: int
     executed: int
+    fav_short: int = 0        # favourable band, and still did not finish
+    adv_short: int = 0        # adverse band, and still did not finish
 
     @property
     def completion(self) -> Optional[float]:
@@ -700,13 +775,15 @@ class Totals(NamedTuple):
     orders: int
     order_qty: int
     executed: int
+    fav_short: int = 0
+    adv_short: int = 0
 
     @property
     def completion(self) -> Optional[float]:
         return _completion(self.executed, self.order_qty)
 
 
-def by_region(orders, splits) -> list:
+def by_region(lines) -> list:
     """One Row per region, always all eight, always in REGIONS order.
 
     An order's quantity and its fills are counted into the SAME region - the
@@ -715,19 +792,28 @@ def by_region(orders, splits) -> list:
     n = {c: 0 for c in REGION_CODES}
     qty = {c: 0 for c in REGION_CODES}
     made = {c: 0 for c in REGION_CODES}
-    for o in orders:
-        n[o.region] += 1
-        qty[o.region] += o.size
-        made[o.region] += made_of(splits, o.key)
-    return [Row(r.code, r.name, n[r.code], qty[r.code], made[r.code])
-            for r in REGIONS]
+    fav = {c: 0 for c in REGION_CODES}
+    adv = {c: 0 for c in REGION_CODES}
+    for ln in lines:
+        c = ln.o.region
+        n[c] += 1
+        qty[c] += ln.o.size
+        made[c] += ln.executed
+        if ln.incomplete and ln.favourable is True:
+            fav[c] += 1
+        elif ln.incomplete and ln.favourable is False:
+            adv[c] += 1
+    return [Row(r.code, r.name, n[r.code], qty[r.code], made[r.code],
+                fav[r.code], adv[r.code]) for r in REGIONS]
 
 
 def totals(rows) -> Totals:
     """The headline.  Completion is summed executed over summed order qty, so
     it is the same ratio the rows are, not an average of percentages."""
     return Totals(sum(r.orders for r in rows), sum(r.order_qty for r in rows),
-                  sum(r.executed for r in rows))
+                  sum(r.executed for r in rows),
+                  sum(r.fav_short for r in rows),
+                  sum(r.adv_short for r in rows))
 
 
 def shared_ids(orders) -> tuple:
@@ -756,12 +842,19 @@ TITLE = "Orders at a Limit"
 Y_TITLE, Y_SUBTITLE, Y_RULE_TOP = 0.955, 0.931, 0.9185
 Y_RULE_BOTTOM, Y_FOOTER = 0.066, 0.048
 
+#  "Short" is the trading sense of the word - the order came up short of
+#  what it asked for - and it counts ORDERS, not quantity.  Favourable and
+#  adverse sit next to each other because neither is the whole story: the
+#  first is the one we could have traded into, the second is still a
+#  question whenever the order was marketable anyway.
 REGION_COLS = (
-    ("Region", 0.30, False),
-    ("Orders", 0.15, True),
-    ("Order qty", 0.20, True),
-    ("Executed", 0.20, True),
-    ("Completion", 0.15, True),
+    ("Region", 0.22, False),
+    ("Orders", 0.10, True),
+    ("Order qty", 0.15, True),
+    ("Executed", 0.15, True),
+    ("Completion", 0.12, True),
+    ("Short, fav.", 0.13, True),
+    ("Short, adv.", 0.13, True),
 )
 
 
@@ -770,7 +863,10 @@ def _row_cells(r):
             (fmt_int(r.orders), INK if r.orders else INK3, "normal"),
             (fmt_int(r.order_qty), INK if r.orders else INK3, "normal"),
             (fmt_int(r.executed), INK if r.orders else INK3, "normal"),
-            (fmt_pct1(r.completion), INK, "bold")]
+            (fmt_pct1(r.completion), INK, "bold"),
+            (fmt_int(r.fav_short), RED if r.fav_short else INK3,
+             "bold" if r.fav_short else "normal"),
+            (fmt_int(r.adv_short), INK if r.adv_short else INK3, "normal")]
 
 
 def draw(rows, tot, subtitle, foot, note=""):
@@ -795,8 +891,19 @@ def draw(rows, tot, subtitle, foot, note=""):
              va="baseline")
     _total_line(fig, tot, y - 0.026)
 
+    fig.text(L, y - 0.062,
+             "Short, fav. — orders that did not fully execute while the "
+             "band was on the side we could trade into (selling into a limit "
+             "up, buying into a limit down).",
+             fontsize=7.5, color=INK2, va="baseline")
+    fig.text(L, y - 0.080,
+             "Short, adv. — the same on the other side. Not an excuse: a "
+             "market order is marketable into a band either way. Orders the "
+             "book could not call are in neither.",
+             fontsize=7.5, color=INK2, va="baseline")
     if note:
-        fig.text(L, y - 0.070, note, fontsize=7.5, color=INK3, va="baseline")
+        fig.text(L, y - 0.104, note, fontsize=7.5, color=INK3,
+                 va="baseline")
 
     footer(fig, foot, Y_RULE_BOTTOM, Y_FOOTER)
     return fig
@@ -810,7 +917,8 @@ def _total_line(fig, tot, y):
     for (label, frac, right), text in zip(
             REGION_COLS,
             ["", fmt_int(tot.orders), fmt_int(tot.order_qty),
-             fmt_int(tot.executed), fmt_pct1(tot.completion)]):
+             fmt_int(tot.executed), fmt_pct1(tot.completion),
+             fmt_int(tot.fav_short), fmt_int(tot.adv_short)]):
         w = frac * (R - L)
         if text:
             fig.text(x + w - 0.008, y, text, ha="right", va="baseline",
@@ -818,15 +926,112 @@ def _total_line(fig, tot, y):
         x += w
 
 
-def pages_for(rows, tot, subtitle, foot, note=""):
-    return [draw(rows, tot, subtitle, foot, note)]
+#  The listing.  Chosen for someone who has to decide whether a line is a
+#  problem: what it was, how much of it got done, what the book was doing,
+#  and how long the two overlapped.  Everything else is in --raw.
+ORDER_LIST_COLS = (
+    ("Region", 0.10, False),
+    ("Symbol", 0.12, False),
+    ("Target id", 0.09, True),
+    ("Side", 0.05, False),
+    ("Type", 0.06, False),
+    ("Order qty", 0.09, True),
+    ("Executed", 0.09, True),
+    ("Completion", 0.09, True),
+    ("Limit", 0.07, False),
+    ("Limit window", 0.14, False),
+    ("Mins", 0.05, True),
+    ("Splits", 0.05, True),
+)
+
+ROWS_PER_LIST_PAGE = 28
+
+
+def _list_cells(ln):
+    w = ln.periods
+    fav = ln.favourable
+    #  the two that matter are read together: how little got done, and
+    #  whether the band was on our side while it did not
+    comp_ink = RED if (ln.incomplete and fav is True) else INK
+    return [
+        (REGION_NAME[ln.o.region], INK, "normal"),
+        (ln.o.sym, INK, "normal"),
+        (fmt_int(ln.o.id_target), INK2, "normal"),
+        (ln.o.side or DASH, INK, "normal"),
+        (ln.o.otype or DASH, INK2, "normal"),
+        (fmt_int(ln.o.size), INK, "normal"),
+        (fmt_int(ln.executed), INK, "normal"),
+        (fmt_pct1(ln.completion), comp_ink, "bold"),
+        (_dir_label(ln), INK if fav is True else INK2, "normal"),
+        (f"{fmt_hm(w[0].start)}–{fmt_hm(w[-1].end)}" if w else DASH,
+         INK2, "normal"),
+        (f"{overlap_mins(ln.o, w):.0f}", INK, "normal"),
+        (fmt_int(ln.sp.n), INK if ln.sp.n else RED,
+         "normal" if ln.sp.n else "bold"),
+    ]
+
+
+def _dir_label(ln) -> str:
+    """up / down, and a star when that was the side we could trade into.
+
+    One column rather than two: the direction alone does not say whether it
+    was ours to take without the side beside it, and a reader should not
+    have to do that join by eye on every row.
+    """
+    if not ln.periods:
+        return DASH
+    return ln.direction + (" *" if ln.favourable is True else "")
+
+
+def list_order(lines) -> list:
+    """Worst first: the ones we could have traded into and did not
+    finish, biggest quantity missed at the top."""
+    return sorted(lines,
+                  key=lambda ln: (ln.incomplete and ln.favourable is True,
+                                  ln.unfilled, ln.o.size),
+                  reverse=True)
+
+
+def draw_orders(lines, subtitle, foot, page=1, pages=1):
+    """One page of the order listing."""
+    fig = figure()
+    heading(fig, TITLE, subtitle, Y_TITLE, Y_SUBTITLE, Y_RULE_TOP)
+    head = "Every order at a limit"
+    if pages > 1:
+        head += f"   ({page} of {pages})"
+    fig.text(L, 0.893, head, fontsize=12, fontweight="bold", color=INK,
+             va="baseline")
+    fig.text(L, 0.874,
+             "Sorted by quantity missed, the ones we could have traded into "
+             "first — a star on the limit marks those.",
+             fontsize=8, color=INK2, va="baseline")
+    fig.text(L, 0.858,
+             "Mins is how long the order and the limit overlapped. Splits is "
+             "how many children the order sent: zero means it never tried.",
+             fontsize=8, color=INK2, va="baseline")
+    table(fig, ORDER_LIST_COLS, [_list_cells(ln) for ln in lines], 0.833,
+          0.0245, fs=7.5, head_fs=7.5)
+    footer(fig, foot, Y_RULE_BOTTOM, Y_FOOTER)
+    return fig
+
+
+def pages_for(rows, tot, subtitle, foot, note="", lines=()):
+    """The summary, then every order that made it."""
+    out = [draw(rows, tot, subtitle, foot, note)]
+    got = list_order(lines)
+    n = max(1, -(-len(got) // ROWS_PER_LIST_PAGE)) if got else 0
+    for i in range(n):
+        chunk = got[i * ROWS_PER_LIST_PAGE:(i + 1) * ROWS_PER_LIST_PAGE]
+        out.append(draw_orders(chunk, subtitle, foot, i + 1, n))
+    return out
 
 
 # =============================================================================
 # CSV
 # =============================================================================
 
-CSV_HEADER = ("region", "orders", "order_qty", "executed", "completion_pct")
+CSV_HEADER = ("region", "orders", "order_qty", "executed", "completion_pct",
+              "short_favourable", "short_adverse")
 
 
 def csv_rows(rows, tot) -> list:
@@ -835,7 +1040,8 @@ def csv_rows(rows, tot) -> list:
     keep in step."""
     def one(name, r):
         return [name, r.orders, r.order_qty, r.executed,
-                "" if r.completion is None else f"{r.completion:.1f}"]
+                "" if r.completion is None else f"{r.completion:.1f}",
+                r.fav_short, r.adv_short]
     out = [one(r.name, r) for r in rows]
     out.append(one("Total", tot))
     return out
@@ -926,14 +1132,13 @@ def overlap_mins(o, periods) -> float:
     return total / 60_000.0
 
 
-def raw_rows(orders, splits, hits) -> list:
+def raw_rows(lines) -> list:
     """One row per order in scope, in the order the report counted them."""
     out = []
-    for o in orders:
-        got = sorted(hits.get(o.key, ()), key=lambda w: w.start)
-        sp = splits.get(o.key, Splits())
-        ex = sp.made
-        comp = _completion(ex, o.size)
+    for ln in lines:
+        o, sp, got = ln.o, ln.sp, ln.periods
+        ex = ln.executed
+        comp = ln.completion
         out.append([
             #  ORDER_COLS - what we did
             o.date.isoformat() if o.date else "",
@@ -950,7 +1155,7 @@ def raw_rows(orders, splits, hits) -> list:
             f"{got[0].price:g}" if got else "",
             f"{o.ref:g}" if o.ref else "",
             _pct(pct_from_close(got[0].price, o.ref)) if got else "",
-            line_direction(got, o.ref),
+            ln.direction,
             sum(w.noask for w in got), sum(w.nobid for w in got),
             f"{got[0].net:g}" if got and got[0].net else "",
             "yes" if got and all(w.locked for w in got) else "no",
@@ -960,14 +1165,14 @@ def raw_rows(orders, splits, hits) -> list:
     return out
 
 
-def write_raw(orders, executed, hits, out_dir, stem) -> Path:
+def write_raw(lines, out_dir, stem) -> Path:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     path = out / f"{stem}_raw.csv"
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(RAW_HEADER)
-        w.writerows(raw_rows(orders, executed, hits))
+        w.writerows(raw_rows(lines))
     log(f"  wrote {path}")
     return path
 
@@ -1063,7 +1268,8 @@ def run(args) -> int:
         hits.update(day_hits)
         executed.update(splits_by_order(wr, kept))
 
-    rows = by_region(orders, executed)
+    lines = to_lines(orders, executed, hits)
+    rows = by_region(lines)
     tot = totals(rows)
 
     if cancelled:
@@ -1089,12 +1295,15 @@ def run(args) -> int:
                 f"counted once per send.")
 
     stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
-    figs = pages_for(rows, tot, pl.subtitle, f"Generated {stamp}", note)
+    figs = pages_for(rows, tot, pl.subtitle, f"Generated {stamp}", note,
+                     lines)
+    if len(figs) > 2:
+        log(f"  the order listing runs to {len(figs) - 1} pages")
     save(figs, args.out_dir, pl.stem, dpi=DPI)
     if args.csv:
         write_csv(rows, tot, args.out_dir, pl.stem)
     if args.raw:
-        write_raw(orders, executed, hits, args.out_dir, pl.stem)
+        write_raw(lines, args.out_dir, pl.stem)
     return 0
 
 
@@ -1167,7 +1376,13 @@ def demo_session(d=None):
         for _i2 in range(n):
             k += 1
             size = 20_000 + ((k * 7919) % 400) * 500
-            side = "sell" if (k % 3) else "buy"
+            #  the band, and whether we were on the side that could trade
+            #  into it - both, so the page has each to show
+            up, down = ((50, 0), (0, 50), (0, 0))[k % 3]
+            went_up = up > down                  # a locked one reads as down
+            fav = k % 2 == 0
+            side = ("sell" if fav else "buy") if went_up else (
+                "buy" if fav else "sell")
             #  market orders among them: marketable into a limit whichever way
             #  the band went, which is why otype is on the line
             otype = "market" if k % 4 == 0 else "limit"
@@ -1176,8 +1391,7 @@ def demo_session(d=None):
             start = 11 * H + (k % 90) * 60_000
             end = start + (25 + (k % 40)) * 60_000     # all over --min-mins
             #  a spread of directions, including LOCKED runs the book cannot
-            #  call - all of them stay in scope, which is the point
-            up, down = ((50, 0), (0, 50), (0, 0))[k % 3]
+            #  call from the sides alone - all stay in scope, which is the point
             lims.append(_lim(sym, start, end, price=10.0 + (k % 400) / 4.0,
                              d=d, noask=up, nobid=down))
             #  one to three children, created inside the limit and coming
@@ -1222,18 +1436,19 @@ def demo_session(d=None):
                                          last_state_by_order(sr, orders))
     kept, hits = touched(orders, to_limits(lims, d))
     ex = splits_by_order(wr, kept)
-    rows = by_region(kept, ex)
-    return kept, ex, hits, rows, totals(rows)
+    lines = to_lines(kept, ex, hits)
+    rows = by_region(lines)
+    return lines, rows, totals(rows)
 
 
 def demo(out_dir, want_csv=True) -> int:
-    orders, ex, hits, rows, tot = demo_session()
+    lines, rows, tot = demo_session()
     figs = pages_for(rows, tot, "By region  ·  SAMPLE",
-                     "SAMPLE - synthetic data, not from kdb")
+                     "SAMPLE - synthetic data, not from kdb", "", lines)
     save(figs, out_dir, "luld_orders_SAMPLE", dpi=DPI)
     if want_csv:
         write_csv(rows, tot, out_dir, "luld_orders_SAMPLE")
-        write_raw(orders, ex, hits, out_dir, "luld_orders_SAMPLE")
+        write_raw(lines, out_dir, "luld_orders_SAMPLE")
     log("  these are made up numbers - do not circulate them as a report")
     return 0
 
@@ -1364,7 +1579,8 @@ def self_test() -> int:
                          ro)
     check("a target's children are added up", ex[ro[0].key].made, 700)
     check("and counted", ex[ro[0].key].n, 2)
-    rows = {r.code: r for r in by_region(ro, ex)}
+    rol = to_lines(ro, ex, {})
+    rows = {r.code: r for r in by_region(rol)}
     check("orders are counted per region", rows["JP"].orders, 2)
     check("quantity is summed per region", rows["JP"].order_qty, 4000)
     check("executed is summed per region", rows["JP"].executed, 700)
@@ -1372,10 +1588,10 @@ def self_test() -> int:
           round(rows["JP"].completion, 4), 17.5)
     check("a region with no order shows no percentage, not 0%",
           rows["TH"].completion, None)
-    check("all eight regions are always there", len(by_region(ro, ex)), 8)
+    check("all eight regions are always there", len(by_region(rol)), 8)
     check("and always in the same order",
-          [r.code for r in by_region(ro, ex)], list(REGION_CODES))
-    tot = totals(by_region(ro, ex))
+          [r.code for r in by_region(rol)], list(REGION_CODES))
+    tot = totals(by_region(rol))
     check("the total is the sum of the rows", (tot.orders, tot.order_qty),
           (3, 6000))
     check("and its completion is quantity weighted, not a mean of the rows",
@@ -1386,7 +1602,7 @@ def self_test() -> int:
     #  off one grouping, fills off another
     mix = to_orders([_t(1, "JP", 1000)])
     mex = splits_by_order([_wo(11, 1, 500), _wo(12, 99, 5000)], mix)
-    mrows = by_region(mix, mex)
+    mrows = by_region(to_lines(mix, mex, {}))
     check("a workorder whose parent is out of scope is dropped",
           sum(r.executed for r in mrows), 500)
     check("no region executes what it had no order for",
@@ -1404,7 +1620,7 @@ def self_test() -> int:
           sh[0].client_id, "ONE")
 
     print("\nthe page")
-    dorders, dex, dhits, drows, dtot = demo_session()
+    dlines, drows, dtot = demo_session()
     check("the demo has orders in every region",
           [r.code for r in drows if not r.orders], [])
     #  103 shaped orders, plus the locked one with no close on file and the
@@ -1415,11 +1631,19 @@ def self_test() -> int:
           dtot.orders, 103 + 2)
     check("the columns add up to the full width",
           round(sum(c[1] for c in REGION_COLS), 6), 1.0)
-    check("the page shows what was asked and what was done",
+    check("the page shows what was asked, what was done, and what came short",
           [c[0] for c in REGION_COLS],
-          ["Region", "Orders", "Order qty", "Executed", "Completion"])
+          ["Region", "Orders", "Order qty", "Executed", "Completion",
+           "Short, fav.", "Short, adv."])
+    check("the listing columns add up to the full width",
+          round(sum(c[1] for c in ORDER_LIST_COLS), 6), 1.0)
     figs = pages_for(drows, dtot, "By region  ·  x", "Generated  ·  x")
-    check("it is one page", len(figs), 1)
+    check("the summary alone is one page", len(figs), 1)
+    withl = pages_for(drows, dtot, "x", "y", "", dlines)
+    check("and the listing paginates behind it",
+          len(withl), 1 + -(-dtot.orders // ROWS_PER_LIST_PAGE))
+    check("every order in scope is on one of those pages, none dropped",
+          len(list_order(dlines)), dtot.orders)
     buf = io.BytesIO()
     figs[0].savefig(buf, format="pdf")
     check("and it renders", buf.getvalue()[:5], b"%PDF-")
@@ -1432,9 +1656,13 @@ def self_test() -> int:
     check("the csv is the SAME numbers the page drew",
           [cr[0][1], cr[0][2], cr[0][3]],
           [drows[0].orders, drows[0].order_qty, drows[0].executed])
+    check("and it carries the two short columns too",
+          [cr[0][5], cr[0][6]], [drows[0].fav_short, drows[0].adv_short])
     check("a percentage with nothing to measure is empty, not 0.0",
           csv_rows([Row("TH", "Thailand", 0, 0, 0)],
                    Totals(0, 0, 0))[0][4], "")
+    check("the demo has orders on both sides of the band",
+          (dtot.fav_short > 0, dtot.adv_short > 0), (True, True))
 
     print("\nwhich limit it was")
     check("no ask means nobody will offer: limit up", direction_of(60, 0), UP)
@@ -1544,7 +1772,7 @@ def self_test() -> int:
           made_of({}, (None, 1, 1)), 0)
 
     print("\nthe raw rows")
-    rr = raw_rows(dorders, dex, dhits)
+    rr = raw_rows(dlines)
     check("a line per order in scope, and no more", len(rr), dtot.orders)
     check("the header names every column", len(RAW_HEADER), len(rr[0]))
     check("ours first, the market's second, both last",
@@ -1601,7 +1829,8 @@ def self_test() -> int:
                        t_end=15 * H)])
     rw = to_limits([_lim(ro[0].sym, 11 * H, 12 * H)], min_mins=0.0)
     rk, rh = touched(ro, rw)
-    one = raw_rows(rk, splits_by_order([_wo(9, 1, 250)], rk), rh)[0]
+    one = raw_rows(to_lines(rk, splits_by_order([_wo(9, 1, 250)], rk),
+                            rh))[0]
     check("the limit period is 60 minutes",
           one[RAW_HEADER.index("limit_mins")], "60.0")
     check("but the order was only live for the second half of it",
