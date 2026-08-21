@@ -203,6 +203,7 @@ MARKETS = (
     Mkt("JP", "Japan", ".JP"),
     Mkt("KR", "Korea", ".KS"),
     Mkt("MY", "Malaysia", ".MK"),
+    Mkt("TW", "Taiwan", ".TT"),
     Mkt("TH", "Thailand", ".TB"),
 )
 MARKET_CODES = tuple(m.code for m in MARKETS)
@@ -240,24 +241,42 @@ Q_SESSION = """
   sside:`$sside;
   et:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; size:0#0i;
          fixmsg:0#`; oes_oid:0#`; basket:0#`; side:0#`; algo:0#`;
-         t_start:0#0Nt; t_end:0#0Nt; time:0#0Nt);
+         sidesign:0#0i; limit_price:0#0n; t_start:0#0Nt; t_end:0#0Nt;
+         time:0#0Nt; fxlast:0#0n; refpx:0#0n);
   ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i;
-         state:0#`);
+         state:0#`; avg_fill_price:0#0n; t_transmit:0#0Nt;
+         transmit_bidprice:0#0n; transmit_askprice:0#0n);
 
   t:$[hist;
       select date,id_server,id_target,sym,size,fixmsg,oes_oid,basket,side,
-          algo,t_start,t_end,time
+          algo,sidesign,limit_price,t_start,t_end,time
         from target where date=d, side=sside, any (upper sym) like/: sfx;
       update date:0Nd from select id_server,id_target,sym,size,fixmsg,oes_oid,
-          basket,side,algo,t_start,t_end,time
+          basket,side,algo,sidesign,limit_price,t_start,t_end,time
         from target where side=sside, any (upper sym) like/: sfx];
   if[0=count t; :(et;ew)];
 
+  / fx and a reference close, for the notional.  target_stock is a REFERENCE
+  / table - one row per parent per day, describing the stock rather than the
+  / order - so `last` here is not the row-collapsing this file refuses to do
+  / elsewhere; it is picking the current value of a fact.
+  ids:exec distinct id_target from t;
+  x:$[hist;
+      select date,id_server,id_target,fxlast,adjclose,orgclose
+        from target_stock where date=d, id_target in ids;
+      update date:0Nd from select id_server,id_target,fxlast,adjclose,orgclose
+        from target_stock where id_target in ids];
+  x:0!select refpx:last adjclose^last orgclose, fxlast:last fxlast
+       by date,id_server,id_target from x;
+  t:t lj `date`id_server`id_target xkey x;
+
   ids:exec distinct id_target from t;
   w:$[hist;
-      select date,id_server,id_work,id_target,make,state
+      select date,id_server,id_work,id_target,make,state,avg_fill_price,
+          t_transmit,transmit_bidprice,transmit_askprice
         from workorder where date=d, id_target in ids;
-      update date:0Nd from select id_server,id_work,id_target,make,state
+      update date:0Nd from select id_server,id_work,id_target,make,state,
+          avg_fill_price,t_transmit,transmit_bidprice,transmit_askprice
         from workorder where id_target in ids];
   (t;w)
   }
@@ -269,6 +288,38 @@ def fetch(handle, hist: bool, d: Optional[dt.date]):
     t, w = handle(Q_SESSION, hist, d if d is not None else _UNUSED_DATE,
                   sfx, SHORTSELL_SIDE.encode())
     return t.pd().to_dict("records"), w.pd().to_dict("records")
+
+# Why a workorder was rejected is NOT on workorder - it has no text field at
+# all.  It is on EXECUTION, the message stream back from the venue: `ostat` is
+# the status it came back with, and `comment` / `fixtags` carry whatever text
+# came with it (FIX tag 58 Text, tag 103 OrdRejReason).
+#
+# This query does not decide what a reject looks like there.  It pulls every
+# execution row belonging to the workorders ALREADY known to be rejected, and
+# --reject-reasons prints the distinct values.  Guessing the encoding is what
+# the investigation is supposed to answer.
+Q_REJECT_REASONS = """
+{[hist;d;works]
+  ee:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; sym:0#`;
+         ostat:0#`; comment:0#`; fixtags:0#`);
+  if[0=count works; :ee];
+  $[hist;
+    select date,id_server,id_work,id_target,sym,ostat,comment,fixtags
+      from execution where date=d, id_work in works;
+    update date:0Nd from select id_server,id_work,id_target,sym,ostat,comment,
+        fixtags
+      from execution where id_work in works]
+  }
+"""
+
+
+def fetch_reject_reasons(handle, hist: bool, d, works):
+    if not works:
+        return []
+    r = handle(Q_REJECT_REASONS, hist, d if d is not None else _UNUSED_DATE,
+               [int(w) for w in works])
+    return r.pd().to_dict("records")
+
 
 def _check_server(endpoint: str, which: str):
     if _PLACEHOLDER in endpoint:
@@ -330,6 +381,18 @@ def _i(v) -> int:
         return 0
     # 0Ni round-trips as INT_MIN; a size or a fill of that magnitude is a null.
     return 0 if n == -2147483648 else n
+
+
+def _f(v) -> float:
+    """A q float as a float.  A null or a missing value reads as 0.0, which
+    every caller treats as "no price" rather than as free."""
+    try:
+        if v is None:
+            return 0.0
+        x = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if x != x or x in (float("inf"), float("-inf")) else x
 
 
 def _d(v) -> Optional[dt.date]:
@@ -399,6 +462,10 @@ class Split(NamedTuple):
     country: str
     make: int
     rejected: bool
+    fill_price: float       # avg_fill_price - what this child actually paid
+    transmit: float         # t_transmit, to find the order's FIRST child
+    bid: float              # the quote when it was sent, for a market order
+    ask: float
 
 
 def to_splits(records, parents) -> list:
@@ -417,7 +484,11 @@ def to_splits(records, parents) -> list:
             continue
         out.append(Split(key=key, id_work=_i(r.get("id_work")), date=p.date,
                          country=p.country, make=abs(_i(r.get("make"))),
-                         rejected=is_rejected(r.get("state"))))
+                         rejected=is_rejected(r.get("state")),
+                         fill_price=_f(r.get("avg_fill_price")),
+                         transmit=_t(r.get("t_transmit")),
+                         bid=_f(r.get("transmit_bidprice")),
+                         ask=_f(r.get("transmit_askprice"))))
     return out
 
 # =============================================================================
@@ -441,6 +512,10 @@ class Attempt(NamedTuple):
     basket: str
     side: str
     algo: str
+    sidesign: int              # <0 sell, >0 buy - which side of the quote
+    limit_price: float         # 0 on a market order
+    fxlast: float              # local -> USD
+    refpx: float               # adjclose, else orgclose
     t_start: float             # the order's live window, seconds
     t_end: float
     seq: float                 # target `time`, to find the last attempt
@@ -502,7 +577,9 @@ def to_attempts(records) -> tuple:
             client_id=fix_tag(r.get("fixmsg")),
             oes_oid=_s(r.get("oes_oid")), basket=_s(r.get("basket")),
             side=_s(r.get("side")) or SHORTSELL_SIDE,
-            algo=_s(r.get("algo")),
+            algo=_s(r.get("algo")), sidesign=_i(r.get("sidesign")) or -1,
+            limit_price=_f(r.get("limit_price")), fxlast=_f(r.get("fxlast")),
+            refpx=_f(r.get("refpx")),
             t_start=_t(r.get("t_start")), t_end=_t(r.get("t_end")),
             seq=_t(r.get("time")), id_target=idt))
     return out, dropped
@@ -819,6 +896,77 @@ def report_over_filled(over) -> None:
             f"{sorted({a.size for a in c.attempts})}")
 
 
+def reason_of(rec) -> str:
+    """A one line reason for one execution row.
+
+    comment first, then the FIX Text tag, then OrdRejReason, then the status
+    on its own.  Whitespace is squeezed and the whole thing truncated, so two
+    rejects that differ only in an order id land on the same line - which is
+    what makes a top 20 mean anything.
+    """
+    import re
+    for got in (_s(rec.get("comment")),
+                fix_tag(rec.get("fixtags"), "58"),
+                fix_tag(rec.get("fixtags"), "103")):
+        got = re.sub(r"\s+", " ", got).strip()
+        if got:
+            return got[:110]
+    return "(no text, status only)"
+
+
+def reject_reasons(records, splits) -> dict:
+    """{market: [(ostat, reason, count)]}, commonest first.
+
+    Keyed off the workorders already known to be rejected, so nothing here
+    depends on how a reject is spelled in `execution` - the point is to SEE how
+    it is spelled.
+    """
+    market = {}
+    for sp in splits:
+        if sp.rejected:
+            market[sp.id_work] = sp.country
+    counts = {}
+    for r in records:
+        w = _i(r.get("id_work"))
+        m = market.get(w)
+        if m is None:
+            continue
+        k = (_s(r.get("ostat")) or "(none)", reason_of(r))
+        counts.setdefault(m, {})
+        counts[m][k] = counts[m].get(k, 0) + 1
+    return {m: sorted(((o, t, n) for (o, t), n in c.items()),
+                      key=lambda x: -x[2])
+            for m, c in counts.items()}
+
+
+def dump_reject_reasons(by_market_reasons, splits, seen_works, top=20) -> int:
+    """The top distinct rejection reasons per market, for the terminal."""
+    rejected = [sp for sp in splits if sp.rejected]
+    if not rejected:
+        print("no rejected workorders in this session")
+        return 0
+    covered = sum(1 for sp in rejected if sp.id_work in seen_works)
+    print(f"{len(rejected):,} rejected workorders, {covered:,} with an "
+          f"execution row ({100.0 * covered / len(rejected):.1f}%)")
+    if covered < len(rejected):
+        print(f"  the other {len(rejected) - covered:,} never produced an "
+              f"execution row, so nothing here explains them")
+
+    for m in MARKETS:
+        rows = by_market_reasons.get(m.code)
+        if not rows:
+            continue
+        total = sum(n for _o, _t, n in rows)
+        print(f"\n{m.name}  -  {total:,} execution row"
+              f"{'' if total == 1 else 's'} over {len(rows):,} distinct "
+              f"reason{'' if len(rows) == 1 else 's'}"
+              + (f", top {top}" if len(rows) > top else ""))
+        print(f"  {'count':>7}  {'share':>6}  {'ostat':<16}reason")
+        for ostat, text, n in rows[:top]:
+            print(f"  {n:>7,}  {100.0 * n / total:>5.1f}%  {ostat:<16}{text}")
+    return 0
+
+
 def dump_untagged(attempts, limit=200) -> int:
     """The targets carrying no tag 9604.
 
@@ -886,6 +1034,96 @@ def dump_chains(chs, limit=40):
 
 
 # =============================================================================
+# NOTIONAL
+#
+# `size` is a share count, so putting an order in USD needs a price - and the
+# UNFILLED part of an order never traded at one.  The ladder, best first:
+#
+#   limit_price     a limit order is worth what the client said it was worth
+#   the quote       a market order has no limit, so it is valued at the side we
+#                   would actually have traded: the BID for a sell, the ASK for
+#                   a buy, as at the moment the FIRST child was sent
+#   refpx           adjclose, else orgclose.  The fallback for an order that
+#                   never produced a child at all - and there were 557 of those
+#                   in one live month, so this is not a rare branch
+#
+# EXECUTED is not priced this way at all: it is the sum of make * the child's
+# own avg_fill_price, which is what those shares really cost.  So notional
+# completion is NOT the share completion - it cannot be, because the two sides
+# traded at different prices.
+#
+# Everything is multiplied by target_stock.fxlast, local -> USD.  An order with
+# no fx or no price at all contributes NOTHING and is COUNTED: a notional that
+# quietly omits a market is worse than one that admits a gap.
+# =============================================================================
+
+def order_price(a: "Attempt", kids) -> tuple:
+    """(price in local currency, where it came from) for one order.
+
+    kids are the chain's splits; only the earliest one that carries a quote is
+    read, because that is the market the order actually met.
+    """
+    if a.limit_price > 0:
+        return a.limit_price, "limit"
+    quoted = sorted((k for k in kids if k.bid > 0 or k.ask > 0),
+                    key=lambda k: k.transmit)
+    if quoted:
+        k = quoted[0]
+        #  sell into the bid, buy from the ask - the side we would have hit
+        px = k.bid if a.sidesign < 0 else k.ask
+        if px > 0:
+            return px, "quote"
+    if a.refpx > 0:
+        return a.refpx, "close"
+    return 0.0, "none"
+
+
+class Notional(NamedTuple):
+    ordered: float             # USD
+    executed: float            # USD
+    priced: int                # orders that got a price
+    unpriced: int              # orders with no price or no fx - contribute 0
+    by_source: dict            # {"limit": n, "quote": n, "close": n}
+
+
+def notional(chains, splits) -> Notional:
+    """What the orders were worth, and how much of them could be valued."""
+    by_key = {}
+    for sp in splits:
+        by_key.setdefault(sp.key, []).append(sp)
+
+    ordered = executed = 0.0
+    priced = unpriced = 0
+    src = {}
+    for c in chains:
+        kids = [x for k in c.keys for x in by_key.get(k, ())]
+        last = c.attempts[-1]
+        px, where = order_price(last, kids)
+        fx = last.fxlast
+        if px <= 0 or fx <= 0:
+            unpriced += 1
+            continue
+        priced += 1
+        src[where] = src.get(where, 0) + 1
+        ordered += c.size * px * fx
+        #  the fills are valued at what they actually paid, never at px
+        executed += sum(x.make * x.fill_price * fx for x in kids
+                        if x.fill_price > 0)
+    return Notional(ordered, executed, priced, unpriced, src)
+
+
+def report_notional(n: Notional) -> None:
+    if n.unpriced:
+        log(f"  {n.unpriced:,} of {n.priced + n.unpriced:,} orders could not "
+            f"be valued - no price or no fxlast - and contribute NOTHING to "
+            f"the notional columns")
+    if n.by_source:
+        log("  priced from: " + ", ".join(
+            f"{k} {v:,}" for k, v in sorted(n.by_source.items(),
+                                            key=lambda kv: -kv[1])))
+
+
+# =============================================================================
 # THE NUMBERS
 # =============================================================================
 
@@ -896,15 +1134,29 @@ def _completion(executed: int, order_qty: int) -> Optional[float]:
 
 
 class Row(NamedTuple):
+    """One market.
+
+    order_qty and executed stay as SHARE counts - the rollups, the checks and
+    --compare are all in shares - and the notional rides beside them.  The page
+    prints the notional; completion is taken off the notional too, so the
+    percentage and the two columns either side of it agree.
+    """
     code: str
     name: str
     orders: int
-    order_qty: int
-    executed: int
+    order_qty: int             # shares
+    executed: int              # shares
     rejections: int
+    ordered_usd: float = 0.0
+    executed_usd: float = 0.0
 
     @property
     def completion(self) -> Optional[float]:
+        return _completion(self.executed_usd, self.ordered_usd)
+
+    @property
+    def share_completion(self) -> Optional[float]:
+        """The old percentage, kept for --compare and for the checks."""
         return _completion(self.executed, self.order_qty)
 
 
@@ -918,12 +1170,15 @@ class DayRow(NamedTuple):
 
 
 class Totals(NamedTuple):
-    """The headline figures.  completion is executed over order qty, summed."""
+    """The headline figures.  completion is executed over ordered, summed, in
+    USD - the same measure the market column shows."""
     orders: int
     order_qty: int
     executed: int
     rejections: int
     completion: Optional[float]
+    ordered_usd: float = 0.0
+    executed_usd: float = 0.0
 
 
 def totals(rows) -> Totals:
@@ -936,8 +1191,11 @@ def totals(rows) -> Totals:
     """
     ex = sum(r.executed for r in rows)
     qty = sum(r.order_qty for r in rows)
+    ousd = sum(r.ordered_usd for r in rows)
+    eusd = sum(r.executed_usd for r in rows)
     return Totals(sum(r.orders for r in rows), qty, ex,
-                  sum(r.rejections for r in rows), _completion(ex, qty))
+                  sum(r.rejections for r in rows), _completion(eusd, ousd),
+                  ousd, eusd)
 
 
 def by_market(chs, splits) -> list:
@@ -952,8 +1210,15 @@ def by_market(chs, splits) -> list:
         made[s.country] += s.make
         if s.rejected:
             rej[s.country] += 1
+    #  the notional is worked out PER MARKET rather than once and apportioned:
+    #  every order carries its own price and its own fx, and there is no
+    #  meaningful market-level price to apply afterwards
+    usd = {m.code: notional([c for c in chs if c.country == m.code],
+                            [s for s in splits if s.country == m.code])
+           for m in MARKETS}
     return [Row(m.code, m.name, orders[m.code], qty[m.code],
-                made[m.code], rej[m.code]) for m in MARKETS]
+                made[m.code], rej[m.code],
+                usd[m.code].ordered, usd[m.code].executed) for m in MARKETS]
 
 
 def by_market_targets(attempts, splits) -> list:
@@ -1076,7 +1341,7 @@ Y_FOOTER = 0.048
 # most of that band, and some of the table's row pitch, to the per day pair.
 MKT_BAND = {                      # (y0, height, title y)
     "daily": (0.195, 0.265, 0.478),
-    "monthly": (0.470, 0.118, 0.598),
+    "monthly": (0.455, 0.110, 0.578),
 }
 # The per day band stops clear of the notes: its baseline hairline is drawn 0.008
 # below y0, and a baseline running through a line of text is the one collision
@@ -1092,16 +1357,32 @@ DAY_BANDS = (
 
 # (column label, width as a fraction of COL_W, right aligned)
 TABLE_COLS = (
-    ("Market", 0.27, False),
-    ("Orders", 0.12, True),
-    ("Order qty", 0.19, True),
-    ("Executed", 0.19, True),
-    ("Completion", 0.13, True),
-    ("Rejections", 0.10, True),
+    ("Market", 0.22, False),
+    ("Orders", 0.10, True),
+    ("Notional Ordered (USD)", 0.23, True),
+    ("Notional Executed (USD)", 0.24, True),
+    ("Completion", 0.12, True),
+    ("Rejections", 0.09, True),
 )
 
 BAR_R_IN = 0.035      # rounded data end, inches (~4px at 100dpi)
 BAR_FRAC = 0.58       # bar height as a fraction of the row pitch - thin marks
+
+
+def fmt_usd(v) -> str:
+    """A USD notional, in the unit the number is actually in.
+
+    A trading day runs from thousands to hundreds of millions, and 79,241,883
+    is a number nobody reads - 79.2m is.  Zero prints as a dash: it means the
+    orders could not be valued, not that they were worth nothing.
+    """
+    v = float(v or 0.0)
+    if v <= 0:
+        return DASH
+    for cut, suf in ((1e9, "bn"), (1e6, "m"), (1e3, "k")):
+        if v >= cut:
+            return f"{v / cut:,.1f}{suf}"
+    return f"{v:,.0f}"
 
 
 def _table(fig, rows, y_top, row_h):
@@ -1109,8 +1390,8 @@ def _table(fig, rows, y_top, row_h):
     only pulled to the counts that are not zero."""
     cells = [[(r.name, INK, "normal"),
               (fmt_int(r.orders), INK, "normal"),
-              (fmt_int(r.order_qty), INK, "normal"),
-              (fmt_int(r.executed), INK, "normal"),
+              (fmt_usd(r.ordered_usd), INK, "normal"),
+              (fmt_usd(r.executed_usd), INK, "normal"),
               (fmt_pct1(r.completion), INK, "normal"),
               (fmt_int(r.rejections),
                RED if r.rejections else INK3,
@@ -1353,6 +1634,15 @@ def run(args) -> int:
     if args.no_tag:
         return dump_untagged(attempts)
 
+    if args.reject_reasons:
+        works = [sp.id_work for sp in splits if sp.rejected]
+        recs = []
+        for d in pl.dates:
+            recs.extend(fetch_reject_reasons(h, pl.hist, d, works))
+        seen = {_i(r.get("id_work")) for r in recs}
+        return dump_reject_reasons(reject_reasons(recs, splits), splits, seen,
+                                   args.top)
+
     chs = to_chains(attempts, args.chain_qty, splits)
     over = over_filled(chs, splits)
     if over and not args.keep_over:
@@ -1429,6 +1719,11 @@ def demo_session(d=None):
     for i in range(1, 83):                       # Korea
         pr.append(_a(2000 + i, "KR", 12_567, f"CLI-KR-{i:04d}", t=i, d=d))
         wr.append(_c(2000 + i, 2000 + i, 4_933, "done", d=d))
+    for i in range(1, 24):                       # Taiwan
+        pr.append(_a(4000 + i, "TW", 31_400, f"CLI-TW-{i:04d}", t=i, d=d))
+        wr.append(_c(4000 + i, 4000 + i, 19_800, "filled", d=d))
+    for i in range(31):
+        wr.append(_c(93_000 + i, 4001 + (i % 23), 0, "rejected", d=d))
     for i in range(152):
         wr.append(_c(92_000 + i, 2001 + (i % 82), 0, "rejected", d=d))
 
@@ -1483,21 +1778,30 @@ def demo(out_dir) -> int:
     return 0
 
 
-def _p(idt, country, size, fixmsg="", d=None, srv=1, sym=None):    # noqa: E302
+#  the fixtures price EVERYTHING at 10.0 with fx 1.0 by default, on both the
+#  ordered and the executed side, so notional completion equals share
+#  completion and every share-based expectation below still reads the same.
+#  The checks that care about pricing set their own.
+def _p(idt, country, size, fixmsg="", d=None, srv=1, sym=None,
+       limit_price=10.0, fxlast=1.0, refpx=10.0, sidesign=-1):    # noqa: E302
     """One TARGET row.  country is spelled as a market code for readability and
     turned into the sym suffix the real feed carries."""
     if sym is None:
         sym = "X" + MARKET_NAME.get(country, country)[:1] + dict(
             (m.code, m.suffix) for m in MARKETS).get(country, "." + country)
     return {"date": d, "id_server": srv, "id_target": idt, "sym": sym,
-            "size": size, "fixmsg": fixmsg}
+            "size": size, "fixmsg": fixmsg, "limit_price": limit_price,
+            "fxlast": fxlast, "refpx": refpx, "sidesign": sidesign}
 
 
-def _c(idw, idt, make, state, d=None, srv=1):
+def _c(idw, idt, make, state, d=None, srv=1, fill_px=10.0, bid=0.0, ask=0.0,
+       transmit=0.0):
     """ONE WORKORDER ROW.  Several of these may share an id_work - which is the
     whole point of counting per row rather than per split."""
     return {"date": d, "id_server": srv, "id_work": idw, "id_target": idt,
-            "make": make, "state": state}
+            "make": make, "state": state, "avg_fill_price": fill_px,
+            "t_transmit": dt.timedelta(seconds=transmit),
+            "transmit_bidprice": bid, "transmit_askprice": ask}
 
 def _a(idt, country, size, cid, basket="B1", side="sellshort",
        algo="vwap", t=0.0, live=3600.0, d=None, srv=1, sym=None, extra=""):
@@ -1954,6 +2258,72 @@ def self_test() -> int:
     lines = compare_lines(v1_rows, rows2)
     #  two header lines, a rule, the markets, a rule, the total, a blank and
     #  the note about what cannot differ
+    print("\nwhy a workorder was rejected")
+
+    def _x(idw, idt=1, ostat="rejected", comment="", fixtags="", sym="X.HK"):
+        return {"date": None, "id_server": 1, "id_work": idw, "id_target": idt,
+                "sym": sym, "ostat": ostat, "comment": comment,
+                "fixtags": fixtags}
+
+    check("the comment is the reason when there is one",
+          reason_of(_x(1, comment="Short sell not allowed")),
+          "Short sell not allowed")
+    check("else FIX tag 58, the Text field",
+          reason_of(_x(1, fixtags="35=8;58=Borrow unavailable;103=0")),
+          "Borrow unavailable")
+    check("else tag 103, OrdRejReason",
+          reason_of(_x(1, fixtags="35=8;103=11")), "11")
+    check("and with nothing at all it says so rather than guessing",
+          reason_of(_x(1)), "(no text, status only)")
+    check("whitespace is squeezed so near-identical texts collapse",
+          reason_of(_x(1, comment="Short   sell\n not\tallowed")),
+          "Short sell not allowed")
+    check("and a very long one is truncated to fit a terminal",
+          len(reason_of(_x(1, comment="x" * 400))), 110)
+    check("a comment of only whitespace falls through to the tags",
+          reason_of(_x(1, comment="   ", fixtags="58=Real reason")),
+          "Real reason")
+
+    #  the market comes from the REJECTED workorder, so nothing here depends on
+    #  how a reject is spelled in execution - seeing that is the point
+    rj_att, _ = to_attempts([_p(1, "HK", 1000), _p(2, "JP", 1000)])
+    rj_sp = to_splits([_c(11, 1, 0, "rejected"), _c(12, 1, 0, "rejected"),
+                       _c(13, 2, 0, "rejected"), _c(14, 2, 500, "filled")],
+                      rj_att)
+    recs = [_x(11, 1, comment="Short sell not allowed"),
+            _x(12, 1, comment="Short sell not allowed"),
+            _x(13, 2, ostat="rej", comment="Price outside band"),
+            _x(14, 2, ostat="filled", comment="never rejected")]
+    got = reject_reasons(recs, rj_sp)
+    check("reasons are grouped by market", sorted(got), ["HK", "JP"])
+    check("commonest first, with a count",
+          got["HK"], [("rejected", "Short sell not allowed", 2)])
+    check("and the other market keeps its own",
+          got["JP"], [("rej", "Price outside band", 1)])
+    check("a workorder that was NOT rejected is ignored",
+          sum(n for rows in got.values() for _o, _t, n in rows), 3)
+    check("the status is carried beside the text, not merged into it",
+          got["JP"][0][0], "rej")
+
+    said = printed(dump_reject_reasons, got, rj_sp, {11, 12, 13})
+    check("it reports how many rejects it could explain",
+          "3 rejected workorders, 3 with an execution row" in said, True)
+    partial = printed(dump_reject_reasons, got, rj_sp, {11})
+    check("and says plainly when it could not explain them all",
+          "never produced an execution row" in partial, True)
+    check("a session with no rejects says so instead",
+          "no rejected workorders" in printed(
+              dump_reject_reasons, {}, [], set()), True)
+
+    print("\nreading a notional")
+    check("hundreds of millions", fmt_usd(79_241_883), "79.2m")
+    check("billions", fmt_usd(2_400_000_000), "2.4bn")
+    check("thousands", fmt_usd(12_400), "12.4k")
+    check("and small numbers as they are", fmt_usd(842), "842")
+    check("zero is a DASH - not valued, rather than worth nothing",
+          fmt_usd(0), DASH)
+    check("so is a missing one", fmt_usd(None), DASH)
+
     check("it prints a row per market plus a total",
           len(lines), len(MARKETS) + 7)
     check("with both order counts on the Thailand row",
@@ -1967,37 +2337,120 @@ def self_test() -> int:
     check("so the whole table survives a cp1252 console",
           all(x.encode("cp1252", "strict") is not None for x in lines), True)
 
+    print("\nthe table still fits under its own charts")
+    #  a market added to MARKETS makes the table taller; the chart titles sit
+    #  at fixed y, and a sixth row is what first pushed the two together
+    for mode, row_h in (("daily", 0.040), ("monthly", 0.030)):
+        bottom = Y_TABLE_TOP - H_TABLE_HEAD - len(MARKETS) * row_h
+        y0, h, ty = MKT_BAND[mode]
+        check(f"{mode}: the table ends above the chart titles", bottom > ty,
+              True)
+        check(f"{mode}: and the titles sit above their axes", ty > y0 + h, True)
+    (cy, ch, cty), (ry, rh, rty) = DAY_BANDS
+    check("the by day titles clear the market charts",
+          cty < MKT_BAND["monthly"][0], True)
+    check("and each sits above its own axes",
+          (cty > cy + ch, rty > ry + rh), (True, True))
+
+
+    print("\nputting an order in USD")
+    H2 = 3_600_000
+
+    def one(**kw):
+        """one order, one child, priced however the case wants"""
+        rec = _p(1, "HK", 1000, **{k: v for k, v in kw.items()
+                                   if k in ("limit_price", "fxlast", "refpx",
+                                            "sidesign")})
+        att, _drop = to_attempts([rec])
+        sp = to_splits([_c(1, 1, 400, "filled",
+                           fill_px=kw.get("fill_px", 10.0),
+                           bid=kw.get("bid", 0.0), ask=kw.get("ask", 0.0))],
+                       att)
+        return att, sp, to_chains(att, "asked", sp)
+
+    a1, s1, c1 = one(limit_price=12.5)
+    check("a limit order is priced at its limit",
+          order_price(a1[0], s1), (12.5, "limit"))
+    check("and its ordered notional is size x limit x fx",
+          notional(c1, s1).ordered, 1000 * 12.5 * 1.0)
+    check("while executed is the FILLS at what they paid",
+          notional(c1, s1).executed, 400 * 10.0 * 1.0)
+
+    a2, s2, c2 = one(limit_price=0.0, bid=9.5, ask=10.5, sidesign=-1)
+    check("a market SELL is priced at the bid - the side we would hit",
+          order_price(a2[0], s2), (9.5, "quote"))
+    a3, s3, c3 = one(limit_price=0.0, bid=9.5, ask=10.5, sidesign=1)
+    check("a market BUY is priced at the ask",
+          order_price(a3[0], s3), (10.5, "quote"))
+
+    a4, s4, c4 = one(limit_price=0.0, refpx=11.0)
+    check("with no limit and no quote it falls back to the close",
+          order_price(a4[0], s4), (11.0, "close"))
+    a5, _ = to_attempts([_p(1, "HK", 1000, limit_price=0.0, refpx=0.0)])
+    check("and with nothing at all there is no price",
+          order_price(a5[0], []), (0.0, "none"))
+    n5 = notional(to_chains(a5, "asked", []), [])
+    check("an order that cannot be valued contributes NOTHING",
+          (n5.ordered, n5.executed), (0.0, 0.0))
+    check("and is counted as unpriced rather than passed over",
+          (n5.priced, n5.unpriced), (0, 1))
+    a_nofx, _ = to_attempts([_p(1, "HK", 1000, fxlast=0.0)])
+    check("so is one with a price but no fx",
+          notional(to_chains(a_nofx, "asked", []), []).unpriced, 1)
+
+    #  the quote is read off the EARLIEST child, which is the market the order
+    #  actually met
+    a6, _ = to_attempts([_p(1, "HK", 1000, limit_price=0.0)])
+    s6 = to_splits([_c(2, 1, 0, "leave", bid=9.0, ask=10.0, transmit=200),
+                    _c(1, 1, 0, "leave", bid=8.0, ask=9.0, transmit=100)], a6)
+    check("the quote comes from the first child sent, not the first row",
+          order_price(a6[0], s6), (8.0, "quote"))
+
+    #  fx really is applied
+    a7, s7, c7 = one(limit_price=10.0, fxlast=0.13)
+    check("fxlast turns local into USD",
+          round(notional(c7, s7).ordered, 2), round(1000 * 10.0 * 0.13, 2))
+    check("on both sides", round(notional(c7, s7).executed, 2),
+          round(400 * 10.0 * 0.13, 2))
+    check("it reports where the prices came from",
+          notional(c1, s1).by_source, {"limit": 1})
+
     print("\nthe headline is the real fill rate")
     #  the day this whole thread started from
-    mrows = [Row("HK", "Hong Kong", 572, 21_324_695, 10_879_995, 146),
-             Row("JP", "Japan", 290, 2_594_047, 1_971_647, 53),
-             Row("KR", "Korea", 56, 105_590, 40_557, 54),
-             Row("MY", "Malaysia", 3, 202_900, 86_900, 9),
-             Row("TH", "Thailand", 3, 81_000_000, 0, 7)]
+    #  priced at 1.0 with fx 1.0, so the USD columns equal the share columns
+    #  and every expectation below reads the same as it did before the notional
+    def _row(code, name, orders, qty, ex, rej):
+        return Row(code, name, orders, qty, ex, rej, float(qty), float(ex))
+
+    mrows = [_row("HK", "Hong Kong", 572, 21_324_695, 10_879_995, 146),
+             _row("JP", "Japan", 290, 2_594_047, 1_971_647, 53),
+             _row("KR", "Korea", 56, 105_590, 40_557, 54),
+             _row("MY", "Malaysia", 3, 202_900, 86_900, 9),
+             _row("TH", "Thailand", 3, 81_000_000, 0, 7)]
     mt = totals(mrows)
     check("the market percentages",
           [round(r.completion, 1) for r in mrows], [51.0, 76.0, 38.4, 42.8, 0.0])
     check("the headline is summed executed over summed order qty",
           round(mt.completion, 6),
-          round(100.0 * mt.executed / mt.order_qty, 6))
+          round(100.0 * mt.executed_usd / mt.ordered_usd, 6))
     check("the mean of the market rows would have said 41.7 instead",
           round(sum(r.completion for r in mrows) / len(mrows), 1), 41.7)
     check("a market with no orders contributes nothing either way",
-          totals(mrows + [Row("XX", "Nowhere", 0, 0, 0, 0)]).completion,
+          totals(mrows + [_row("XX", "Nowhere", 0, 0, 0, 0)]).completion,
           mt.completion)
     check("and all-empty has no headline at all",
-          totals([Row("XX", "Nowhere", 0, 0, 0, 0)]).completion, None)
+          totals([_row("XX", "Nowhere", 0, 0, 0, 0)]).completion, None)
     check("size DOES decide it, which is the point: a big market at 10% "
           "beside a small one at 90% is 10.8, not 50",
-          round(totals([Row("A", "A", 100, 1_000_000, 100_000, 0),
-                        Row("B", "B", 1, 10_000, 9_000, 0)]).completion, 1),
+          round(totals([_row("A", "A", 100, 1_000_000, 100_000, 0),
+                        _row("B", "B", 1, 10_000, 9_000, 0)]).completion, 1),
           10.8)
 
     #  the headline above is only trustworthy because Thailand's 3 targets are
     #  ONE order.  With the double count still in it read 12.3%.
     check("with Thailand counted three times it was 12.3",
           round(mt.completion, 1), 12.3)
-    chained = [r if r.code != "TH" else Row("TH", "Thailand", 1, 27_000_000,
+    chained = [r if r.code != "TH" else _row("TH", "Thailand", 1, 27_000_000,
                                             0, 7) for r in mrows]
     check("counted once, the same ratio is 25.3",
           round(totals(chained).completion, 1), 25.3)
@@ -2061,6 +2514,13 @@ def main(argv=None) -> int:
     p.add_argument("--chains", action="store_true",
                    help="list the chained orders and their attempts, and exit "
                         "- the way to check tag 9604 against the engine")
+    p.add_argument("--reject-reasons", action="store_true",
+                   help="print the commonest rejection reasons per market and "
+                        "exit. Reads `ostat`, `comment` and `fixtags` off "
+                        "EXECUTION for the workorders already known to be "
+                        "rejected - workorder itself carries no text")
+    p.add_argument("--top", type=int, default=20,
+                   help="how many distinct reasons per market to show")
     p.add_argument("--no-tag", action="store_true",
                    help="list the targets carrying NO tag 9604, and exit - "
                         "they are counted as counting targets would, and this is how "

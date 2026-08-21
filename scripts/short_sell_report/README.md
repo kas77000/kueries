@@ -85,10 +85,10 @@ reach, a network share included.
 | | |
 |---|---|
 | **Orders** | one per **order**, not one per `target` row. A rejected-and-replaced order writes a **new `id_target`** each time it is re-sent, so counting target rows counts one economic order several times. They are chained back together on **FIX tag 9604** — see below. |
-| **Order qty** | what the chain asked for. Not simply `sum size`: three sends of 27m that never traded asked for **27m**, not 81m. |
-| **Executed** | the sum of `workorder.make` across **every** attempt. `make` is what that child executed, whatever state it ended in — a cancelled child that part-filled still contributes what it filled. |
-| **Completion** | per market, `Executed / Order qty`. |
-| **Overall completion** | the same ratio over every market at once — **summed executed over summed order qty**. The real fill rate. |
+| **Notional Ordered (USD)** | the chain's quantity × a price × `fxlast`. The price ladder, best first: **`limit_price`** for a limit order; else **the quote on our side** — the bid for a sell, the ask for a buy, as at the moment the first child was sent; else the **reference close** (`adjclose`, then `orgclose`) for an order that never produced a child. The quantity is what the chain asked for, not `sum size`: three sends of 27m that never traded asked for **27m**, not 81m. |
+| **Notional Executed (USD)** | Σ(`make` × the child's own `avg_fill_price`) × `fxlast`, across **every** attempt. What those shares really cost. `make` counts whatever state the child ended in — a cancelled child that part-filled still contributes what it filled. |
+| **Completion** | per market, Notional Executed / Notional Ordered. **Not** the share completion — it cannot be, because the two sides are priced differently: the unfilled part at a limit or a quote, the filled part at what it actually paid. |
+| **Overall completion** | the same ratio over every market at once — summed USD executed over summed USD ordered. |
 | **Rejections** | `workorder` rows in state `` `rejected ``, across **all** attempts of the chain. Counted per child order, not per parent, which is why Hong Kong can show 109 orders and 239 rejections. |
 
 `workorder` also carries `invalid_ack` and `fail_ack`. They are **not** counted:
@@ -331,6 +331,47 @@ data supports it — removing the slow ones would delete a finding.
 ---
 
 
+## Why a workorder was rejected
+
+```
+python scripts/short_sell_report/short_sell_report.py --reject-reasons --date 2026-08-19
+```
+
+The reason is **not on `workorder`** — it has no text field at all. It is on
+**`execution`**, the message stream back from the venue: `ostat` is the status
+it came back with, and `comment` / `fixtags` carry the text (FIX tag 58 `Text`,
+tag 103 `OrdRejReason`).
+
+This does **not** decide what a reject looks like there. It pulls every
+`execution` row belonging to the workorders **already known** to be rejected
+and prints the distinct values — guessing the encoding is what the
+investigation is meant to answer.
+
+```
+6 rejected workorders, 5 with an execution row (83.3%)
+  the other 1 never produced an execution row, so nothing here explains them
+
+Hong Kong  -  3 execution rows over 2 distinct reasons
+    count   share  ostat           reason
+        2   66.7%  rejected        SHORT SELL NOT PERMITTED - no locate
+        1   33.3%  rejected        Order price outside daily limit band
+
+Japan  -  1 execution row over 1 distinct reason
+    count   share  ostat           reason
+        1  100.0%  reject          Tick rule violation
+```
+
+The reason is `comment`, else tag 58, else tag 103, else the status alone.
+Whitespace is squeezed and the text truncated at 110 characters, so two rejects
+differing only in an order id land on the same line — which is what makes a top
+20 mean anything. `--top N` changes how many per market.
+
+**The coverage line is the first thing to read.** A reject with no `execution`
+row is not explained by anything below it, and the percentage says how much of
+the picture you are looking at.
+
+---
+
 ## `--compare`, `--chains`, `--no-tag`
 
 One fetch, two rollups, printed side by side — so any difference is the counting
@@ -344,11 +385,23 @@ console, and a diagnostic that raises `UnicodeEncodeError` on cp1252 is no use.
 
 ## Scope
 
-**Hong Kong, Japan, Korea, Malaysia and Thailand**, always all five and always
+**Hong Kong, Japan, Korea, Malaysia, Taiwan and Thailand**, always all six and always
 in that order. A market with no short sell flow prints as a zero row rather than
 vanishing, because a market that is absent from the data is otherwise
 indistinguishable from one nobody remembered to ask about. Anything whose sym
 carries another suffix — or none — never enters a total.
+
+The market is the **sym suffix**:
+
+| suffix | market | | suffix | market |
+|---|---|---|---|---|
+| `.HK` | Hong Kong | | `.MK` | Malaysia |
+| `.JP` | Japan | | `.TT` | Taiwan |
+| `.KS` | Korea | | `.TB` | Thailand |
+
+The `*.HK`-style patterns q filters on are **built from the same table** Python
+maps back, so they cannot drift. Matching is case-insensitive and only the last
+dot counts, so `BRK.A.HK` is Hong Kong.
 
 **Japan excludes restricted names.** A parent whose `fixmsg` matches
 `*RSHO=1*` is dropped before anything is counted, so it appears in neither the
@@ -510,7 +563,7 @@ rendering path runs on a machine with no kdb, no pykx and no q licence:
 python scripts/short_sell_report/short_sell_report.py --self-test
 ```
 
-It rebuilds the page above from synthetic records — 158 checks — covering
+It rebuilds the page above from synthetic records — 199 checks — covering
 parsing tag 9604 out of a real `fixmsg`, the chaining and every guard on it, the
 suffix routing (including the suffixes that are *not* ours, like Tokyo's `.T`),
 the market rollup, the mean-of-markets headline, the Japan exclusion
