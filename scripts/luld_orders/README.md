@@ -56,8 +56,8 @@ looks wrong.
 ```
 date,region,sym,side,id_server,id_target,tag_9604,order_qty,executed,
 completion_pct,order_start,order_end,limit_periods,limit_first_start,
-limit_last_end,limit_mins,limit_price,limit_dir,limit_noask,limit_nobid,
-overlap_mins
+limit_last_end,limit_mins,limit_price,ref_close,pct_from_close,limit_dir,
+limit_noask,limit_nobid,limit_net,limit_locked,overlap_mins
 ```
 
 | column | what it is |
@@ -68,25 +68,44 @@ overlap_mins
 | `limit_periods` | how many qualifying periods the order was live through |
 | `limit_first_start`, `limit_last_end` | the span those periods cover |
 | `limit_mins` | how long the periods lasted, summed |
+| `ref_close` | the previous close the band is measured from — `target_stock.adjclose`, or `orgclose` where that is null |
+| `pct_from_close` | how far the band sat from it |
 | `limit_dir` | `up`, `down`, `unknown`, or `mixed` — see below |
-| `limit_noask`, `limit_nobid` | the tick counts `limit_dir` was decided from |
+| `limit_noask`, `limit_nobid`, `limit_net` | the evidence `limit_dir` was decided from |
+| `limit_locked` | `yes` when no side ever went missing — bid = ask throughout |
 | `overlap_mins` | how long the order and the limit actually **coexisted** — each period clipped to the order's own window |
 
 ### `limit_dir`
 
-At limit up nobody will offer, so the **ask** goes missing; at limit down
-nobody bids. The direction is whichever side went away, counted across the
-**whole run** rather than read off one tick, because a pinned book flickers.
-`limit_noask` and `limit_nobid` are those counts, on the line, so the call can
-be checked rather than taken.
+**A stock at its limit does not always go one sided.** It can **lock** — bid =
+ask, both present — and then no side went missing and the book cannot answer on
+its own. That is why there are three questions rather than one, in the order
+[`limit_up_down.q`](../../queries/limit_up_down/limit_up_down.q) asks them:
 
-- **`unknown`** is a real answer, not a failure. A **locked** run — bid = ask,
-  both present — has neither side missing, and the book alone cannot say which
-  band it sits at; telling those apart needs the previous close, which this
-  report does not read. An equal count cannot say either.
+1. **Which side went away.** At limit up nobody will offer, so the ask goes
+   missing; at limit down nobody bids. Counted across the **whole run** rather
+   than read off one tick, because a pinned book flickers. `limit_noask` and
+   `limit_nobid` are those counts.
+2. **Where the price sits against the previous close.** This is what settles a
+   locked book: a band above the close is limit up, below it is down. `ref_close`
+   and `pct_from_close` are on the line, so the call can be checked rather than
+   taken.
+3. **`netChange`, and only then.** It comes off the last *traded* price, so it
+   is 0 or null on exactly the stocks being hunted — a last resort, and the q
+   script says the same.
+
+Each outranks the ones below it: a book that went one sided is called from that
+whatever the close says, and the close outranks `netChange`.
+
+- **`unknown`** is what is left when all three decline — a locked stock with no
+  close on file, or a band sitting exactly at it. A real answer, and better
+  than a guess.
 - **`mixed`** means the order was live through periods that disagreed — limit
   down in the morning, limit up in the afternoon. Picking the first would
   quietly claim it was only that one.
+
+On the sample, 35 of 104 lines are locked; the close calls all but one of them,
+and that one has no close on file.
 
 **Direction is reported, never filtered on.** Nothing is dropped for being
 unfavourable or for being unknown — an unfavourable limit can still be
@@ -120,16 +139,17 @@ the band, and the report never has to decide which side a period was at.
 
 That decision is what the old `luld_report` spent its `noask`/`nobid`
 comparison on — and a period whose side could not be told was **dropped**.
-Here the same evidence is still read, but only to REPORT the direction in
-`--raw`; it never decides whether an order is in scope, so nothing is lost.
+Here the same evidence is still read, and more besides, but only to REPORT the
+direction in `--raw`; it never decides whether an order is in scope, so nothing
+is lost.
 
 ---
 
 ## What a limit period is
 
-A stock at its limit stops quoting two sided: it **locks** (`qbid=qask`) or goes
-**one sided** (one side empty, the other carrying the band). That is the whole
-test, and it is
+A stock at its limit stops quoting two sided: it **locks** (`qbid=qask`, both
+present — common, and not the exception) or goes **one sided** (one side empty,
+the other carrying the band). That is the whole test, and it is
 [`queries/limit_up_down/limit_up_down.q`](../../queries/limit_up_down/limit_up_down.q)'s
 expression verbatim:
 
@@ -258,7 +278,7 @@ conversion anywhere. That is relied on and is not a gap.
 
 Nothing is grouped in q: a `target` row is one send and a `workorder` row is one
 child. Every sum and count happens in Python, where `--self-test` can prove it —
-86 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
+99 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
 synthetic data.
 
 ---
@@ -269,9 +289,13 @@ synthetic data.
 - **The marketable window**, and whether a split was actually on the book during
   it — the question this is being built towards.
 - **Rejections**, email, and the findings table.
-- **A price sanity check.** Every locked or one-sided run counts, with no test
-  that the price sits at a real band, so a thin book, a halt or an auction
-  imbalance reads as a limit period. `limit_up_down.q` guards this with
-  `pctFromClose` against the previous close; there is no equivalent here.
+- **A price sanity check that actually filters.** `pct_from_close` is now
+  *reported* on every raw line, but nothing is dropped on it — so a thin book,
+  a halt or an auction imbalance still reads as a limit period.
+  `limit_up_down.q` calls this the sanity check: a genuine limit sits AT the
+  band, so something locked at +0.1% is a locked market and not a limit. Making
+  it a threshold needs per-market band reference data, which that script's own
+  comment says to verify before trusting. Read the column first and see what
+  the distribution looks like.
 
 `luld_report` is the older report and is untouched by this one.

@@ -161,7 +161,8 @@ def region_of(sym) -> Optional[str]:
 Q_ORDERS = """
 {[hist;d;sfx]
   et:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; side:0#`;
-         sidesign:0#0i; size:0#0i; t_start:0#0Nt; t_end:0#0Nt; fixmsg:0#`);
+         sidesign:0#0i; size:0#0i; t_start:0#0Nt; t_end:0#0Nt; fixmsg:0#`;
+         adjclose:0#0n; orgclose:0#0n);
   ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i);
 
   / parents.  Every side: a limit up is favourable to a seller and a limit down
@@ -176,8 +177,21 @@ Q_ORDERS = """
         from target where any (upper sym) like/: sfx];
   if[0=count t; :(et;ew)];
 
-  / children.  make is what the child executed, whatever state it ended in.
   ids:exec distinct id_target from t;
+
+  / the previous close, which is what says which BAND a locked book is at.  A
+  / stock at its limit does not always go one sided - it can lock, bid = ask,
+  / and then the side that went missing cannot answer the question because
+  / neither did.  target_stock carries the close per target, so this is a
+  / lookup on the key the row already has rather than a second symbology.
+  x:$[hist;
+      `date`id_server`id_target xkey select date,id_server,id_target,adjclose,
+          orgclose from target_stock where date=d, id_target in ids;
+      `id_server`id_target xkey select id_server,id_target,adjclose,orgclose
+        from target_stock where id_target in ids];
+  t:t lj x;
+
+  / children.  make is what the child executed, whatever state it ended in.
   w:$[hist;
       select date,id_server,id_work,id_target,make from workorder
         where date=d, id_target in ids;
@@ -196,13 +210,15 @@ Q_LIMITS = """
   / reads exactly like a calm market.
   syms:`$syms;
   ep:([] sym:0#`; grp:0#0j; start:0#0Nt; end:0#0Nt; price:0#0n; ticks:0#0j;
-         noask:0#0j; nobid:0#0j);
+         noask:0#0j; nobid:0#0j; net:0#0n);
   / rows with nothing on either side are trade prints or pre-open gaps - they
   / would read as one sided and break a run in two
+  / netChange comes off the last TRADED price, so it is 0 or null on exactly
+  / the stocks being hunted - it is a last resort, never the first answer
   q:$[hist;
-      select time,sym,qbid:0^qbid,qask:0^qask from qatt
+      select time,sym,qbid:0^qbid,qask:0^qask,netChange:0^netChange from qatt
         where date=d, sym in syms, (0<0^qbid)|0<0^qask;
-      select time,sym,qbid:0^qbid,qask:0^qask from qatt
+      select time,sym,qbid:0^qbid,qask:0^qask,netChange:0^netChange from qatt
         where sym in syms, (0<0^qbid)|0<0^qask];
   if[0=count q; :ep];
   q:`sym`time xasc q;
@@ -214,8 +230,8 @@ Q_LIMITS = """
   / whole run rather than read off one tick: at limit up nobody will offer, so
   / the ask goes missing, and at limit down nobody bids
   0!select start:first time, end:last time,
-      price:last ?[0=qask;qbid;qask], ticks:count i,
-      noask:sum 0=qask, nobid:sum 0=qbid
+      price:last ?[0=qbid;qask;qbid], ticks:count i,
+      noask:sum 0=qask, nobid:sum 0=qbid, net:last netChange
     by sym,grp from q where lim
   }
 """
@@ -288,6 +304,18 @@ def _i(v) -> int:
     return 0 if n == -2147483648 else n
 
 
+def _f(v) -> float:
+    """A q float.  Null and not-a-number both come back 0.0, which every
+    caller here reads as "no reference price", never as a price of zero."""
+    try:
+        if v is None:
+            return 0.0
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return 0.0 if f != f else f          # NaN is q's null float through pandas
+
+
 def _d(v) -> Optional[dt.date]:
     if v is None:
         return None
@@ -340,30 +368,63 @@ class Order(NamedTuple):
     t_end: Optional[int]
     client_id: str             # FIX tag 9604, "" when the client sent none
     id_target: int
+    ref: float                 # the previous close a band is measured from
 
 
 UP, DOWN, UNKNOWN = "up", "down", "unknown"
 
 
-def direction_of(noask: int, nobid: int) -> str:
-    """Which limit a period was at, from the side of the book that went away.
+def direction_of(noask: int, nobid: int, price: float = 0.0,
+                 ref: float = 0.0, net: float = 0.0) -> str:
+    """Which limit a period was at.  The cascade is limit_up_down.q's.
 
-    At limit up nobody will offer, so the ask goes missing; at limit down
-    nobody bids.  Counted across the WHOLE run rather than read off one tick,
-    because a pinned book flickers.
+    A stock at its limit does NOT always go one sided.  It can LOCK - bid =
+    ask, both present - and then no side went missing and the book cannot
+    answer on its own.  So three questions, in order of how much they can be
+    trusted:
 
-    UNKNOWN is a real answer and not a failure.  A LOCKED run - bid = ask, both
-    present - has neither side missing and the book alone cannot say which band
-    it sits at; telling those apart needs the previous close, which this report
-    does not read.  An equal count cannot say either.  Nothing is DROPPED for
-    being unknown: both sides count here, so direction is reported, never used
-    to decide whether an order is in scope.
+      1. WHICH SIDE WENT AWAY.  At limit up nobody will offer, so the ask goes
+         missing; at limit down nobody bids.  Counted across the whole run
+         rather than read off one tick, because a pinned book flickers.
+      2. WHERE THE PRICE SITS against the previous close.  This is what settles
+         a locked book: a band above the close is limit up, below it is down.
+         `ref` is target_stock's adjclose, or orgclose where that is null.
+      3. netChange, and only then.  It comes off the last TRADED price, so it
+         is 0 or null on exactly the stocks being hunted - a last resort, and
+         the q script says the same.
+
+    UNKNOWN is what is left when all three decline, and it is a real answer:
+    a locked stock with no close on file cannot be called, and saying so beats
+    guessing.  Nothing is DROPPED for it - direction is reported, never used to
+    decide whether an order is in scope.
     """
     if noask > nobid:
         return UP
     if nobid > noask:
         return DOWN
+    if ref > 0 and price > 0:
+        if price > ref:
+            return UP
+        if price < ref:
+            return DOWN
+    if net > 0:
+        return UP
+    if net < 0:
+        return DOWN
     return UNKNOWN
+
+
+def pct_from_close(price: float, ref: float) -> Optional[float]:
+    """How far the band sits from the previous close.
+
+    Reported, not filtered on.  limit_up_down.q calls this the sanity check -
+    a genuine limit sits AT the band, so something locked at +0.1% is a locked
+    market and not a limit - but the bands differ enough across APAC that
+    turning it into a threshold needs reference data this does not have.
+    """
+    if ref <= 0 or price <= 0:
+        return None
+    return 100.0 * (price - ref) / ref
 
 
 class Limit(NamedTuple):
@@ -377,14 +438,22 @@ class Limit(NamedTuple):
     ticks: int
     noask: int = 0
     nobid: int = 0
+    net: float = 0.0
 
     @property
     def minutes(self) -> float:
         return (self.end - self.start) / 60_000.0
 
     @property
-    def direction(self) -> str:
-        return direction_of(self.noask, self.nobid)
+    def locked(self) -> bool:
+        """Neither side went missing, so the book alone cannot call it."""
+        return self.noask == self.nobid
+
+    def direction(self, ref: float = 0.0) -> str:
+        """A method rather than a property: a locked period cannot be called
+        without the stock's previous close, and the period does not carry it -
+        it belongs to the stock, and arrives with the order."""
+        return direction_of(self.noask, self.nobid, self.price, ref, self.net)
 
 
 def to_orders(records) -> list:
@@ -401,7 +470,9 @@ def to_orders(records) -> list:
             side=_s(r.get("side")), size=_i(r.get("size")),
             t_start=_ms(r.get("t_start")), t_end=_ms(r.get("t_end")),
             client_id=fix_tag(r.get("fixmsg")),
-            id_target=_i(r.get("id_target"))))
+            id_target=_i(r.get("id_target")),
+            #  adjclose first, orgclose where it is null - q's orgclose^adjclose
+            ref=_f(r.get("adjclose")) or _f(r.get("orgclose"))))
     return out
 
 
@@ -442,7 +513,7 @@ def to_limits(records, d=None, min_mins=MIN_LIMIT_MINS) -> list:
         lim = Limit(sym=_s(r.get("sym")), date=_d(r.get("date")) or d,
                     start=start, end=end, price=price,
                     ticks=_i(r.get("ticks")), noask=_i(r.get("noask")),
-                    nobid=_i(r.get("nobid")))
+                    nobid=_i(r.get("nobid")), net=_f(r.get("net")))
         if lim.minutes < min_mins:
             continue
         out.append(lim)
@@ -682,11 +753,12 @@ RAW_HEADER = (
     "date", "region", "sym", "side", "id_server", "id_target", "tag_9604",
     "order_qty", "executed", "completion_pct", "order_start", "order_end",
     "limit_periods", "limit_first_start", "limit_last_end", "limit_mins",
-    "limit_price", "limit_dir", "limit_noask", "limit_nobid", "overlap_mins",
+    "limit_price", "ref_close", "pct_from_close", "limit_dir", "limit_noask",
+    "limit_nobid", "limit_net", "limit_locked", "overlap_mins",
 )
 
 
-def line_direction(periods) -> str:
+def line_direction(periods, ref: float = 0.0) -> str:
     """One direction for a line that may cover several periods.
 
     `mixed` when they disagree - a stock that was limit down in the morning and
@@ -695,10 +767,14 @@ def line_direction(periods) -> str:
     """
     if not periods:
         return ""
-    got = {w.direction for w in periods}
+    got = {w.direction(ref) for w in periods}
     if len(got) == 1:
         return got.pop()
     return "mixed"
+
+
+def _pct(v) -> str:
+    return "" if v is None else f"{v:.2f}"
 
 
 def _hms(ms) -> str:
@@ -742,8 +818,12 @@ def raw_rows(orders, executed, hits) -> list:
             _hms(got[-1].end) if got else "",
             f"{sum(w.minutes for w in got):.1f}" if got else "",
             f"{got[0].price:g}" if got else "",
-            line_direction(got),
+            f"{o.ref:g}" if o.ref else "",
+            _pct(pct_from_close(got[0].price, o.ref)) if got else "",
+            line_direction(got, o.ref),
             sum(w.noask for w in got), sum(w.nobid for w in got),
+            f"{got[0].net:g}" if got and got[0].net else "",
+            "yes" if got and all(w.locked for w in got) else "no",
             f"{overlap_mins(o, got):.1f}",
         ])
     return out
@@ -884,7 +964,8 @@ def run(args) -> int:
 # =============================================================================
 
 def _t(idt, region, size, d=None, srv=1, sym=None, side="sell",
-       t_start=9 * 3_600_000 + 1_800_000, t_end=15 * 3_600_000, cid=None):
+       t_start=9 * 3_600_000 + 1_800_000, t_end=15 * 3_600_000, cid=None,
+       adjclose=100.0, orgclose=None):
     """One target row.  cid goes into fixmsg as tag 9604 the way the client
     really sends it, so the fixture exercises the parse too."""
     sfx = dict((r.code, r.suffixes[0]) for r in REGIONS).get(region,
@@ -898,7 +979,8 @@ def _t(idt, region, size, d=None, srv=1, sym=None, side="sell",
             "sidesign": -1 if side == "sell" else 1, "size": size,
             #  None is a real value here: a target still working has no t_end
             "t_start": _td(t_start), "t_end": _td(t_end),
-            "fixmsg": fix + "59=0"}
+            "fixmsg": fix + "59=0",
+            "adjclose": adjclose, "orgclose": orgclose}
 
 
 def _td(ms):
@@ -910,11 +992,16 @@ def _wo(idw, idt, make, d=None, srv=1):
             "make": make}
 
 
-def _lim(sym, start, end, price=100.0, ticks=50, d=None, noask=50, nobid=0):
-    """Default is a limit UP: the ask is the side that went missing."""
+def _lim(sym, start, end, price=100.0, ticks=50, d=None, noask=50, nobid=0,
+         net=0.0):
+    """Default is a limit UP: the ask is the side that went missing.
+
+    noask=nobid is a LOCKED period - bid = ask, neither side away - which is
+    what price against the close, and then net, are there to settle.
+    """
     return {"sym": sym, "date": d, "start": dt.timedelta(milliseconds=start),
             "end": dt.timedelta(milliseconds=end), "price": price,
-            "ticks": ticks, "noask": noask, "nobid": nobid}
+            "ticks": ticks, "noask": noask, "nobid": nobid, "net": net}
 
 
 def demo_session(d=None):
@@ -940,6 +1027,13 @@ def demo_session(d=None):
             lims.append(_lim(sym, start, end, price=10.0 + (k % 400) / 4.0,
                              d=d, noask=up, nobid=down))
             wr.append(_wo(k, k, int(size * fill), d=d))
+    #  a LOCKED stock with no close on file: nothing can call it, and it stays
+    #  in scope anyway - unknown is an answer, not a reason to drop an order
+    k += 1
+    tr.append(_t(k, "JP", 120_000, d=d, adjclose=None, orgclose=None))
+    lims.append(_lim(tr[-1]["sym"], 11 * H, 12 * H, d=d, noask=0, nobid=0,
+                     net=0.0))
+    wr.append(_wo(k, k, 60_000, d=d))
     #  one stock that only blipped: under the minimum, so its order is out
     k += 1
     tr.append(_t(k, "JP", 99_000, d=d))
@@ -1105,11 +1199,10 @@ def self_test() -> int:
     dorders, dex, dhits, drows, dtot = demo_session()
     check("the demo has orders in every region",
           [r.code for r in drows if not r.orders], [])
-    check("the blip is under the minimum and is not one of them",
-          dtot.orders, sum(n for _c, n, _f in
-                           (("JP", 26, 0), ("KR", 19, 0), ("CN", 22, 0),
-                            ("TW", 11, 0), ("TH", 7, 0), ("MY", 5, 0),
-                            ("ID", 4, 0), ("IN", 9, 0))))
+    #  103 shaped orders, plus the locked one with no close on file.  The
+    #  two-minute blip and the order that finished before its limit are OUT
+    check("every order that met a limit is counted, and only those",
+          dtot.orders, 103 + 1)
     check("the columns add up to the full width",
           round(sum(c[1] for c in REGION_COLS), 6), 1.0)
     check("the page shows what was asked and what was done",
@@ -1136,14 +1229,45 @@ def self_test() -> int:
     print("\nwhich limit it was")
     check("no ask means nobody will offer: limit up", direction_of(60, 0), UP)
     check("no bid means limit down", direction_of(0, 60), DOWN)
-    check("a locked run has neither side missing and cannot be called",
-          direction_of(0, 0), UNKNOWN)
-    check("nor can an equal count", direction_of(30, 30), UNKNOWN)
     check("it is the run that decides, not the last tick",
           direction_of(59, 1), UP)
+    #  a LOCKED book - bid = ask, neither side away - is a real limit, and the
+    #  side that went missing cannot answer it because neither did
+    check("locked, and the band is above the close: limit up",
+          direction_of(0, 0, price=1250.0, ref=1000.0), UP)
+    check("locked, and below it: limit down",
+          direction_of(0, 0, price=750.0, ref=1000.0), DOWN)
+    check("the close outranks netChange, which comes off the last trade",
+          direction_of(0, 0, price=750.0, ref=1000.0, net=5.0), DOWN)
+    check("netChange only when there is no close on file",
+          direction_of(0, 0, price=750.0, ref=0.0, net=5.0), UP)
+    check("and negative is down", direction_of(0, 0, net=-5.0), DOWN)
+    check("locked with no close and no netChange cannot be called",
+          direction_of(0, 0), UNKNOWN)
+    check("a price exactly at the close says nothing either",
+          direction_of(0, 0, price=1000.0, ref=1000.0), UNKNOWN)
+    check("one side missing still wins over the close, whatever it says",
+          direction_of(0, 60, price=1250.0, ref=1000.0), DOWN)
     check("a period carries its own direction",
           to_limits([_lim("7203.JP", 11 * H, 12 * H, noask=0,
-                          nobid=60)])[0].direction, DOWN)
+                          nobid=60)])[0].direction(), DOWN)
+    check("and knows whether it was locked",
+          [to_limits([_lim("a", 11 * H, 12 * H, noask=0, nobid=0)])[0].locked,
+           to_limits([_lim("a", 11 * H, 12 * H, noask=9, nobid=0)])[0].locked],
+          [True, False])
+    check("how far the band sat from the close",
+          round(pct_from_close(1100.0, 1000.0), 2), 10.0)
+    check("no close on file is not 0%, it is nothing to measure against",
+          pct_from_close(1100.0, 0.0), None)
+    check("the close arrives on the ORDER, adjclose first",
+          to_orders([_t(1, "JP", 1, adjclose=12.5, orgclose=99.0)])[0].ref,
+          12.5)
+    check("orgclose where adjclose is null",
+          to_orders([_t(1, "JP", 1, adjclose=None, orgclose=99.0)])[0].ref,
+          99.0)
+    check("and neither is no reference at all, never a price of zero",
+          to_orders([_t(1, "JP", 1, adjclose=None, orgclose=None)])[0].ref,
+          0.0)
     #  unknown is REPORTED, never dropped - the old report threw these away
     unk = to_orders([_t(1, "JP", 1000, t_start=9 * H, t_end=15 * H)])
     ul = to_limits([_lim(unk[0].sym, 11 * H, 12 * H, noask=0, nobid=0)])
@@ -1157,6 +1281,9 @@ def self_test() -> int:
                                          nobid=0),
                                     _lim("a", 12 * H, 13 * H, noask=0,
                                          nobid=9)])), "mixed")
+    check("a locked line is called with the order's own close",
+          line_direction(to_limits([_lim("a", 10 * H, 11 * H, price=1250.0,
+                                         noask=0, nobid=0)]), 1000.0), UP)
     check("no period at all is empty, not a direction", line_direction([]), "")
 
     print("\nthe raw rows")
