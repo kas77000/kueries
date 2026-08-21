@@ -55,7 +55,7 @@ looks wrong.
 
 ```
 date,region,sym,side,otype,id_server,id_target,tag_9604,order_qty,executed,
-completion_pct,order_start,order_end,limit_periods,limit_first_start,
+completion_pct,t_gen,order_start,order_end,limit_periods,limit_first_start,
 limit_last_end,limit_mins,limit_price,ref_close,pct_from_close,limit_dir,
 limit_noask,limit_nobid,limit_net,limit_locked,overlap_mins,splits,
 split_first_gen,split_last_off
@@ -79,6 +79,7 @@ question this is being built towards lives.
 | `order_qty` | `target.size` | what this send asked for |
 | `executed` | Σ `workorder.make` | what its children did, whatever state they ended in |
 | `completion_pct` | `executed / order_qty` | empty when there was no quantity to measure against — which is not the same as 0% |
+| `t_gen` | `target.t_gen` | when the **order** was created. Not `split_first_gen`, which is the first child's |
 | `order_start`, `order_end` | `target.t_start`, `t_end` | the order's live window, `HH:MM:SS`, ready to type back into a query. **Empty end = still working** |
 
 #### The limit — from `qatt`, and `target_stock` for the close
@@ -266,8 +267,35 @@ session** instead of only the one in force at `now`.
 
 ## Which orders are in scope
 
-`target` rows on the eight regions, **every side**, no `target_state` join —
-this is a historical report, so there is no "currently activated" to filter on.
+`target` rows on the eight regions, **every side**. No filter on *which* state
+an order reached — this is a historical report, so there is no "currently
+activated" to ask about.
+
+### Orders that were over before they began
+
+An order **cancelled before its own `t_start`** never worked. Nothing of it was
+ever going to reach the book, so counting it as an order that sat through a
+limit is counting a false positive. Those are **dropped**, and the run says how
+many:
+
+```
+14 of 312 orders were over before their own t_start - cancelled before
+they worked - and are out
+```
+
+The test is the **last `target_state` row against `t_start`**: if the order's
+life ended before it began, it did not begin. Last by *time*, decided in Python
+rather than with a `by` in the query — grouping it down to one row per order in
+q would hand back an answer with no way to see what it stood for, and this is
+the evidence a whole order gets dropped on.
+
+**Nothing is dropped on missing evidence.** No state row, a state row with no
+time, or an order with no `t_start` all mean the question cannot be answered,
+and the order stays. An order silently removed for want of a row in another
+table is worse than one that should not be there: the first is invisible, the
+second shows up in `--raw`. A state row exactly *at* `t_start` is not before it.
+
+### The overlap test
 
 An order is in scope when its live window `[t_start, t_end]` **overlaps any
 qualifying period** on its own `(date, sym)`. An order that finished before its
@@ -348,7 +376,7 @@ conversion anywhere. That is relied on and is not a gap.
 
 Nothing is grouped in q: a `target` row is one send and a `workorder` row is one
 child. Every sum and count happens in Python, where `--self-test` can prove it —
-118 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
+130 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
 synthetic data.
 
 ---

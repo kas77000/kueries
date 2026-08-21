@@ -161,22 +161,23 @@ def region_of(sym) -> Optional[str]:
 Q_ORDERS = """
 {[hist;d;sfx]
   et:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; side:0#`;
-         sidesign:0#0i; size:0#0i; otype:0#`; t_start:0#0Nt; t_end:0#0Nt;
-         fixmsg:0#`; adjclose:0#0n; orgclose:0#0n);
+         sidesign:0#0i; size:0#0i; otype:0#`; t_gen:0#0Nt; t_start:0#0Nt;
+         t_end:0#0Nt; fixmsg:0#`; adjclose:0#0n; orgclose:0#0n);
   ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i;
          t_gen:0#0Nt; t_off_market:0#0Nt);
+  es:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; time:0#0Nt; state:0#`);
 
   / parents.  Every side: a limit up is favourable to a seller and a limit down
   / to a buyer, and an unfavourable one can still be marketable, so nothing is
   / filtered away on side here.
   t:$[hist;
-      select date,id_server,id_target,sym,side,sidesign,size,otype,t_start,
-          t_end,fixmsg
+      select date,id_server,id_target,sym,side,sidesign,size,otype,t_gen,
+          t_start,t_end,fixmsg
         from target where date=d, any (upper sym) like/: sfx;
       update date:0Nd from select id_server,id_target,sym,side,sidesign,size,
-          otype,t_start,t_end,fixmsg
+          otype,t_gen,t_start,t_end,fixmsg
         from target where any (upper sym) like/: sfx];
-  if[0=count t; :(et;ew)];
+  if[0=count t; :(et;ew;es)];
 
   ids:exec distinct id_target from t;
 
@@ -201,7 +202,15 @@ Q_ORDERS = """
       update date:0Nd from select id_server,id_work,id_target,make,t_gen,
           t_off_market
         from workorder where id_target in ids];
-  (t;w)
+  / every state row, ungrouped.  Which one is LAST is decided in Python,
+  / where the self test can prove it - grouping it down to one row per order
+  / here would hand back an answer with no way to see what it stood for.
+  st:$[hist;
+      select date,id_server,id_target,time,state from target_state
+        where date=d, id_target in ids;
+      update date:0Nd from select id_server,id_target,time,state
+        from target_state where id_target in ids];
+  (t;w;st)
   }
 """
 
@@ -274,8 +283,10 @@ _UNUSED_DATE = dt.date(2000, 1, 1)
 
 def fetch_orders(handle, hist: bool, d: Optional[dt.date]):
     sfx = [p.encode() for p in SYM_PATTERNS]
-    t, w = handle(Q_ORDERS, hist, d if d is not None else _UNUSED_DATE, sfx)
-    return t.pd().to_dict("records"), w.pd().to_dict("records")
+    t, w, st = handle(Q_ORDERS, hist,
+                      d if d is not None else _UNUSED_DATE, sfx)
+    return (t.pd().to_dict("records"), w.pd().to_dict("records"),
+            st.pd().to_dict("records"))
 
 
 def fetch_limits(handle, hist: bool, d: Optional[dt.date], syms):
@@ -369,6 +380,7 @@ class Order(NamedTuple):
     side: str
     otype: str                 # `market`, `limit`, ... - as the feed sends it
     size: int
+    t_gen: Optional[int]       # when the order was CREATED, ms since midnight
     t_start: Optional[int]     # ms since midnight
     t_end: Optional[int]
     client_id: str             # FIX tag 9604, "" when the client sent none
@@ -473,7 +485,7 @@ def to_orders(records) -> list:
                  _i(r.get("id_target"))),
             date=_d(r.get("date")), region=region, sym=sym,
             side=_s(r.get("side")), otype=_s(r.get("otype")),
-            size=_i(r.get("size")),
+            size=_i(r.get("size")), t_gen=_ms(r.get("t_gen")),
             t_start=_ms(r.get("t_start")), t_end=_ms(r.get("t_end")),
             client_id=fix_tag(r.get("fixmsg")),
             id_target=_i(r.get("id_target")),
@@ -531,6 +543,65 @@ def made_of(splits, key) -> int:
     """What an order executed.  No children at all is 0, not missing."""
     got = splits.get(key)
     return got.made if got else 0
+
+
+class LastState(NamedTuple):
+    at: Optional[int]          # ms since midnight
+    state: str
+
+
+def last_state_by_order(records, orders) -> dict:
+    """{order key: the LAST target_state row it had}.
+
+    Last by time, decided here rather than in the query: `last state by
+    id_target` in q hands back one row per order with no way to see what it
+    stood for, and this is the evidence a whole order gets dropped on.
+
+    A row with no time cannot be the last one - it cannot be ordered at all,
+    and treating it as midnight would make it the FIRST.
+    """
+    known = {o.key for o in orders}
+    out = {}
+    for r in records:
+        key = (_d(r.get("date")), _i(r.get("id_server")),
+               _i(r.get("id_target")))
+        if key not in known:
+            continue
+        at = _ms(r.get("time"))
+        if at is None:
+            continue
+        got = out.get(key)
+        if got is None or at >= got.at:
+            out[key] = LastState(at, _s(r.get("state")))
+    return out
+
+
+def died_before_starting(o, last) -> bool:
+    """Was this order over before its own start time?
+
+    An order cancelled before t_start never worked: nothing of it was ever
+    going to reach the book, so counting it as an order that sat through a
+    limit is counting a false positive.  The test is the LAST target_state
+    row against t_start - if the order's life ended before it began, it did
+    not begin.
+
+    NOT DROPPED ON MISSING EVIDENCE.  No state row and no t_start both mean
+    the question cannot be answered, and an order silently removed for want
+    of a row in another table is worse than one that should not be there:
+    the first is invisible, the second shows up in the raw file.
+    """
+    if last is None or last.at is None or o.t_start is None:
+        return False
+    return last.at < o.t_start
+
+
+def drop_dead_on_arrival(orders, states) -> tuple:
+    """(the orders that had a life, the ones that were over first)."""
+    keep, dead = [], []
+    for o in orders:
+        (dead if died_before_starting(o, states.get(o.key)) else
+         keep).append(o)
+    return keep, dead
 
 
 def to_limits(records, d=None, min_mins=MIN_LIMIT_MINS) -> list:
@@ -790,8 +861,8 @@ def write_csv(rows, tot, out_dir, stem) -> Path:
 
 RAW_HEADER = (
     "date", "region", "sym", "side", "otype", "id_server", "id_target",
-    "tag_9604", "order_qty", "executed", "completion_pct", "order_start",
-    "order_end", "limit_periods", "limit_first_start", "limit_last_end",
+    "tag_9604", "order_qty", "executed", "completion_pct", "t_gen",
+    "order_start", "order_end", "limit_periods", "limit_first_start", "limit_last_end",
     "limit_mins", "limit_price", "ref_close", "pct_from_close", "limit_dir",
     "limit_noask", "limit_nobid", "limit_net", "limit_locked", "overlap_mins",
     "splits", "split_first_gen", "split_last_off",
@@ -854,7 +925,7 @@ def raw_rows(orders, splits, hits) -> list:
             o.id_target,
             o.client_id, o.size, ex,
             "" if comp is None else f"{comp:.1f}",
-            _hms(o.t_start), _hms(o.t_end),
+            _hms(o.t_gen), _hms(o.t_start), _hms(o.t_end),
             len(got),
             _hms(got[0].start) if got else "",
             _hms(got[-1].end) if got else "",
@@ -946,15 +1017,20 @@ def run(args) -> int:
     oh = connect(pl.order_server)
     qh = connect(pl.qatt_server)
 
-    orders, executed, hits, seen, no_limit_days = [], {}, {}, 0, 0
+    orders, executed, hits = [], {}, {}
+    seen, cancelled, no_limit_days = 0, 0, 0
     for d in pl.dates:
         if not args.quiet and d is not None:
             log(f"  {d} ...")
-        pr, wr = fetch_orders(oh, pl.hist, d)
+        pr, wr, sr = fetch_orders(oh, pl.hist, d)
         day = to_orders(pr)
         if not day:
             continue
         seen += len(day)
+        day, dead = drop_dead_on_arrival(day, last_state_by_order(sr, day))
+        cancelled += len(dead)
+        if not day:
+            continue
         syms = sorted({o.sym for o in day})
         lims = to_limits(fetch_limits(qh, pl.hist, d, syms), d, args.min_mins)
         if not lims:
@@ -973,8 +1049,11 @@ def run(args) -> int:
     rows = by_region(orders, executed)
     tot = totals(rows)
 
-    log(f"  {seen:,} orders in scope, {tot.orders:,} of them were live while "
-        f"their stock was at a limit")
+    if cancelled:
+        log(f"  {cancelled:,} of {seen:,} orders were over before their own "
+            f"t_start - cancelled before they worked - and are out")
+    log(f"  {seen - cancelled:,} orders in scope, {tot.orders:,} of them were "
+        f"live while their stock was at a limit")
     if seen and not tot.orders:
         log(f"  WARNING: {seen:,} orders were in scope and NOT ONE was live "
             f"through a limit period. Check {pl.qatt_server} has the syms, and "
@@ -1007,7 +1086,7 @@ def run(args) -> int:
 # =============================================================================
 
 def _t(idt, region, size, d=None, srv=1, sym=None, side="sell",
-       otype="limit", t_start=9 * 3_600_000 + 1_800_000,
+       otype="limit", t_gen=9 * 3_600_000, t_start=9 * 3_600_000 + 1_800_000,
        t_end=15 * 3_600_000, cid=None, adjclose=100.0, orgclose=None):
     """One target row.  cid goes into fixmsg as tag 9604 the way the client
     really sends it, so the fixture exercises the parse too."""
@@ -1022,6 +1101,7 @@ def _t(idt, region, size, d=None, srv=1, sym=None, side="sell",
             "sidesign": -1 if side == "sell" else 1, "size": size,
             "otype": otype,
             #  None is a real value here: a target still working has no t_end
+            "t_gen": _td(t_gen),
             "t_start": _td(t_start), "t_end": _td(t_end),
             "fixmsg": fix + "59=0",
             "adjclose": adjclose, "orgclose": orgclose}
@@ -1039,6 +1119,12 @@ def _wo(idw, idt, make, d=None, srv=1, gen=None, off=None):
             "make": make, "t_gen": _td(gen), "t_off_market": _td(off)}
 
 
+def _ts(idt, at, state="cancelled", d=None, srv=1):
+    """One target_state row - one thing that happened to the order."""
+    return {"date": d, "id_server": srv, "id_target": idt,
+            "time": _td(at), "state": state}
+
+
 def _lim(sym, start, end, price=100.0, ticks=50, d=None, noask=50, nobid=0,
          net=0.0):
     """Default is a limit UP: the ask is the side that went missing.
@@ -1054,7 +1140,7 @@ def _lim(sym, start, end, price=100.0, ticks=50, d=None, noask=50, nobid=0,
 def demo_session(d=None):
     """(orders, executed, rows, totals) for one made up session."""
     H = 3_600_000
-    tr, wr, lims = [], [], []
+    tr, wr, lims, sr = [], [], [], []
     k = 0
     shape = (("JP", 26, 0.72), ("KR", 19, 0.41), ("CN", 22, 0.55),
              ("TW", 11, 0.63), ("TH", 7, 0.38), ("MY", 5, 0.51),
@@ -1084,6 +1170,12 @@ def demo_session(d=None):
                 wr.append(_wo(1000 * k + j, k, done // n_sp, d=d,
                               gen=start + j * 60_000,
                               off=start + (j + 1) * 300_000))
+    #  an order CANCELLED BEFORE IT STARTED: its last state row is earlier
+    #  than its own t_start, so it never worked and is not one of ours
+    k += 1
+    tr.append(_t(k, "JP", 500_000, d=d, t_gen=9 * H, t_start=10 * H))
+    sr.append(_ts(k, 9 * H + 60_000, "cancelled", d=d))
+    lims.append(_lim(tr[-1]["sym"], 11 * H, 12 * H, d=d))
     #  an order that sat through a limit and NEVER SENT A CHILD.  0 splits,
     #  no times, and the case this is all being built towards
     k += 1
@@ -1108,6 +1200,8 @@ def demo_session(d=None):
     wr.append(_wo(k, k, 88_000, d=d))
 
     orders = to_orders(tr)
+    orders, _dead = drop_dead_on_arrival(orders,
+                                         last_state_by_order(sr, orders))
     kept, hits = touched(orders, to_limits(lims, d))
     ex = splits_by_order(wr, kept)
     rows = by_region(kept, ex)
@@ -1184,6 +1278,39 @@ def self_test() -> int:
     check("minutes are the window, not the tick count",
           to_limits([_lim("7203.JP", 11 * H, 11 * H + 1_800_000)],
                     min_mins=20.0)[0].minutes, 30.0)
+
+    print("\nover before it began")
+    #  an order cancelled before its own t_start never worked, so counting
+    #  it as one that sat through a limit is counting a false positive
+    dd = to_orders([_t(1, "JP", 1000, t_gen=9 * H, t_start=10 * H),
+                    _t(2, "JP", 1000, t_gen=9 * H, t_start=10 * H)])
+    st = last_state_by_order([_ts(1, 9 * H + 60_000, "cancelled"),
+                              _ts(2, 14 * H, "done")], dd)
+    check("the last state row is the last one by TIME, not by arrival",
+          st[dd[1].key].at, 14 * H)
+    check("and it carries what it was", st[dd[1].key].state, "done")
+    keep, dead = drop_dead_on_arrival(dd, st)
+    check("an order whose life ended before it began is out",
+          [o.id_target for o in dead], [1])
+    check("one that outlived its start is in",
+          [o.id_target for o in keep], [2])
+    #  the boundary: a state row AT t_start is not before it
+    at = to_orders([_t(1, "JP", 1000, t_start=10 * H)])
+    check("exactly at t_start is not before it",
+          drop_dead_on_arrival(at, last_state_by_order(
+              [_ts(1, 10 * H, "cancelled")], at))[1], [])
+    #  never dropped on missing evidence
+    check("no state row at all cannot answer the question, so it stays",
+          len(drop_dead_on_arrival(at, {})[0]), 1)
+    check("nor can a state row with no time",
+          len(drop_dead_on_arrival(at, last_state_by_order(
+              [_ts(1, None, "cancelled")], at))[0]), 1)
+    nos = to_orders([_t(1, "JP", 1000, t_start=None)])
+    check("nor an order with no start time to compare against",
+          len(drop_dead_on_arrival(nos, last_state_by_order(
+              [_ts(1, 10 * H, "cancelled")], nos))[0]), 1)
+    check("a state row belonging to another order is not evidence here",
+          last_state_by_order([_ts(99, 9 * H, "cancelled")], at), {})
 
     print("\nwhich orders the limit touched")
     ords = to_orders([_t(1, "JP", 1000, t_start=9 * H, t_end=15 * H),
@@ -1263,8 +1390,9 @@ def self_test() -> int:
     check("the demo has orders in every region",
           [r.code for r in drows if not r.orders], [])
     #  103 shaped orders, plus the locked one with no close on file and the
-    #  one that never sent a child.  The two-minute blip and the order that
-    #  finished before its limit are OUT
+    #  one that never sent a child.  OUT: the two-minute blip, the order
+    #  that finished before its limit, and the one cancelled before it
+    #  started - which sat through a limit and would otherwise be counted
     check("every order that met a limit is counted, and only those",
           dtot.orders, 103 + 2)
     check("the columns add up to the full width",
@@ -1323,6 +1451,8 @@ def self_test() -> int:
           round(pct_from_close(1100.0, 1000.0), 2), 10.0)
     check("no close on file is not 0%, it is nothing to measure against",
           pct_from_close(1100.0, 0.0), None)
+    check("t_gen is on the order, and is when it was CREATED",
+          to_orders([_t(1, "JP", 1, t_gen=9 * H)])[0].t_gen, 9 * H)
     check("the close arrives on the ORDER, adjclose first",
           to_orders([_t(1, "JP", 1, adjclose=12.5, orgclose=99.0)])[0].ref,
           12.5)
@@ -1441,6 +1571,11 @@ def self_test() -> int:
           one[RAW_HEADER.index("overlap_mins")], "30.0")
     check("times are HH:MM:SS, ready to type back into a query",
           one[RAW_HEADER.index("limit_first_start")], "11:00:00")
+    check("the order's own t_gen is on the line, beside its window",
+          [RAW_HEADER[RAW_HEADER.index("t_gen") + i] for i in (0, 1, 2)],
+          ["t_gen", "order_start", "order_end"])
+    check("and it is the target's t_gen, not the first child's",
+          one[RAW_HEADER.index("t_gen")], "09:00:00")
     check("an order still open overlaps to the end of the day, not to zero",
           overlap_mins(to_orders([_t(1, "JP", 1, t_start=11 * H,
                                      t_end=None)])[0],
