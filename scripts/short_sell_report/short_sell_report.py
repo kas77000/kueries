@@ -289,36 +289,36 @@ def fetch(handle, hist: bool, d: Optional[dt.date]):
                   sfx, SHORTSELL_SIDE.encode())
     return t.pd().to_dict("records"), w.pd().to_dict("records")
 
-# Why a workorder was rejected is NOT on workorder - it has no text field at
-# all.  It is on EXECUTION, the message stream back from the venue: `ostat` is
-# the status it came back with, and `comment` / `fixtags` carry whatever text
-# came with it (FIX tag 58 Text, tag 103 OrdRejReason).
+# Why an order was rejected is on ALERTS.  Not on workorder, which has no text
+# field, and not on execution: a rejected order HAS no execution, and ostat and
+# comment there mean something else entirely.
 #
-# This query does not decide what a reject looks like there.  It pulls every
-# execution row belonging to the workorders ALREADY known to be rejected, and
-# --reject-reasons prints the distinct values.  Guessing the encoding is what
-# the investigation is supposed to answer.
-Q_REJECT_REASONS = """
-{[hist;d;works]
-  ee:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; sym:0#`;
-         ostat:0#`; comment:0#`; fixtags:0#`);
-  if[0=count works; :ee];
+# alerts holds every alert an order raised, keyed the same way targets are.
+# `alerttype` says what kind and `alertstr` carries the text.  Everything is
+# pulled and the filtering happens in Python, so --self-test can prove the rule
+# and so the run can also say what OTHER alert types were there - a filter that
+# cannot tell you what it discarded is a filter you have to trust blindly.
+Q_ALERTS = """
+{[hist;d;ids]
+  ea:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; alerttype:0#`;
+         alertstr:0#`; ntrigger:0#0i);
+  if[0=count ids; :ea];
   $[hist;
-    select date,id_server,id_work,id_target,sym,ostat,comment,fixtags
-      from execution where date=d, id_work in works;
-    update date:0Nd from select id_server,id_work,id_target,sym,ostat,comment,
-        fixtags
-      from execution where id_work in works]
+    select date,id_server,id_target,sym,alerttype,alertstr,ntrigger
+      from alerts where date=d, id_target in ids;
+    update date:0Nd from select id_server,id_target,sym,alerttype,alertstr,
+        ntrigger
+      from alerts where id_target in ids]
   }
 """
 
 
-def fetch_reject_reasons(handle, hist: bool, d, works):
-    if not works:
+def fetch_alerts(handle, hist: bool, d, ids):
+    if not ids:
         return []
-    r = handle(Q_REJECT_REASONS, hist, d if d is not None else _UNUSED_DATE,
-               [int(w) for w in works])
-    return r.pd().to_dict("records")
+    a = handle(Q_ALERTS, hist, d if d is not None else _UNUSED_DATE,
+               [int(i) for i in ids])
+    return a.pd().to_dict("records")
 
 
 def _check_server(endpoint: str, which: str):
@@ -896,74 +896,128 @@ def report_over_filled(over) -> None:
             f"{sorted({a.size for a in c.attempts})}")
 
 
-def reason_of(rec) -> str:
-    """A one line reason for one execution row.
+# The alert type that means an order was rejected too many times.
+REJECT_ALERT = "REJECTTOOMANY"
 
-    comment first, then the FIX Text tag, then OrdRejReason, then the status
-    on its own.  Whitespace is squeezed and the whole thing truncated, so two
-    rejects that differ only in an order id land on the same line - which is
-    what makes a top 20 mean anything.
+# Which of those alerts are about SHORT SELLING.  Deliberately permissive:
+# "short sell", "short-sell", "shortsell", "short selling", "Short-Selling",
+# "SHORT_SELL", "short sale" all match, because the text is written by whoever
+# wrote that venue's rejection and there is no house style to rely on.
+#
+# No leading word boundary on purpose - an underscore is a word character, so
+# \b would fail on X_SHORTSELL, and nothing plausible matches this by accident.
+SHORT_SELL_RE = r"short[\s\-_]*(?:sell|sale)"
+
+
+def is_short_sell(text) -> bool:
+    """Is this alert about short selling?"""
+    import re
+    return re.search(SHORT_SELL_RE, _s(text), re.I) is not None
+
+
+def normalise_alert(text) -> str:
+    """One alert string, squeezed so near-identical texts group together.
+
+    Whitespace collapses and the line is truncated: two rejects that differ only
+    in an order id or a size must land on the same line, or a top 20 counts
+    nothing but noise.
     """
     import re
-    for got in (_s(rec.get("comment")),
-                fix_tag(rec.get("fixtags"), "58"),
-                fix_tag(rec.get("fixtags"), "103")):
-        got = re.sub(r"\s+", " ", got).strip()
-        if got:
-            return got[:110]
-    return "(no text, status only)"
+    return re.sub(r"\s+", " ", _s(text)).strip()[:110]
 
 
-def reject_reasons(records, splits) -> dict:
-    """{market: [(ostat, reason, count)]}, commonest first.
+class AlertStats(NamedTuple):
+    total: int                 # every alert on the orders in scope
+    rejects: int               # ... of type REJECTTOOMANY
+    short_sell: int            # ... whose text is about short selling
+    other_types: dict          # {alerttype: n} - what was NOT looked at
+    orders: int                # distinct orders raising a short sell reject
+    by_market: dict            # {market: [(text, alerts, triggers, orders)]}
 
-    Keyed off the workorders already known to be rejected, so nothing here
-    depends on how a reject is spelled in `execution` - the point is to SEE how
-    it is spelled.
-    """
+
+def reject_alerts(records, attempts) -> AlertStats:
+    """The short sell rejection alerts, per market, commonest first."""
     market = {}
-    for sp in splits:
-        if sp.rejected:
-            market[sp.id_work] = sp.country
-    counts = {}
+    for a in attempts:
+        market[a.key] = a.country
+
+    total = rejects = 0
+    other, counts, orders = {}, {}, {}
     for r in records:
-        w = _i(r.get("id_work"))
-        m = market.get(w)
+        total += 1
+        atype = _s(r.get("alerttype")).strip()
+        if atype.upper() != REJECT_ALERT:
+            other[atype or "(none)"] = other.get(atype or "(none)", 0) + 1
+            continue
+        rejects += 1
+        if not is_short_sell(r.get("alertstr")):
+            continue
+        key = (_d(r.get("date")), _i(r.get("id_server")),
+               _i(r.get("id_target")))
+        #  the order's own market, falling back to the alert's sym for a row
+        #  whose target is not in scope
+        m = market.get(key) or market_of(r.get("sym"))
         if m is None:
             continue
-        k = (_s(r.get("ostat")) or "(none)", reason_of(r))
+        text = normalise_alert(r.get("alertstr"))
+        #  group CASE INSENSITIVELY but keep the spellings, and display the
+        #  commonest.  "Short Sell" and "SHORT SELL" are one reason; the
+        #  punctuation is NOT folded, because "short-sell" against "short sell"
+        #  may be two venues wording the same rule and merging them would hide
+        #  that rather than reveal it
+        k = text.lower()
         counts.setdefault(m, {})
-        counts[m][k] = counts[m].get(k, 0) + 1
-    return {m: sorted(((o, t, n) for (o, t), n in c.items()),
-                      key=lambda x: -x[2])
-            for m, c in counts.items()}
+        cur = counts[m].get(k, [0, 0, {}])
+        cur[0] += 1
+        cur[1] += max(_i(r.get("ntrigger")), 1)
+        cur[2][text] = cur[2].get(text, 0) + 1
+        counts[m][k] = cur
+        orders.setdefault(m, {}).setdefault(k, set()).add(key)
+
+    by_market = {
+        m: sorted(((max(spell, key=spell.get), n, trg, len(orders[m][k]))
+                   for k, (n, trg, spell) in c.items()), key=lambda x: -x[1])
+        for m, c in counts.items()}
+    return AlertStats(total=total, rejects=rejects,
+                      short_sell=sum(n for rows in by_market.values()
+                                     for _t, n, _g, _o in rows),
+                      other_types=other,
+                      orders=len({k for m in orders for t in orders[m]
+                                  for k in orders[m][t]}),
+                      by_market=by_market)
 
 
-def dump_reject_reasons(by_market_reasons, splits, seen_works, top=20) -> int:
-    """The top distinct rejection reasons per market, for the terminal."""
-    rejected = [sp for sp in splits if sp.rejected]
-    if not rejected:
-        print("no rejected workorders in this session")
+def dump_reject_alerts(st: AlertStats, top=20) -> int:
+    """The commonest short sell rejection reasons per market, for the terminal."""
+    print(f"{st.total:,} alerts on the orders in scope: {st.rejects:,} are "
+          f"{REJECT_ALERT}, {st.short_sell:,} of those are about short selling "
+          f"(over {st.orders:,} orders)")
+    if st.other_types:
+        shown = sorted(st.other_types.items(), key=lambda kv: -kv[1])[:8]
+        print("  other alert types, not looked at: "
+              + ", ".join(f"{k} {v:,}" for k, v in shown)
+              + (f", and {len(st.other_types) - len(shown)} more"
+                 if len(st.other_types) > len(shown) else ""))
+    if st.rejects and not st.short_sell:
+        print(f"  NOTE: {st.rejects:,} {REJECT_ALERT} alerts matched none of "
+              f"the short sell wording. Check SHORT_SELL_RE against one of "
+              f"them by hand before concluding there were none.")
+    if not st.by_market:
         return 0
-    covered = sum(1 for sp in rejected if sp.id_work in seen_works)
-    print(f"{len(rejected):,} rejected workorders, {covered:,} with an "
-          f"execution row ({100.0 * covered / len(rejected):.1f}%)")
-    if covered < len(rejected):
-        print(f"  the other {len(rejected) - covered:,} never produced an "
-              f"execution row, so nothing here explains them")
 
     for m in MARKETS:
-        rows = by_market_reasons.get(m.code)
+        rows = st.by_market.get(m.code)
         if not rows:
             continue
-        total = sum(n for _o, _t, n in rows)
-        print(f"\n{m.name}  -  {total:,} execution row"
-              f"{'' if total == 1 else 's'} over {len(rows):,} distinct "
-              f"reason{'' if len(rows) == 1 else 's'}"
+        tot = sum(n for _t, n, _g, _o in rows)
+        print(f"\n{m.name}  -  {tot:,} alert{'' if tot == 1 else 's'} over "
+              f"{len(rows):,} distinct text{'' if len(rows) == 1 else 's'}"
               + (f", top {top}" if len(rows) > top else ""))
-        print(f"  {'count':>7}  {'share':>6}  {'ostat':<16}reason")
-        for ostat, text, n in rows[:top]:
-            print(f"  {n:>7,}  {100.0 * n / total:>5.1f}%  {ostat:<16}{text}")
+        print(f"  {'alerts':>7}  {'share':>6}  {'orders':>7}  {'trig':>6}  "
+              f"reason")
+        for text, n, trg, ords in rows[:top]:
+            print(f"  {n:>7,}  {100.0 * n / tot:>5.1f}%  {ords:>7,}  "
+                  f"{trg:>6,}  {text}")
     return 0
 
 
@@ -1635,13 +1689,11 @@ def run(args) -> int:
         return dump_untagged(attempts)
 
     if args.reject_reasons:
-        works = [sp.id_work for sp in splits if sp.rejected]
+        ids = sorted({a.id_target for a in attempts})
         recs = []
         for d in pl.dates:
-            recs.extend(fetch_reject_reasons(h, pl.hist, d, works))
-        seen = {_i(r.get("id_work")) for r in recs}
-        return dump_reject_reasons(reject_reasons(recs, splits), splits, seen,
-                                   args.top)
+            recs.extend(fetch_alerts(h, pl.hist, d, ids))
+        return dump_reject_alerts(reject_alerts(recs, attempts), args.top)
 
     chs = to_chains(attempts, args.chain_qty, splits)
     over = over_filled(chs, splits)
@@ -2258,62 +2310,88 @@ def self_test() -> int:
     lines = compare_lines(v1_rows, rows2)
     #  two header lines, a rule, the markets, a rule, the total, a blank and
     #  the note about what cannot differ
-    print("\nwhy a workorder was rejected")
+    print("\nwhich alerts are about short selling")
+    for text in ("Short Sell rejected by venue",
+                 "SHORT-SELL not permitted",
+                 "shortsell blocked",
+                 "Short Selling restricted on this name",
+                 "Short-Selling suspended",
+                 "SHORT_SELL flag missing",
+                 "short  sell  rejected",
+                 "naked short sale rejected",
+                 "SHORTSALE ban in force",
+                 "rejected: shortsells over limit"):
+        check(f"{text!r}", is_short_sell(text), True)
+    for text in ("Price outside band", "Too many cancels", "",
+                 "Long sell rejected", "sold short of the close",
+                 "shorted the position"):
+        check(f"not short selling: {text!r}", is_short_sell(text), False)
+    check("None is not a match, and does not raise", is_short_sell(None),
+          False)
 
-    def _x(idw, idt=1, ostat="rejected", comment="", fixtags="", sym="X.HK"):
-        return {"date": None, "id_server": 1, "id_work": idw, "id_target": idt,
-                "sym": sym, "ostat": ostat, "comment": comment,
-                "fixtags": fixtags}
-
-    check("the comment is the reason when there is one",
-          reason_of(_x(1, comment="Short sell not allowed")),
-          "Short sell not allowed")
-    check("else FIX tag 58, the Text field",
-          reason_of(_x(1, fixtags="35=8;58=Borrow unavailable;103=0")),
-          "Borrow unavailable")
-    check("else tag 103, OrdRejReason",
-          reason_of(_x(1, fixtags="35=8;103=11")), "11")
-    check("and with nothing at all it says so rather than guessing",
-          reason_of(_x(1)), "(no text, status only)")
+    print("\ngrouping the alert texts")
     check("whitespace is squeezed so near-identical texts collapse",
-          reason_of(_x(1, comment="Short   sell\n not\tallowed")),
-          "Short sell not allowed")
-    check("and a very long one is truncated to fit a terminal",
-          len(reason_of(_x(1, comment="x" * 400))), 110)
-    check("a comment of only whitespace falls through to the tags",
-          reason_of(_x(1, comment="   ", fixtags="58=Real reason")),
-          "Real reason")
+          normalise_alert("Short   sell\n  rejected\tby venue"),
+          "Short sell rejected by venue")
+    check("and a long one is truncated to fit a terminal",
+          len(normalise_alert("x" * 400)), 110)
+    check("an empty one stays empty", normalise_alert(None), "")
 
-    #  the market comes from the REJECTED workorder, so nothing here depends on
-    #  how a reject is spelled in execution - seeing that is the point
-    rj_att, _ = to_attempts([_p(1, "HK", 1000), _p(2, "JP", 1000)])
-    rj_sp = to_splits([_c(11, 1, 0, "rejected"), _c(12, 1, 0, "rejected"),
-                       _c(13, 2, 0, "rejected"), _c(14, 2, 500, "filled")],
-                      rj_att)
-    recs = [_x(11, 1, comment="Short sell not allowed"),
-            _x(12, 1, comment="Short sell not allowed"),
-            _x(13, 2, ostat="rej", comment="Price outside band"),
-            _x(14, 2, ostat="filled", comment="never rejected")]
-    got = reject_reasons(recs, rj_sp)
-    check("reasons are grouped by market", sorted(got), ["HK", "JP"])
-    check("commonest first, with a count",
-          got["HK"], [("rejected", "Short sell not allowed", 2)])
-    check("and the other market keeps its own",
-          got["JP"], [("rej", "Price outside band", 1)])
-    check("a workorder that was NOT rejected is ignored",
-          sum(n for rows in got.values() for _o, _t, n in rows), 3)
-    check("the status is carried beside the text, not merged into it",
-          got["JP"][0][0], "rej")
+    def _al(idt, atype, text, sym="X.HK", srv=1, ntrigger=1, d=None):
+        return {"date": d, "id_server": srv, "id_target": idt, "sym": sym,
+                "alerttype": atype, "alertstr": text, "ntrigger": ntrigger}
 
-    said = printed(dump_reject_reasons, got, rj_sp, {11, 12, 13})
-    check("it reports how many rejects it could explain",
-          "3 rejected workorders, 3 with an execution row" in said, True)
-    partial = printed(dump_reject_reasons, got, rj_sp, {11})
-    check("and says plainly when it could not explain them all",
-          "never produced an execution row" in partial, True)
-    check("a session with no rejects says so instead",
-          "no rejected workorders" in printed(
-              dump_reject_reasons, {}, [], set()), True)
+    print("\nrejection alerts, per market")
+    al_att, _ = to_attempts([_p(1, "HK", 1000), _p(2, "HK", 1000),
+                             _p(3, "JP", 1000)])
+    recs = [_al(1, "REJECTTOOMANY", "Short Sell not permitted - no locate", ntrigger=3),
+            _al(2, "REJECTTOOMANY", "SHORT SELL NOT PERMITTED - no locate"),
+            _al(3, "REJECTTOOMANY", "Short Selling restricted"),
+            _al(1, "REJECTTOOMANY", "Price outside daily band"),
+            _al(2, "PRICEFAR", "Short sell far from mid"),
+            _al(3, "LATENCY", "slow venue")]
+    st = reject_alerts(recs, al_att)
+    check("every alert is counted", st.total, 6)
+    check("of which the reject ones", st.rejects, 4)
+    check("and the short sell ones", st.short_sell, 3)
+    check("a REJECTTOOMANY about something else is dropped",
+          all("Price outside" not in t
+              for rows in st.by_market.values() for t, *_ in rows), True)
+    check("and a short sell alert of ANOTHER type is not a rejection",
+          all("far from mid" not in t
+              for rows in st.by_market.values() for t, *_ in rows), True)
+    check("the other types are reported, not silently discarded",
+          st.other_types, {"PRICEFAR": 1, "LATENCY": 1})
+    check("grouped by market", sorted(st.by_market), ["HK", "JP"])
+    check("case does not split one reason in two",
+          len(st.by_market["HK"]), 1)
+    check("and the commonest spelling is the one shown",
+          st.by_market["HK"][0][0], "Short Sell not permitted - no locate")
+    check("punctuation DOES stay separate - two venues wording one rule is "
+          "worth seeing, not hiding",
+          len(reject_alerts([_al(1, "REJECTTOOMANY", "short sell blocked"),
+                             _al(2, "REJECTTOOMANY", "short-sell blocked")],
+                            al_att).by_market["HK"]), 2)
+    check("counted across both orders", st.by_market["HK"][0][1], 2)
+    check("with the triggers summed", st.by_market["HK"][0][2], 4)
+    check("and the distinct orders counted", st.by_market["HK"][0][3], 2)
+    check("orders raising one, overall", st.orders, 3)
+
+    said = printed(dump_reject_alerts, st)
+    check("the run leads with what it kept and what it did not",
+          "4 are REJECTTOOMANY, 3 of those are about short selling" in said,
+          True)
+    check("and names the alert types it never looked at",
+          ("PRICEFAR" in said and "LATENCY" in said), True)
+
+    #  the case that would otherwise look like "no short sell rejections"
+    none_matched = reject_alerts(
+        [_al(1, "REJECTTOOMANY", "Price outside daily band")], al_att)
+    warn = printed(dump_reject_alerts, none_matched)
+    check("rejects that match no short sell wording are FLAGGED, not read as "
+          "an absence", "matched none of the short sell wording" in warn, True)
+    check("a clean run does not carry that warning",
+          "matched none" in said, False)
 
     print("\nreading a notional")
     check("hundreds of millions", fmt_usd(79_241_883), "79.2m")
@@ -2515,10 +2593,10 @@ def main(argv=None) -> int:
                    help="list the chained orders and their attempts, and exit "
                         "- the way to check tag 9604 against the engine")
     p.add_argument("--reject-reasons", action="store_true",
-                   help="print the commonest rejection reasons per market and "
-                        "exit. Reads `ostat`, `comment` and `fixtags` off "
-                        "EXECUTION for the workorders already known to be "
-                        "rejected - workorder itself carries no text")
+                   help="print the commonest SHORT SELL rejection reasons per "
+                        "market and exit. Reads alerttype and alertstr off "
+                        "ALERTS, keeping " + REJECT_ALERT + " alerts whose "
+                        "text is about short selling")
     p.add_argument("--top", type=int, default=20,
                    help="how many distinct reasons per market to show")
     p.add_argument("--no-tag", action="store_true",

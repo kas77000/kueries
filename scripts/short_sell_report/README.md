@@ -331,44 +331,59 @@ data supports it — removing the slow ones would delete a finding.
 ---
 
 
-## Why a workorder was rejected
+## Why an order was rejected
 
 ```
 python scripts/short_sell_report/short_sell_report.py --reject-reasons --date 2026-08-19
 ```
 
-The reason is **not on `workorder`** — it has no text field at all. It is on
-**`execution`**, the message stream back from the venue: `ostat` is the status
-it came back with, and `comment` / `fixtags` carry the text (FIX tag 58 `Text`,
-tag 103 `OrdRejReason`).
+The reason is on **`alerts`** — not on `workorder`, which has no text field,
+and **not on `execution`**: a rejected order *has* no execution, and `ostat` and
+`comment` there mean something else entirely.
 
-This does **not** decide what a reject looks like there. It pulls every
-`execution` row belonging to the workorders **already known** to be rejected
-and prints the distinct values — guessing the encoding is what the
-investigation is meant to answer.
+`alerts` holds every alert an order raised, keyed the way targets are.
+`alerttype` says what kind and `alertstr` carries the text. This keeps
+**`REJECTTOOMANY`** alerts whose text is about **short selling**, and discards
+the rest — a price-band reject is not this report's business.
 
 ```
-6 rejected workorders, 5 with an execution row (83.3%)
-  the other 1 never produced an execution row, so nothing here explains them
+8 alerts on the orders in scope: 6 are REJECTTOOMANY, 5 of those are about
+short selling (over 5 orders)
+  other alert types, not looked at: PRICEFAR 1, LATENCY 1
 
-Hong Kong  -  3 execution rows over 2 distinct reasons
-    count   share  ostat           reason
-        2   66.7%  rejected        SHORT SELL NOT PERMITTED - no locate
-        1   33.3%  rejected        Order price outside daily limit band
-
-Japan  -  1 execution row over 1 distinct reason
-    count   share  ostat           reason
-        1  100.0%  reject          Tick rule violation
+Hong Kong  -  3 alerts over 2 distinct texts
+   alerts   share   orders    trig  reason
+        2   66.7%        2       6  Short Sell rejected by venue: no locate available
+        1   33.3%        1       1  Short-Selling restricted on this security
 ```
 
-The reason is `comment`, else tag 58, else tag 103, else the status alone.
-Whitespace is squeezed and the text truncated at 110 characters, so two rejects
-differing only in an order id land on the same line — which is what makes a top
-20 mean anything. `--top N` changes how many per market.
+**The wording match is deliberately permissive**, because the text is written by
+whoever wrote that venue's rejection and there is no house style to rely on:
 
-**The coverage line is the first thing to read.** A reject with no `execution`
-row is not explained by anything below it, and the percentage says how much of
-the picture you are looking at.
+```python
+SHORT_SELL_RE = r"short[\s\-_]*(?:sell|sale)"
+```
+
+catches `short sell`, `short-sell`, `shortsell`, `short selling`,
+`Short-Selling`, `SHORT_SELL`, `short sale`, `shortsales`. There is no leading
+`` on purpose — an underscore is a word character, so `` would fail on
+`X_SHORTSELL`.
+
+**Texts group case-insensitively and the commonest spelling is shown**, so
+`Short Sell` and `SHORT SELL` are one line. Punctuation is *not* folded:
+`short-sell` against `short sell` may be two venues wording one rule, and
+merging them would hide that rather than reveal it. Whitespace is squeezed and
+the line truncated at 110 characters so two rejects differing only in an order
+id land together. `--top N` changes how many per market.
+
+**Two things the run tells you so you are not reading an absence as a fact:**
+the alert types it never looked at, and — if `REJECTTOOMANY` alerts exist but
+*none* matched the short-sell wording — a note to check `SHORT_SELL_RE` against
+one of them by hand before concluding there were none.
+
+> Note: the **Rejections** column on the page still counts *every* rejected
+> workorder of a short-sell order, not only the short-sell-related ones. Those
+> are two different numbers and this tool is the way to see the gap.
 
 ---
 
@@ -563,7 +578,7 @@ rendering path runs on a machine with no kdb, no pykx and no q licence:
 python scripts/short_sell_report/short_sell_report.py --self-test
 ```
 
-It rebuilds the page above from synthetic records — 199 checks — covering
+It rebuilds the page above from synthetic records — 222 checks — covering
 parsing tag 9604 out of a real `fixmsg`, the chaining and every guard on it, the
 suffix routing (including the suffixes that are *not* ours, like Tokyo's `.T`),
 the market rollup, the mean-of-markets headline, the Japan exclusion
