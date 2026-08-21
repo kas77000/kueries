@@ -74,7 +74,7 @@ overlapped. Everything else is in `--raw`.
 
 | column | what it means |
 |---|---|
-| `Target id` | the row to look up when the line needs checking |
+| `Target id` | the row to look up when the line needs checking. Printed with **no thousands separator** — it is an id, and `1,105,432` is not what anyone types into a query |
 | `Type` | `market` or `limit` — a market order was marketable whichever way the band went |
 | `Limit` | the direction, with a **star** when that was the side we could trade into. One column rather than two: the direction alone does not say whether it was ours to take without the side beside it, and a reader should not have to do that join by eye on every row |
 | `Limit window` | first period start to last period end. Not one continuous period when the order met several |
@@ -435,7 +435,7 @@ conversion anywhere. That is relied on and is not a gap.
 
 Nothing is grouped in q: a `target` row is one send and a `workorder` row is one
 child. Every sum and count happens in Python, where `--self-test` can prove it —
-143 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
+144 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
 synthetic data.
 
 ---

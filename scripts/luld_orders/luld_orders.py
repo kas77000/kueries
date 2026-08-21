@@ -956,7 +956,9 @@ def _list_cells(ln):
     return [
         (REGION_NAME[ln.o.region], INK, "normal"),
         (ln.o.sym, INK, "normal"),
-        (fmt_int(ln.o.id_target), INK2, "normal"),
+        #  an id, not a quantity: no thousands separator, because 1,105 is
+        #  not what anyone types into a query
+        (str(ln.o.id_target), INK2, "normal"),
         (ln.o.side or DASH, INK, "normal"),
         (ln.o.otype or DASH, INK2, "normal"),
         (fmt_int(ln.o.size), INK, "normal"),
@@ -1637,6 +1639,11 @@ def self_test() -> int:
            "Short, fav.", "Short, adv."])
     check("the listing columns add up to the full width",
           round(sum(c[1] for c in ORDER_LIST_COLS), 6), 1.0)
+    tid = ORDER_LIST_COLS.index(("Target id", 0.09, True))
+    idcell = _list_cells(to_lines(
+        to_orders([_t(1_105_432, "JP", 1000)]), {}, {})[0])[tid][0]
+    check("a target id is an id, not a quantity - no thousands separator",
+          idcell, "1105432")
     figs = pages_for(drows, dtot, "By region  ·  x", "Generated  ·  x")
     check("the summary alone is one page", len(figs), 1)
     withl = pages_for(drows, dtot, "x", "y", "", dlines)
