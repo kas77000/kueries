@@ -55,8 +55,8 @@ looks wrong.
 
 ```
 OURS ────────────────────────────────────────────────────────────────────────
-date,region,sym,side,otype,id_server,id_target,tag_9604,order_qty,executed,
-completion_pct,t_gen,order_start,order_end,splits,split_first_gen,
+date,region,sym,side,otype,id_server,id_target,tag_9604,basket,order_qty,
+executed,completion_pct,t_gen,order_start,order_end,splits,split_first_gen,
 split_last_off,
 THE MARKET'S ────────────────────────────────────────────────────────────────
 limit_periods,limit_first_start,limit_last_end,limit_mins,limit_price,
@@ -84,6 +84,7 @@ in the wrong block.
 | `otype` | `target.otype` | the order type — see the table below |
 | `id_server`, `id_target` | `target` | **the row this line is.** Look it up with these two and the date |
 | `tag_9604` | FIX tag 9604 in `target.fixmsg` | the client's own order id. Empty when the client sent none. Two lines sharing one are the same order re-sent — not chained here, see below |
+| `basket` | `target.basket` | what the order was sent as part of. Empty when it was sent on its own — a basket that pinned on one name will show up as several lines sharing this |
 | `order_qty` | `target.size` | what this send asked for |
 | `executed` | Σ `workorder.make` | what its children did, whatever state they ended in |
 | `completion_pct` | `executed / order_qty` | empty when there was no quantity to measure against — which is not the same as 0% |
@@ -385,7 +386,7 @@ conversion anywhere. That is relied on and is not a gap.
 
 Nothing is grouped in q: a `target` row is one send and a `workorder` row is one
 child. Every sum and count happens in Python, where `--self-test` can prove it —
-135 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
+138 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
 synthetic data.
 
 ---

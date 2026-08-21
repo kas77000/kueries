@@ -161,8 +161,9 @@ def region_of(sym) -> Optional[str]:
 Q_ORDERS = """
 {[hist;d;sfx]
   et:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; side:0#`;
-         sidesign:0#0i; size:0#0i; otype:0#`; t_gen:0#0Nt; t_start:0#0Nt;
-         t_end:0#0Nt; fixmsg:0#`; adjclose:0#0n; orgclose:0#0n);
+         sidesign:0#0i; size:0#0i; otype:0#`; basket:0#`; t_gen:0#0Nt;
+         t_start:0#0Nt; t_end:0#0Nt; fixmsg:0#`; adjclose:0#0n;
+         orgclose:0#0n);
   ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i;
          t_gen:0#0Nt; t_off_market:0#0Nt);
   es:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; time:0#0Nt; state:0#`);
@@ -171,11 +172,11 @@ Q_ORDERS = """
   / to a buyer, and an unfavourable one can still be marketable, so nothing is
   / filtered away on side here.
   t:$[hist;
-      select date,id_server,id_target,sym,side,sidesign,size,otype,t_gen,
-          t_start,t_end,fixmsg
+      select date,id_server,id_target,sym,side,sidesign,size,otype,basket,
+          t_gen,t_start,t_end,fixmsg
         from target where date=d, any (upper sym) like/: sfx;
       update date:0Nd from select id_server,id_target,sym,side,sidesign,size,
-          otype,t_gen,t_start,t_end,fixmsg
+          otype,basket,t_gen,t_start,t_end,fixmsg
         from target where any (upper sym) like/: sfx];
   if[0=count t; :(et;ew;es)];
 
@@ -379,6 +380,7 @@ class Order(NamedTuple):
     sym: str
     side: str
     otype: str                 # `market`, `limit`, ... - as the feed sends it
+    basket: str                # what the order was sent as part of, if any
     size: int
     t_gen: Optional[int]       # when the order was CREATED, ms since midnight
     t_start: Optional[int]     # ms since midnight
@@ -485,7 +487,8 @@ def to_orders(records) -> list:
                  _i(r.get("id_target"))),
             date=_d(r.get("date")), region=region, sym=sym,
             side=_s(r.get("side")), otype=_s(r.get("otype")),
-            size=_i(r.get("size")), t_gen=_ms(r.get("t_gen")),
+            basket=_s(r.get("basket")), size=_i(r.get("size")),
+            t_gen=_ms(r.get("t_gen")),
             t_start=_ms(r.get("t_start")), t_end=_ms(r.get("t_end")),
             client_id=fix_tag(r.get("fixmsg")),
             id_target=_i(r.get("id_target")),
@@ -865,7 +868,7 @@ def write_csv(rows, tot, out_dir, stem) -> Path:
 #  column's block says which side to go and check when it looks wrong.
 ORDER_COLS = (
     "date", "region", "sym", "side", "otype", "id_server", "id_target",
-    "tag_9604", "order_qty", "executed", "completion_pct", "t_gen",
+    "tag_9604", "basket", "order_qty", "executed", "completion_pct", "t_gen",
     "order_start", "order_end", "splits", "split_first_gen", "split_last_off",
 )
 
@@ -935,7 +938,7 @@ def raw_rows(orders, splits, hits) -> list:
             #  ORDER_COLS - what we did
             o.date.isoformat() if o.date else "",
             REGION_NAME[o.region], o.sym, o.side, o.otype, o.key[1],
-            o.id_target, o.client_id, o.size, ex,
+            o.id_target, o.client_id, o.basket, o.size, ex,
             "" if comp is None else f"{comp:.1f}",
             _hms(o.t_gen), _hms(o.t_start), _hms(o.t_end),
             sp.n, _hms(sp.first_gen), _hms(sp.last_off),
@@ -1100,8 +1103,9 @@ def run(args) -> int:
 # =============================================================================
 
 def _t(idt, region, size, d=None, srv=1, sym=None, side="sell",
-       otype="limit", t_gen=9 * 3_600_000, t_start=9 * 3_600_000 + 1_800_000,
-       t_end=15 * 3_600_000, cid=None, adjclose=100.0, orgclose=None):
+       otype="limit", basket="B1", t_gen=9 * 3_600_000,
+       t_start=9 * 3_600_000 + 1_800_000, t_end=15 * 3_600_000, cid=None,
+       adjclose=100.0, orgclose=None):
     """One target row.  cid goes into fixmsg as tag 9604 the way the client
     really sends it, so the fixture exercises the parse too."""
     sfx = dict((r.code, r.suffixes[0]) for r in REGIONS).get(region,
@@ -1113,7 +1117,7 @@ def _t(idt, region, size, d=None, srv=1, sym=None, side="sell",
     return {"date": d, "id_server": srv, "id_target": idt,
             "sym": sym or f"{1000 + idt}{sfx}", "side": side,
             "sidesign": -1 if side == "sell" else 1, "size": size,
-            "otype": otype,
+            "otype": otype, "basket": basket,
             #  None is a real value here: a target still working has no t_end
             "t_gen": _td(t_gen),
             "t_start": _td(t_start), "t_end": _td(t_end),
@@ -1497,6 +1501,11 @@ def self_test() -> int:
     print("\nthe order type")
     check("it comes off the target as the feed sends it",
           to_orders([_t(1, "JP", 100, otype="market")])[0].otype, "market")
+    check("and so does the basket it was sent as part of",
+          to_orders([_t(1, "JP", 100, basket="ASIA-OPEN")])[0].basket,
+          "ASIA-OPEN")
+    check("an order in no basket carries none, not a placeholder",
+          to_orders([_t(1, "JP", 100, basket="")])[0].basket, "")
     check("a limit order says so",
           to_orders([_t(1, "JP", 100, otype="limit")])[0].otype, "limit")
     check("an unset one is empty, not guessed at",
@@ -1546,6 +1555,8 @@ def self_test() -> int:
     check("nor the other way",
           [c for c in LIMIT_COLS
            if c.startswith(("split", "order_", "t_gen", "tag_"))], [])
+    check("the basket is ours, and sits with the order",
+          [c for c in ORDER_COLS if c == "basket"], ["basket"])
     check("what the order did stays with the order",
           ORDER_COLS[-3:], ("splits", "split_first_gen", "split_last_off"))
     check("and the only column needing both of them is the last one",
