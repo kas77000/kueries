@@ -163,7 +163,8 @@ Q_ORDERS = """
   et:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; side:0#`;
          sidesign:0#0i; size:0#0i; otype:0#`; t_start:0#0Nt; t_end:0#0Nt;
          fixmsg:0#`; adjclose:0#0n; orgclose:0#0n);
-  ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i);
+  ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i;
+         t_gen:0#0Nt; t_off_market:0#0Nt);
 
   / parents.  Every side: a limit up is favourable to a seller and a limit down
   / to a buyer, and an unfavourable one can still be marketable, so nothing is
@@ -192,10 +193,13 @@ Q_ORDERS = """
   t:t lj x;
 
   / children.  make is what the child executed, whatever state it ended in.
+  / t_gen is when the split was CREATED and t_off_market when it left the
+  / book.  t_transmit and t_oes_send say when we SENT it, a third question.
   w:$[hist;
-      select date,id_server,id_work,id_target,make from workorder
-        where date=d, id_target in ids;
-      update date:0Nd from select id_server,id_work,id_target,make
+      select date,id_server,id_work,id_target,make,t_gen,t_off_market
+        from workorder where date=d, id_target in ids;
+      update date:0Nd from select id_server,id_work,id_target,make,t_gen,
+          t_off_market
         from workorder where id_target in ids];
   (t;w)
   }
@@ -478,8 +482,33 @@ def to_orders(records) -> list:
     return out
 
 
-def executed_by_order(records, orders) -> dict:
-    """{order key: what its children executed}.
+class Splits(NamedTuple):
+    """What one order's children add up to.
+
+    n is EVERY workorder row under the target, whatever became of it - a
+    split that was rejected is still a split the engine made, and a count
+    that quietly left those out would say the order tried less than it did.
+    """
+    n: int = 0
+    made: int = 0
+    first_gen: Optional[int] = None    # earliest CREATED, ms since midnight
+    last_off: Optional[int] = None     # latest OFF the book
+
+    def add(self, make, gen, off) -> "Splits":
+        """One more child.  A missing time cannot move a bound: a split
+        that never reached the market has no t_off_market, and taking that
+        as an end would date the order's last child to midnight.
+        """
+        return Splits(
+            self.n + 1, self.made + make,
+            gen if self.first_gen is None else (
+                self.first_gen if gen is None else min(self.first_gen, gen)),
+            off if self.last_off is None else (
+                self.last_off if off is None else max(self.last_off, off)))
+
+
+def splits_by_order(records, orders) -> dict:
+    """{order key: Splits}.
 
     Keyed back onto the orders that survived the region filter, so a workorder
     whose parent is not in scope cannot contribute quantity to a region that
@@ -492,8 +521,16 @@ def executed_by_order(records, orders) -> dict:
                _i(r.get("id_target")))
         if key not in known:
             continue
-        out[key] = out.get(key, 0) + abs(_i(r.get("make")))
+        out[key] = out.get(key, Splits()).add(
+            abs(_i(r.get("make"))), _ms(r.get("t_gen")),
+            _ms(r.get("t_off_market")))
     return out
+
+
+def made_of(splits, key) -> int:
+    """What an order executed.  No children at all is 0, not missing."""
+    got = splits.get(key)
+    return got.made if got else 0
 
 
 def to_limits(records, d=None, min_mins=MIN_LIMIT_MINS) -> list:
@@ -595,7 +632,7 @@ class Totals(NamedTuple):
         return _completion(self.executed, self.order_qty)
 
 
-def by_region(orders, executed) -> list:
+def by_region(orders, splits) -> list:
     """One Row per region, always all eight, always in REGIONS order.
 
     An order's quantity and its fills are counted into the SAME region - the
@@ -607,7 +644,7 @@ def by_region(orders, executed) -> list:
     for o in orders:
         n[o.region] += 1
         qty[o.region] += o.size
-        made[o.region] += executed.get(o.key, 0)
+        made[o.region] += made_of(splits, o.key)
     return [Row(r.code, r.name, n[r.code], qty[r.code], made[r.code])
             for r in REGIONS]
 
@@ -753,10 +790,11 @@ def write_csv(rows, tot, out_dir, stem) -> Path:
 
 RAW_HEADER = (
     "date", "region", "sym", "side", "otype", "id_server", "id_target",
-    "tag_9604", "order_qty", "executed", "completion_pct", "order_start", "order_end",
-    "limit_periods", "limit_first_start", "limit_last_end", "limit_mins",
-    "limit_price", "ref_close", "pct_from_close", "limit_dir", "limit_noask",
-    "limit_nobid", "limit_net", "limit_locked", "overlap_mins",
+    "tag_9604", "order_qty", "executed", "completion_pct", "order_start",
+    "order_end", "limit_periods", "limit_first_start", "limit_last_end",
+    "limit_mins", "limit_price", "ref_close", "pct_from_close", "limit_dir",
+    "limit_noask", "limit_nobid", "limit_net", "limit_locked", "overlap_mins",
+    "splits", "split_first_gen", "split_last_off",
 )
 
 
@@ -802,12 +840,13 @@ def overlap_mins(o, periods) -> float:
     return total / 60_000.0
 
 
-def raw_rows(orders, executed, hits) -> list:
+def raw_rows(orders, splits, hits) -> list:
     """One row per order in scope, in the order the report counted them."""
     out = []
     for o in orders:
         got = sorted(hits.get(o.key, ()), key=lambda w: w.start)
-        ex = executed.get(o.key, 0)
+        sp = splits.get(o.key, Splits())
+        ex = sp.made
         comp = _completion(ex, o.size)
         out.append([
             o.date.isoformat() if o.date else "",
@@ -828,6 +867,7 @@ def raw_rows(orders, executed, hits) -> list:
             f"{got[0].net:g}" if got and got[0].net else "",
             "yes" if got and all(w.locked for w in got) else "no",
             f"{overlap_mins(o, got):.1f}",
+            sp.n, _hms(sp.first_gen), _hms(sp.last_off),
         ])
     return out
 
@@ -928,7 +968,7 @@ def run(args) -> int:
             continue
         orders.extend(kept)
         hits.update(day_hits)
-        executed.update(executed_by_order(wr, kept))
+        executed.update(splits_by_order(wr, kept))
 
     rows = by_region(orders, executed)
     tot = totals(rows)
@@ -991,9 +1031,12 @@ def _td(ms):
     return None if ms is None else dt.timedelta(milliseconds=ms)
 
 
-def _wo(idw, idt, make, d=None, srv=1):
+def _wo(idw, idt, make, d=None, srv=1, gen=None, off=None):
+    """gen is when the split was CREATED, off when it left the book.  Both
+    are None on a split that never reached the market, which is a real row.
+    """
     return {"date": d, "id_server": srv, "id_work": idw, "id_target": idt,
-            "make": make}
+            "make": make, "t_gen": _td(gen), "t_off_market": _td(off)}
 
 
 def _lim(sym, start, end, price=100.0, ticks=50, d=None, noask=50, nobid=0,
@@ -1033,14 +1076,26 @@ def demo_session(d=None):
             up, down = ((50, 0), (0, 50), (0, 0))[k % 3]
             lims.append(_lim(sym, start, end, price=10.0 + (k % 400) / 4.0,
                              d=d, noask=up, nobid=down))
-            wr.append(_wo(k, k, int(size * fill), d=d))
-    #  a LOCKED stock with no close on file: nothing can call it, and it stays
+            #  one to three children, created inside the limit and coming
+            #  off the book after it - the times the raw file reports
+            done = int(size * fill)
+            n_sp = 1 + (k % 3)
+            for j in range(n_sp):
+                wr.append(_wo(1000 * k + j, k, done // n_sp, d=d,
+                              gen=start + j * 60_000,
+                              off=start + (j + 1) * 300_000))
+    #  an order that sat through a limit and NEVER SENT A CHILD.  0 splits,
+    #  no times, and the case this is all being built towards
+    k += 1
+    tr.append(_t(k, "TW", 75_000, d=d))
+    lims.append(_lim(tr[-1]["sym"], 11 * H, 12 * H, d=d))
+    #  a LOCKED stock with no close on file, which stays unknown
     #  in scope anyway - unknown is an answer, not a reason to drop an order
     k += 1
     tr.append(_t(k, "JP", 120_000, d=d, adjclose=None, orgclose=None))
     lims.append(_lim(tr[-1]["sym"], 11 * H, 12 * H, d=d, noask=0, nobid=0,
                      net=0.0))
-    wr.append(_wo(k, k, 60_000, d=d))
+    wr.append(_wo(k, k, 60_000, d=d, gen=11 * H + 60_000, off=12 * H))
     #  one stock that only blipped: under the minimum, so its order is out
     k += 1
     tr.append(_t(k, "JP", 99_000, d=d))
@@ -1054,7 +1109,7 @@ def demo_session(d=None):
 
     orders = to_orders(tr)
     kept, hits = touched(orders, to_limits(lims, d))
-    ex = executed_by_order(wr, kept)
+    ex = splits_by_order(wr, kept)
     rows = by_region(kept, ex)
     return kept, ex, hits, rows, totals(rows)
 
@@ -1160,9 +1215,10 @@ def self_test() -> int:
 
     print("\nthe rollup")
     ro = to_orders([_t(1, "JP", 1000), _t(2, "JP", 3000), _t(3, "KR", 2000)])
-    ex = executed_by_order([_wo(11, 1, 400), _wo(12, 1, 300), _wo(13, 3, 500)],
-                           ro)
-    check("a target's children are added up", ex[ro[0].key], 700)
+    ex = splits_by_order([_wo(11, 1, 400), _wo(12, 1, 300), _wo(13, 3, 500)],
+                         ro)
+    check("a target's children are added up", ex[ro[0].key].made, 700)
+    check("and counted", ex[ro[0].key].n, 2)
     rows = {r.code: r for r in by_region(ro, ex)}
     check("orders are counted per region", rows["JP"].orders, 2)
     check("quantity is summed per region", rows["JP"].order_qty, 4000)
@@ -1184,7 +1240,7 @@ def self_test() -> int:
     #  the fault that made the old report print Korea 161.9%: quantity counted
     #  off one grouping, fills off another
     mix = to_orders([_t(1, "JP", 1000)])
-    mex = executed_by_order([_wo(11, 1, 500), _wo(12, 99, 5000)], mix)
+    mex = splits_by_order([_wo(11, 1, 500), _wo(12, 99, 5000)], mix)
     mrows = by_region(mix, mex)
     check("a workorder whose parent is out of scope is dropped",
           sum(r.executed for r in mrows), 500)
@@ -1206,10 +1262,11 @@ def self_test() -> int:
     dorders, dex, dhits, drows, dtot = demo_session()
     check("the demo has orders in every region",
           [r.code for r in drows if not r.orders], [])
-    #  103 shaped orders, plus the locked one with no close on file.  The
-    #  two-minute blip and the order that finished before its limit are OUT
+    #  103 shaped orders, plus the locked one with no close on file and the
+    #  one that never sent a child.  The two-minute blip and the order that
+    #  finished before its limit are OUT
     check("every order that met a limit is counted, and only those",
-          dtot.orders, 103 + 1)
+          dtot.orders, 103 + 2)
     check("the columns add up to the full width",
           round(sum(c[1] for c in REGION_COLS), 6), 1.0)
     check("the page shows what was asked and what was done",
@@ -1307,6 +1364,32 @@ def self_test() -> int:
                       to_limits([_lim("1001.JP", 11 * H, 12 * H),
                                  _lim("1002.JP", 11 * H, 12 * H)]))[0]), 2)
 
+    print("\nthe children, counted and timed")
+    sp = splits_by_order(
+        [_wo(11, 1, 100, gen=10 * H, off=11 * H),
+         _wo(12, 1, 200, gen=9 * H, off=13 * H),
+         _wo(13, 1, 300, gen=12 * H, off=12 * H + 60_000)],
+        to_orders([_t(1, "JP", 1000)]))
+    got = sp[(None, 1, 1)]
+    check("every child under the target is counted", got.n, 3)
+    check("and what they executed is summed", got.made, 600)
+    check("the FIRST created, whatever order they arrived in",
+          got.first_gen, 9 * H)
+    check("and the LAST off the book", got.last_off, 13 * H)
+    #  a split that never reached the market has no t_off_market, and
+    #  taking that as an end would date the order to midnight
+    none = splits_by_order([_wo(11, 1, 0, gen=10 * H, off=None),
+                            _wo(12, 1, 50, gen=11 * H, off=12 * H)],
+                           to_orders([_t(1, "JP", 1000)]))[(None, 1, 1)]
+    check("a missing time cannot move a bound", none.last_off, 12 * H)
+    check("but the split still counts as one the engine made", none.n, 2)
+    only = splits_by_order([_wo(11, 1, 0, gen=None, off=None)],
+                           to_orders([_t(1, "JP", 1000)]))[(None, 1, 1)]
+    check("a child with no times at all leaves them empty, not zero",
+          (only.first_gen, only.last_off), (None, None))
+    check("an order with no children at all executed nothing",
+          made_of({}, (None, 1, 1)), 0)
+
     print("\nthe raw rows")
     rr = raw_rows(dorders, dex, dhits)
     check("a line per order in scope, and no more", len(rr), dtot.orders)
@@ -1322,6 +1405,15 @@ def self_test() -> int:
           {x.code: x for x in drows}["JP"].order_qty)
     check("every line names a limit period, or it would not be a line",
           [r for r in rr if not r[RAW_HEADER.index("limit_periods")]], [])
+    si = RAW_HEADER.index("splits")
+    check("the split count is on the line",
+          sorted({r[si] for r in rr}), [0, 1, 2, 3])
+    check("an order that never sent one is 0, and still a line",
+          len([r for r in rr if r[si] == 0]), 1)
+    check("with no times to show for it",
+          [r[si + 1] for r in rr if r[si] == 0], [""])
+    check("and the ones that did are timed",
+          [r for r in rr if r[si] and not r[si + 1]], [])
     oi = RAW_HEADER.index("otype")
     check("every line says what kind of order it was",
           sorted({r[oi] for r in rr}), ["limit", "market"])
@@ -1342,7 +1434,7 @@ def self_test() -> int:
                        t_end=15 * H)])
     rw = to_limits([_lim(ro[0].sym, 11 * H, 12 * H)], min_mins=0.0)
     rk, rh = touched(ro, rw)
-    one = raw_rows(rk, executed_by_order([_wo(9, 1, 250)], rk), rh)[0]
+    one = raw_rows(rk, splits_by_order([_wo(9, 1, 250)], rk), rh)[0]
     check("the limit period is 60 minutes",
           one[RAW_HEADER.index("limit_mins")], "60.0")
     check("but the order was only live for the second half of it",

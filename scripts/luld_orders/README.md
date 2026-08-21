@@ -57,7 +57,8 @@ looks wrong.
 date,region,sym,side,otype,id_server,id_target,tag_9604,order_qty,executed,
 completion_pct,order_start,order_end,limit_periods,limit_first_start,
 limit_last_end,limit_mins,limit_price,ref_close,pct_from_close,limit_dir,
-limit_noask,limit_nobid,limit_net,limit_locked,overlap_mins
+limit_noask,limit_nobid,limit_net,limit_locked,overlap_mins,splits,
+split_first_gen,split_last_off
 ```
 
 Every column, in order. **The order** is what the first block describes, **the
@@ -96,11 +97,36 @@ question this is being built towards lives.
 | `limit_net` | `qatt.netChange` | last resort evidence. Comes off the last *traded* price, so it is 0 or empty on exactly these stocks |
 | `limit_locked` | derived | `yes` when no side ever went missing — bid = ask throughout. These are the ones `ref_close` has to call |
 
+#### The children — from `workorder`
+
+| column | source | what it means |
+|---|---|---|
+| `splits` | count of `workorder` rows | how many children the engine made under this target. **Every row counts**, whatever became of it — a rejected split is still one the engine made, and leaving those out would say the order tried less than it did. `0` is the interesting value |
+| `split_first_gen` | min `workorder.t_gen` | when the **first** child was created |
+| `split_last_off` | max `workorder.t_off_market` | when the **last** child left the book. Empty on a split that never reached the market — a missing time cannot move the bound, or the order would be dated to midnight |
+
 #### The two together
 
 | column | what it means |
 |---|---|
 | `overlap_mins` | how long the order and the limit **actually coexisted** — each period clipped to the order's own window, summed |
+
+Put `split_first_gen` and `split_last_off` beside `limit_first_start` and
+`limit_last_end` and the question this is being built towards is on one line:
+**was anything of ours on the book while the stock was pinned?**
+
+```
+sym       otype   limit window        splits  first gen  last off   executed
+1001.JP   limit   11:01:00-11:27:00        2   11:01:00  11:11:00    129,240
+1104.TT   limit   11:00:00-12:00:00        0          -         -          0
+```
+
+The second line is the shape the report exists to find: an hour at a limit, and
+not one child sent. `splits = 0` is where to start reading.
+
+**`t_gen` is creation, not sending.** `t_transmit` and `t_oes_send` say when we
+sent it and `t_on_market` when it arrived — three different questions, and only
+creation is on the line so far.
 
 `limit_mins` is the stock's; `overlap_mins` is ours. They differ whenever the
 order arrived late or finished early: a 60-minute limit an order only saw the
@@ -322,7 +348,7 @@ conversion anywhere. That is relied on and is not a gap.
 
 Nothing is grouped in q: a `target` row is one send and a `workorder` row is one
 child. Every sum and count happens in Python, where `--self-test` can prove it —
-105 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
+118 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
 synthetic data.
 
 ---
