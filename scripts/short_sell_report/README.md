@@ -11,6 +11,7 @@ python scripts/short_sell_report/short_sell_report.py --demo       # preview, no
 python scripts/short_sell_report/short_sell_report.py --compare    # old counting beside the new
 python scripts/short_sell_report/short_sell_report.py --chains     # what got chained
 python scripts/short_sell_report/short_sell_report.py --no-tag     # what carries no 9604
+python scripts/short_sell_report/short_sell_report.py --reject-reasons  # the rejection texts
 python scripts/short_sell_report/short_sell_report.py --self-test
 ```
 
@@ -28,21 +29,30 @@ By market · 2026-07-24 18:37
 732                 58.7%                394
 Short-sell orders   Overall completion   Rejections
 
-┌──────────┬────────┬────────────┬────────────┬────────────┬────────────┐
-│ Market   │ Orders │  Order qty │   Executed │ Completion │ Rejections │
-├──────────┼────────┼────────────┼────────────┼────────────┼────────────┤
-│ Hong Kong│    109 │ 49,882,020 │ 26,476,220 │      53.1% │        239 │
-│ Japan    │    541 │  5,357,418 │  4,482,418 │      83.7% │          3 │
-│ Korea    │     82 │  1,030,478 │    404,515 │      39.3% │        152 │
-│ Malaysia │      0 │          0 │          0 │          — │          0 │
-│ Thailand │      0 │          0 │          0 │          — │          0 │
-└──────────┴────────┴────────────┴────────────┴────────────┴────────────┘
++----------+--------+----------------+----------------+------------+------------+
+| Market   | Orders | Notional       | Notional       | Completion | Rejections |
+|          |        | Ordered (USD)  | Executed (USD) |            |            |
++----------+--------+----------------+----------------+------------+------------+
+| Hong Kong|    109 |        79.2m   |        42.1m   |      53.1% |        239 |
+| Japan    |    541 |        36.4m   |        30.5m   |      83.7% |          3 |
+| Korea    |     82 |         8.1m   |         3.2m   |      39.3% |        152 |
+| Malaysia |      0 |           —    |           —    |          — |          0 |
+| Taiwan   |     23 |         7.2m   |         4.6m   |      63.1% |         31 |
+| Thailand |      1 |       270.0m   |           —    |       0.0% |          2 |
++----------+--------+----------------+----------------+------------+------------+
 
 Completion by market            Rejections by market
-   Japan ████████████ 84%          Hong Kong ██████████ 239
-Hong Kong ███████ 53%                  Korea ██████ 152
-    Korea █████ 39%                     Japan ▏3
+   Japan ████████████ 84%          Hong Kong █████ ▓▓▓▓▓ 239
+  Taiwan ████████ 63%                  Korea ██ ▓▓ ▒▒ ░░ 152
+Hong Kong ███████ 53%                  Taiwan █ ▓ 31
+    Korea █████ 39%                     Japan 3
+
+                                █ short sell  ▓ open  ▒ close  ░ continuous
 ```
+
+The rejections chart is **stacked by why** — see *Why an order was rejected*.
+Completion is a single measure and stays a plain bar; stacking it would be
+stacking percentages, which do not add up to anything.
 
 `--monthly` adds **Completion by day** and **Rejections by day** underneath, as
 two full-width **vertical** charts, one column per trading day:
@@ -89,12 +99,18 @@ reach, a network share included.
 | **Notional Executed (USD)** | Σ(`make` × the child's own `avg_fill_price`) × `fxlast`, across **every** attempt. What those shares really cost. `make` counts whatever state the child ended in — a cancelled child that part-filled still contributes what it filled. |
 | **Completion** | per market, Notional Executed / Notional Ordered. **Not** the share completion — it cannot be, because the two sides are priced differently: the unfilled part at a limit or a quote, the filled part at what it actually paid. |
 | **Overall completion** | the same ratio over every market at once — summed USD executed over summed USD ordered. |
-| **Rejections** | `workorder` rows in state `` `rejected ``, across **all** attempts of the chain. Counted per child order, not per parent, which is why Hong Kong can show 109 orders and 239 rejections. |
+| **Rejections** | **`REJECTTOOMANY` alerts** on the `alerts` table, across **all** attempts of the chain, split by the four categories below. One order raises several, which is why Hong Kong can show 109 orders and 239 rejections. |
 
-`workorder` also carries `invalid_ack` and `fail_ack`. They are **not** counted:
-they are a different failure — a malformed or unacknowledged send rather than a
-venue saying no — and folding them in would inflate the one number on this page
-a compliance reader will quote.
+**Rejections are alerts, not workorder states.** `workorder.state` says a child
+came back refused; a `REJECTTOOMANY` alert is the engine saying *this order has
+been refused too often*, which is the thing worth putting on a page. The two
+counts are different and the alert is the one the column reports.
+
+`workorder` also carries `invalid_ack` and `fail_ack`. Neither those nor the
+`` `rejected `` state feed this column: they are a different failure — a
+malformed or unacknowledged send rather than a venue saying no — and folding
+them in would inflate the one number on this page a compliance reader will
+quote.
 
 Nothing is grouped in q. A target is one send and a workorder is a child order;
 the chaining, the sums and the counts all happen in Python, where `--self-test`
@@ -381,9 +397,83 @@ the alert types it never looked at, and — if `REJECTTOOMANY` alerts exist but
 *none* matched the short-sell wording — a note to check `SHORT_SELL_RE` against
 one of them by hand before concluding there were none.
 
-> Note: the **Rejections** column on the page still counts *every* rejected
-> workorder of a short-sell order, not only the short-sell-related ones. Those
-> are two different numbers and this tool is the way to see the gap.
+### The four categories
+
+Every `REJECTTOOMANY` alert on the page lands in exactly one bucket, tested in
+this order — **first match wins**:
+
+| | matches | |
+|---|---|---|
+| **short sell** | `SHORT_SELL_RE` above | the rule this report is about |
+| **open** | `open` | refused around the opening auction |
+| **close** | `close` | refused around the closing auction |
+| **continuous** | everything else | the rest of the session |
+
+Order matters and is the whole design. *"Short sell rejected in the OPEN
+auction"* is a **short sell** reject that happened to be at the open, not an
+open reject — the reason we could not trade is the rule, not the clock. So the
+short-sell test runs first and takes it. Only alerts that are **not** about
+short selling are then sorted by session.
+
+`open` and `close` are matched as plain substrings, which is what makes
+*"reopened"* read as **open** and *"undisclosed"* as **close**. Both are covered
+by `--self-test` so the behaviour is on the record rather than a surprise; if
+either shows up in real texts, tighten `OPEN_RE` / `CLOSE_RE` to a word
+boundary. `--reject-reasons` is how you find out.
+
+The four are drawn as one **stacked bar** per market, in that order, with the
+market total labelled at the end of the bar. Four segments is the most a stacked
+bar reads at, and these four are exhaustive and mutually exclusive, so the bar
+length is still the number in the Rejections column.
+
+---
+
+## Only the orders that could have traded
+
+Most markets here cap how far a stock may move from the previous close in a
+session. An order priced **beyond that band never had a chance** — it is not a
+fill that got away, and counting it drags completion down while burying the
+orders somebody could actually have done something about. Those orders are
+**dropped**, and counted as they go:
+
+```
+14 orders excluded as not marketable - priced beyond the day's limit band,
+so they could never have traded
+    Korea              9   band +/-30% of the previous close
+    Taiwan             5   band +/-10% of the previous close
+      2330.TT      size     9,000,000  limit     130.0000  prev close     100.0000
+
+109 orders could not be judged and are KEPT (Hong Kong: no daily limit)
+```
+
+The excluded count also goes in the page footer, and `--keep-unmarketable` puts
+them back — the numbers on the page are then the numbers before this filter.
+
+The rules live in [`scripts/lib/price_bands.py`](../lib/README.md), which is the
+one place to correct them. The previous close comes from
+`target_stock.adjclose`, else `orgclose`, which the report already fetches — so
+this costs no extra table and no quote server.
+
+**Three things it deliberately does:**
+
+- **Judges the direction, not the distance.** These are sells, and a sell dies
+  only **above** limit up. A sell priced *under* limit down is cheap, not off
+  limit, and it trades. Treating both ends the same way would throw away real
+  orders.
+- **Keeps what it cannot judge.** Hong Kong caps nothing, and a name with no
+  previous close cannot be assessed at all. Both are kept, both are reported.
+  Dropping an order because we do not know the rule is inventing a rejection.
+- **Judges the chain, not the send.** A chain survives if **any** attempt was
+  marketable. A client who replaces an off-limit price with a sane one had an
+  order that could trade, and that is one order.
+
+A market order has no price to be wrong, so it is always marketable. Tokyo is a
+**step table in yen**, not a percentage — a 1,234 yen name may move 300, so an
+order at 1,600 is dead where a flat 30% rule would have waved it through.
+
+Its children and its rejection alerts go with it, so a row on the page is always
+internally consistent: the rejections counted are rejections of orders that are
+also counted.
 
 ---
 

@@ -140,6 +140,50 @@ Used by [`short_sell_report`](../short_sell_report/README.md) and
 
 ---
 
+## `price_bands.py`
+
+The daily limit up / limit down band, and whether an order could ever have
+traded inside it.
+
+```python
+from lib.price_bands import band, marketable
+
+band("TW", 100.0)                       # (90.0, 110.0)
+band("JP", 1234.0)                      # (934.0, 1534.0) - a step table, not a %
+marketable("TW", 100.0, 130.0, -1)      # False: a sell nothing may ever print at
+marketable("TW", 100.0,  50.0, -1)      # True:  cheap, not off limit
+marketable("HK", 100.0, 1e6,  -1)       # None:  Hong Kong caps nothing
+```
+
+```
+python scripts/lib/price_bands.py --self-test
+```
+
+**Why a report needs it.** An order priced beyond the band is not a fill that
+got away — it was never going to trade. Counting it drags completion down and
+buries the orders somebody could actually have done something about. The
+previous close is already on the order (`target_stock.adjclose`, else
+`orgclose`), so this costs no extra table and no quote server.
+
+- **It is directional.** A *sell* is dead only **above** the ceiling; below the
+  floor it just trades. Buys are the mirror. Judging both ends the same way
+  throws away marketable orders.
+- **Three answers, not two.** `None` means *cannot be judged* — no band on file,
+  or no previous close — and a caller must keep those. Dropping an order because
+  we do not know the rule is inventing a rejection.
+- **`BANDS` is the only thing to correct.** One entry per market: `("pct", f)`,
+  Tokyo's `("steps", …)` table, or `None` for a market that caps nothing.
+  Exchanges change these; a market that is absent is simply never judged.
+- **A tick tolerance** of 0.25% absorbs the rounding we cannot reproduce without
+  the exchanges' tick tables. A genuinely off-limit price misses by far more.
+
+Prices are **local currency** throughout, matching `limit_price` — there is no
+fx anywhere in the file.
+
+Used by [`short_sell_report`](../short_sell_report/README.md).
+
+---
+
 ## `mailer.py`
 
 Send a report to a list of people: a plain text body, an HTML body with the

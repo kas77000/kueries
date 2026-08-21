@@ -89,13 +89,15 @@ from typing import NamedTuple, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lib.local_config import apply_local              # noqa: E402
+from lib.price_bands import (                                    # noqa: E402
+    describe as band_rule, marketable)
 from lib.order_chains import (                                   # noqa: E402
     CLIENT_ID_TAG, QTY_CHOICES, chain_key, chain_size, fix_tag)
 from lib.report_page import (                                    # noqa: E402
     BLUE, COL_W, DASH, GREEN, INK, INK2, INK3, L, R, RED,
     barchart, figure, fmt_int, fmt_pct0, fmt_pct1, footer as _footer, heading,
-    hline, kpis as _kpis_row, log, save as _save, table as _table_rows,
-    vbarchart)
+    hline, kpis as _kpis_row, log, save as _save, stacked_barchart,
+    table as _table_rows, vbarchart)
 
 # -----------------------------------------------------------------------------
 # CONNECTIONS.  Edit these.
@@ -909,6 +911,32 @@ REJECT_ALERT = "REJECTTOOMANY"
 SHORT_SELL_RE = r"short[\s\-_]*(?:sell|sale)"
 
 
+# The rest of a REJECTTOOMANY alert is bucketed by what its text mentions.
+# SUBSTRINGS, not words, which is what was asked for - so "reopened" is OPEN and
+# "closing auction" is CLOSE.  It also means "disclosed" reads as CLOSE; tighten
+# these to r"\bopen" / r"\bclose" if that shows up in the real texts.
+OPEN_RE = r"open"
+CLOSE_RE = r"close"
+
+#  order matters: short sell first, because a short sell reject in the opening
+#  auction is a SHORT SELL reject - the rule we are reporting on - and calling
+#  it OPEN would file it under the session instead
+CATEGORIES = ("short sell", "open", "close", "continuous")
+
+
+def categorise(text) -> str:
+    """Which bucket one REJECTTOOMANY alert falls in."""
+    import re
+    got = _s(text)
+    if is_short_sell(got):
+        return "short sell"
+    if re.search(OPEN_RE, got, re.I):
+        return "open"
+    if re.search(CLOSE_RE, got, re.I):
+        return "close"
+    return "continuous"
+
+
 def is_short_sell(text) -> bool:
     """Is this alert about short selling?"""
     import re
@@ -1200,9 +1228,13 @@ class Row(NamedTuple):
     orders: int
     order_qty: int             # shares
     executed: int              # shares
-    rejections: int
+    rejections: int            # REJECTTOOMANY alerts
     ordered_usd: float = 0.0
     executed_usd: float = 0.0
+    by_category: dict = None   # {"short sell": n, "open": n, ...}
+
+    def cat(self, name) -> int:
+        return (self.by_category or {}).get(name, 0)
 
     @property
     def completion(self) -> Optional[float]:
@@ -1252,18 +1284,126 @@ def totals(rows) -> Totals:
                   ousd, eusd)
 
 
-def by_market(chs, splits) -> list:
+class Reject(NamedTuple):
+    """ONE REJECTTOOMANY alert."""
+    key: tuple                 # (date, id_server, id_target) - the attempt
+    date: Optional[dt.date]
+    country: str
+    category: str
+    text: str
+
+
+def to_rejects(records, attempts) -> list:
+    """REJECTTOOMANY alerts on the orders in scope, bucketed.
+
+    Every other alert type is dropped here - a price-band alert is not a
+    rejection - and dump_reject_alerts is what says how many were dropped.
+    """
+    market = {a.key: a.country for a in attempts}
+    out = []
+    for r in records:
+        if _s(r.get("alerttype")).strip().upper() != REJECT_ALERT:
+            continue
+        key = (_d(r.get("date")), _i(r.get("id_server")),
+               _i(r.get("id_target")))
+        m = market.get(key) or market_of(r.get("sym"))
+        if m is None:
+            continue
+        text = _s(r.get("alertstr"))
+        out.append(Reject(key=key, date=_d(r.get("date")), country=m,
+                          category=categorise(text), text=text))
+    return out
+
+
+# =============================================================================
+# MARKETABLE
+#
+# An order priced beyond the day's limit up / limit down was never going to
+# trade, so counting it only drags completion down and buries the orders we
+# could actually have done something about.  Those orders are dropped from the
+# page - and COUNTED as they go, per market, because a report that quietly
+# throws work away is worse than one that shows a low number.
+#
+# The band comes off the previous close, which target_stock already carries as
+# adjclose / orgclose, so this costs no extra table and no quote server.  The
+# rules themselves live in scripts/lib/price_bands.py; that is the one place to
+# correct them.
+#
+# A CHAIN is judged on its ATTEMPTS, and it survives if ANY of them was
+# marketable.  A client who cancel/replaces an off-limit price with a sane one
+# had an order that could trade, and the chain is one order.
+# =============================================================================
+
+class Marketability(NamedTuple):
+    kept: list                 # chains that could have traded, or cannot be judged
+    dead: list                 # chains priced where nothing may print
+    unknown: list              # chains in a market with no band on file
+    by_market: dict            # code -> how many dead
+
+
+def attempt_marketable(a: "Attempt"):
+    return marketable(a.country, a.refpx, a.limit_price, a.sidesign)
+
+
+def split_marketable(chs) -> Marketability:
+    """Sort the chains into the ones that had a chance and the ones that did not.
+
+    UNKNOWN IS KEPT.  Hong Kong caps nothing, and a name with no previous close
+    cannot be judged at all; dropping either would be inventing a rejection.
+    """
+    kept, dead, unknown = [], [], []
+    per = {c: 0 for c in MARKET_CODES}
+    for c in chs:
+        verdicts = [attempt_marketable(a) for a in c.attempts]
+        if any(v is True for v in verdicts):
+            kept.append(c)
+        elif all(v is False for v in verdicts) and verdicts:
+            dead.append(c)
+            per[c.country] += 1
+        else:
+            unknown.append(c)
+            kept.append(c)
+    return Marketability(kept, dead, unknown, per)
+
+
+def report_marketable(m: Marketability, applied: bool) -> None:
+    if not m.dead and not m.unknown:
+        return
+    if m.dead:
+        head = ("excluded as not marketable" if applied
+                else "NOT marketable, but kept (--keep-unmarketable)")
+        print(f"\n{len(m.dead):,} orders {head} - priced beyond the day's "
+              f"limit band, so they could never have traded")
+        for code in MARKET_CODES:
+            if m.by_market[code]:
+                print(f"    {MARKET_NAME[code]:<12} {m.by_market[code]:>6,}"
+                      f"   band {band_rule(code)}")
+        for c in sorted(m.dead, key=lambda c: -c.size)[:5]:
+            a = c.attempts[-1]
+            print(f"      {c.sym:<12} size {c.size:>13,}  limit "
+                  f"{a.limit_price:>12,.4f}  prev close {a.refpx:>12,.4f}")
+    if m.unknown:
+        codes = sorted({c.country for c in m.unknown})
+        print(f"\n{len(m.unknown):,} orders could not be judged and are KEPT "
+              f"({', '.join(MARKET_NAME[c] for c in codes)}: "
+              f"{'; '.join(band_rule(c) for c in codes)})")
+
+
+def by_market(chs, splits, rejects=()) -> list:
     orders = {c: 0 for c in MARKET_CODES}
     qty = {c: 0 for c in MARKET_CODES}
     made = {c: 0 for c in MARKET_CODES}
-    rej = {c: 0 for c in MARKET_CODES}
     for c in chs:
         orders[c.country] += 1
         qty[c.country] += c.size
     for s in splits:
         made[s.country] += s.make
-        if s.rejected:
-            rej[s.country] += 1
+    #  REJECTIONS ARE REJECTTOOMANY ALERTS, not workorders in state `rejected.
+    #  The two are different things: the state says a child came back refused,
+    #  the alert is the engine saying this order has been refused too often.
+    cats = {c: {k: 0 for k in CATEGORIES} for c in MARKET_CODES}
+    for r in rejects:
+        cats[r.country][r.category] += 1
     #  the notional is worked out PER MARKET rather than once and apportioned:
     #  every order carries its own price and its own fx, and there is no
     #  meaningful market-level price to apply afterwards
@@ -1271,11 +1411,12 @@ def by_market(chs, splits) -> list:
                             [s for s in splits if s.country == m.code])
            for m in MARKETS}
     return [Row(m.code, m.name, orders[m.code], qty[m.code],
-                made[m.code], rej[m.code],
-                usd[m.code].ordered, usd[m.code].executed) for m in MARKETS]
+                made[m.code], sum(cats[m.code].values()),
+                usd[m.code].ordered, usd[m.code].executed,
+                dict(cats[m.code])) for m in MARKETS]
 
 
-def by_market_targets(attempts, splits) -> list:
+def by_market_targets(attempts, splits, rejects=()) -> list:
     """The OLD counting, one order per target - what --compare puts beside the
     chained numbers.
 
@@ -1291,8 +1432,8 @@ def by_market_targets(attempts, splits) -> list:
         qty[a.country] += a.size
     for s in splits:
         made[s.country] += s.make
-        if s.rejected:
-            rej[s.country] += 1
+    for r in rejects:
+        rej[r.country] += 1
     return [Row(m.code, m.name, orders[m.code], qty[m.code],
                 made[m.code], rej[m.code]) for m in MARKETS]
 
@@ -1492,11 +1633,12 @@ def draw(rows, tot, subtitle, footer, days=None):
              [(r.completion or 0.0) for r in comp],
              [fmt_pct0(r.completion) for r in comp],
              BLUE, vmax=100.0, fs=8.0, title_y=mkt_title_y)
-    barchart(fig, (R - half, mkt_y0, half, mkt_rect_h), "Rejections by market",
-             [r.name for r in rej],
-             [float(r.rejections) for r in rej],
-             [fmt_int(r.rejections) for r in rej],
-             RED, fs=8.0, title_y=mkt_title_y)
+    stacked_barchart(fig, (R - half, mkt_y0, half, mkt_rect_h),
+                     "Rejections by market",
+                     [r.name for r in rej],
+                     [(k, [float(r.cat(k)) for r in rej]) for k in CATEGORIES],
+                     fs=8.0, title_y=mkt_title_y,
+                     legend_y=mkt_y0 - 0.026)
 
     # ---- completion and rejections by day ----------------------------------
     if monthly:
@@ -1672,7 +1814,8 @@ def run(args) -> int:
         f"{pl.endpoint}")
     h = connect(pl.endpoint)
 
-    attempts, splits, dropped, traded = [], [], 0, 0
+    attempts, splits, rejects, dropped, traded = [], [], [], 0, 0
+    alert_recs = []
     for d in pl.dates:
         if not args.quiet and d is not None:
             log(f"  {d} ...")
@@ -1685,15 +1828,19 @@ def run(args) -> int:
         attempts.extend(att)
         splits.extend(to_splits(wr, att))       # keyed on the target rows
 
+    #  the rejections on the page come off ALERTS, so they are fetched on
+    #  every run rather than only for --reject-reasons
+    for d in pl.dates:
+        alert_recs.extend(fetch_alerts(h, pl.hist, d,
+                                       sorted({a.id_target for a in attempts})))
+    rejects = to_rejects(alert_recs, attempts)
+
     if args.no_tag:
         return dump_untagged(attempts)
 
     if args.reject_reasons:
-        ids = sorted({a.id_target for a in attempts})
-        recs = []
-        for d in pl.dates:
-            recs.extend(fetch_alerts(h, pl.hist, d, ids))
-        return dump_reject_alerts(reject_alerts(recs, attempts), args.top)
+        return dump_reject_alerts(reject_alerts(alert_recs, attempts),
+                                  args.top)
 
     chs = to_chains(attempts, args.chain_qty, splits)
     over = over_filled(chs, splits)
@@ -1707,20 +1854,34 @@ def run(args) -> int:
         report_unchained(over, over_filled(chs, splits))
     report_over_filled_attempts(over_filled_attempts(attempts, splits))
     report_no_workorder(*no_workorder(chs, splits))
+
+    #  drop what could never have traded - and drop its children and its
+    #  rejection alerts with it, so the row stays internally consistent
+    mk = split_marketable(chs)
+    report_marketable(mk, not args.keep_unmarketable)
+    if not args.keep_unmarketable and mk.dead:
+        chs = mk.kept
+        live = {k for c in chs for k in c.keys}
+        splits = [x for x in splits if x.key in live]
+        rejects = [r for r in rejects if r.key in live]
+        attempts = [a for a in attempts if a.key in live]
+
     if args.chains:
         return dump_chains(chs)
 
-    rows = by_market(chs, splits)
+    rows = by_market(chs, splits, rejects)
     tot = totals(rows)
     days = by_day(chs, splits) if pl.monthly else None
 
     if args.compare:
-        v1_rows = by_market_targets(attempts, splits)
+        v1_rows = by_market_targets(attempts, splits, rejects)
         print("\n".join(compare_lines(v1_rows, rows)))
         return 0
 
     log(f"  {tot.orders:,} short-sell orders, {tot.rejections:,} rejections"
-        + (f", {dropped:,} restricted JP orders excluded" if dropped else ""))
+        + (f", {dropped:,} restricted JP orders excluded" if dropped else "")
+        + (f", {len(mk.dead):,} not marketable"
+           if mk.dead and not args.keep_unmarketable else ""))
 
     subtitle = f"By market  ·  {pl.when}"
     foot = (f"Generated {dt.datetime.now():%Y-%m-%d %H:%M}  ·  "
@@ -1729,6 +1890,8 @@ def run(args) -> int:
             + (f", {st.no_id:,} untagged" if st.no_id else ""))
     if dropped:
         foot += f"  ·  {dropped:,} restricted JP excluded"
+    if mk.dead and not args.keep_unmarketable:
+        foot += f"  ·  {len(mk.dead):,} off-limit excluded"
 
     fig = draw(rows, tot, subtitle, foot, days)
     files = save(fig, Path(args.out_dir), pl.stem)
@@ -1790,20 +1953,44 @@ def demo_session(d=None):
         pr.append(_a(idt, "JP", size, "CLI-JP-TOPUP", t=k, d=d))
         wr.append(_c(idt, idt, made, "filled", d=d))
 
+    #  the alerts the page counts as rejections, spread over the four buckets
+    #  so the stacked chart has something to show
+    TEXTS = (("short sell", "Short Sell not permitted - no locate"),
+             ("open", "Rejected: too late for the OPEN auction"),
+             ("close", "CLOSE auction would not take the order"),
+             ("continuous", "Price outside the daily limit band"))
+    al = []
+    for i, (mkt, n) in enumerate((("HK", 239), ("JP", 3), ("KR", 152),
+                                  ("TW", 31), ("TH", 2))):
+        base = {"HK": 1, "JP": 1001, "KR": 2001, "TW": 4001, "TH": 3001}[mkt]
+        span = {"HK": 109, "JP": 541, "KR": 82, "TW": 23, "TH": 3}[mkt]
+        for k in range(n):
+            #  a different mix per market, so the chart is not five of the same
+            _cat, text = TEXTS[(k + i) % (2 + (i % 3))]
+            al.append({"date": d, "id_server": 1,
+                       "id_target": base + (k % span), "sym": None,
+                       "alerttype": "REJECTTOOMANY", "alertstr": text,
+                       "ntrigger": 1 + (k % 3)})
+
     attempts, _dropped = to_attempts(pr)
-    return attempts, to_splits(wr, attempts)
+    return attempts, to_splits(wr, attempts), al
 
 
 def demo_month(year=2026, month=7):
-    attempts, splits = [], []
+    attempts, splits, alerts = [], [], []
     for i, d in enumerate(month_dates(year, month)):
-        a, w = demo_session(d)
+        a, w, al = demo_session(d)
         take = 40 + (i * 7) % 400
         keep = a[:take]
         keys = {x.key for x in keep}
         attempts.extend(keep)
         splits.extend([x for x in w if x.key in keys])
-    return attempts, splits
+        #  an alert belongs to a TARGET, so it is kept by id_target - a
+        #  different key from the split's, and mixing the two silently drops
+        #  every alert
+        kept_ids = {x.key[2] for x in keep}
+        alerts.extend([r for r in al if r["id_target"] in kept_ids])
+    return attempts, splits, alerts
 
 
 def demo(out_dir) -> int:
@@ -1811,17 +1998,17 @@ def demo(out_dir) -> int:
     out = Path(out_dir)
     stamp = f"Generated {dt.datetime.now():%Y-%m-%d %H:%M}  ·  {DEMO_STAMP}"
 
-    attempts, splits = demo_session()
+    attempts, splits, al = demo_session()
     chs = to_chains(attempts, CHAIN_QTY, splits)
-    rows = by_market(chs, splits)
+    rows = by_market(chs, splits, to_rejects(al, attempts))
     log("demo: daily layout")
     report_stats(chain_stats(attempts, chs))
     save(draw(rows, totals(rows), "By market  ·  2026-07-24 18:37  ·  SAMPLE",
               stamp), out, "short_sell_report_SAMPLE_daily")
 
-    attempts, splits = demo_month()
+    attempts, splits, al = demo_month()
     chs = to_chains(attempts, CHAIN_QTY, splits)
-    rows = by_market(chs, splits)
+    rows = by_market(chs, splits, to_rejects(al, attempts))
     days = by_day(chs, splits)
     log(f"demo: monthly layout, {len(days)} trading days")
     save(draw(rows, totals(rows), "By market  ·  July 2026  ·  SAMPLE", stamp,
@@ -2291,20 +2478,29 @@ def self_test() -> int:
     sp = to_splits([_c(10, 1, 0, "rejected"), _c(11, 2, 0, "rejected"),
                        _c(12, 3, 0, "cxl")], att2)
     chs2 = to_chains(att2)
-    rows2 = by_market(chs2, sp)
+    #  the rejections come off ALERTS, one per attempt that was refused too
+    #  often, so a chained order carries every attempt's
+    rj2 = to_rejects([{"date": None, "id_server": 1, "id_target": i,
+                       "sym": "X.TB", "alerttype": "REJECTTOOMANY",
+                       "alertstr": "Short Sell not permitted", "ntrigger": 1}
+                      for i in (1, 2)], att2)
+    rows2 = by_market(chs2, sp, rj2)
     th = [r for r in rows2 if r.code == "TH"][0]
     check("one order, not three", th.orders, 1)
     check("27m, not 81m", th.order_qty, 27_000_000)
-    check("EVERY rejection is still counted", th.rejections, 2)
+    check("EVERY rejection alert is still counted, across the attempts",
+          th.rejections, 2)
+    check("and they are bucketed", th.cat("short sell"), 2)
     check("nothing executed", th.executed, 0)
     check("so completion is still zero", th.completion, 0.0)
 
-    v1_rows = by_market_targets(att2, sp)
+    v1_rows = by_market_targets(att2, sp, rj2)
     v1_th = [r for r in v1_rows if r.code == "TH"][0]
-    check("counting targets over the same data still says three orders", v1_th.orders, 3)
+    check("counting targets over the same data still says three orders",
+          v1_th.orders, 3)
     check("and 81m", v1_th.order_qty, 81_000_000)
-    check("with the same rejections - that is the whole point",
-          v1_th.rejections, th.rejections)
+    check("with the same rejections - the counting changed, not what a "
+          "rejection is", v1_th.rejections, th.rejections)
 
     print("\ncompare")
     lines = compare_lines(v1_rows, rows2)
@@ -2340,6 +2536,28 @@ def self_test() -> int:
     def _al(idt, atype, text, sym="X.HK", srv=1, ntrigger=1, d=None):
         return {"date": d, "id_server": srv, "id_target": idt, "sym": sym,
                 "alerttype": atype, "alertstr": text, "ntrigger": ntrigger}
+
+    print("\nfour buckets for a rejection")
+    check("a short sell reject is a short sell reject, even in the auction",
+          categorise("Short sell rejected in the OPEN auction"), "short sell")
+    check("open", categorise("Rejected: order too late for OPEN auction"),
+          "open")
+    check("lower case open too", categorise("rejected before open"), "open")
+    check("close", categorise("CLOSE auction rejected the order"), "close")
+    check("anything else is continuous",
+          categorise("Price outside daily limit band"), "continuous")
+    check("and so is an empty alert", categorise(""), "continuous")
+    check("open beats close when both appear - it is tested first",
+          categorise("rejected between open and close"), "open")
+    check("the four buckets", list(CATEGORIES),
+          ["short sell", "open", "close", "continuous"])
+    #  substrings, as asked - which also means these
+    check("reopened is OPEN", categorise("order reopened then rejected"),
+          "open")
+    check("and disclosed reads as CLOSE - tighten OPEN_RE/CLOSE_RE to \\bopen "
+          "if that shows up for real",
+          categorise("undisclosed size rejected"), "close")
+
 
     print("\nrejection alerts, per market")
     al_att, _ = to_attempts([_p(1, "HK", 1000), _p(2, "HK", 1000),
@@ -2493,6 +2711,81 @@ def self_test() -> int:
     check("it reports where the prices came from",
           notional(c1, s1).by_source, {"limit": 1})
 
+    print("\nonly the orders that could have traded")
+
+    def _chain(country, sym, *prices, refpx=100.0, size=1000):
+        """one chain, one attempt per limit price given"""
+        recs = [_p(i + 1, country, size, limit_price=px, refpx=refpx)
+                for i, px in enumerate(prices)]
+        for i, r in enumerate(recs):
+            r["sym"] = sym
+            r["fixmsg"] = "9604=" + sym + ";40=1"
+            r["time"] = dt.time(9, 30, i)
+        att, _drop = to_attempts(recs)
+        return to_chains(att)[0]
+
+    #  Taiwan bands +/-10% off a 100.00 close, and these are all SELLS
+    ok_tw = _chain("TW", "1.TT", 105.0)
+    dead_tw = _chain("TW", "2.TT", 130.0)
+    m = split_marketable([ok_tw, dead_tw])
+    check("a sell inside the band is kept", [c.sym for c in m.kept], ["1.TT"])
+    check("a sell above limit up is dropped", [c.sym for c in m.dead],
+          ["2.TT"])
+    check("and counted against its market", m.by_market["TW"], 1)
+    check("no other market is charged for it",
+          sum(v for k, v in m.by_market.items() if k != "TW"), 0)
+
+    #  the whole point of chaining: one bad price does not kill the order
+    mixed = _chain("TW", "3.TT", 130.0, 104.0)
+    check("a chain survives if ANY attempt could have traded",
+          split_marketable([mixed]).kept, [mixed])
+    both_bad = _chain("TW", "4.TT", 130.0, 140.0)
+    check("and dies only if none of them could",
+          split_marketable([both_bad]).dead, [both_bad])
+
+    #  a sell below the floor is CHEAP, not off limit
+    check("a sell under limit down still trades",
+          split_marketable([_chain("TW", "5.TT", 50.0)]).dead, [])
+
+    #  unknown is kept, and kept visibly
+    hk = _chain("HK", "6.HK", 1e6)
+    m_hk = split_marketable([hk])
+    check("Hong Kong caps nothing, so nothing there is ever dropped",
+          m_hk.dead, [])
+    check("but it is reported as unjudged rather than passed over silently",
+          [c.sym for c in m_hk.unknown], ["6.HK"])
+    check("and it still counts", m_hk.kept, [hk])
+    no_close = _chain("TW", "7.TT", 1e6, refpx=0.0)
+    check("a name with no previous close cannot be judged either",
+          split_marketable([no_close]).kept, [no_close])
+    check("market orders have no price to be wrong",
+          split_marketable([_chain("TW", "8.TT", 0.0)]).dead, [])
+
+    #  Tokyo is a step table, not a percentage
+    check("a 1234 yen name may print 1534, and an order there is fine",
+          split_marketable([_chain("JP", "9.JP", 1500.0, refpx=1234.0)]).dead,
+          [])
+    check("1600 is beyond it",
+          [c.sym for c in
+           split_marketable([_chain("JP", "10.JP", 1600.0,
+                                    refpx=1234.0)]).dead], ["10.JP"])
+    check("a percentage would have allowed it - Tokyo is NOT +/-30%",
+          marketable("KR", 1234.0, 1600.0, -1), True)
+
+    #  and the row arithmetic once they are gone
+    dead2 = _chain("TW", "11.TT", 130.0, size=9_000_000)
+    live2 = _chain("TW", "12.TT", 105.0, size=1_000)
+    m2 = split_marketable([dead2, live2])
+    r_all = [r for r in by_market([dead2, live2], []) if r.code == "TW"][0]
+    r_live = [r for r in by_market(m2.kept, []) if r.code == "TW"][0]
+    check("keeping the dead one puts 9m of notional on the page nobody could "
+          "ever have traded", r_all.orders, 2)
+    check("dropping it leaves the one real order", r_live.orders, 1)
+    check("and its notional alone",
+          round(r_live.ordered_usd), round(1_000 * 105.0))
+    check("every market is still on the page after the filter",
+          len(by_market(m2.kept, [])), len(MARKETS))
+
     print("\nthe headline is the real fill rate")
     #  the day this whole thread started from
     #  priced at 1.0 with fx 1.0, so the USD columns equal the share columns
@@ -2585,6 +2878,10 @@ def main(argv=None) -> int:
                    help="do NOT un-chain the orders that still execute more "
                         "than they asked for - leave them chained, and let the "
                         "page read over 100%%")
+    p.add_argument("--keep-unmarketable", action="store_true",
+                   help="do NOT drop orders priced beyond the day's limit up / "
+                        "limit down band - count them, even though they could "
+                        "never have traded")
     p.add_argument("--compare", action="store_true",
                    help="print the old per-TARGET counting beside the "
                         "chained per-ORDER one over ONE fetch and exit, so any "

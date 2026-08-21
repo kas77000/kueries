@@ -68,6 +68,13 @@ BASELINE = "#c3c2b7"    # chart baseline
 HEADER_BG = "#3a3835"   # table header band
 HEADER_FG = "#ffffff"
 
+# For a STACKED mark, where the segments sit against each other and hue is
+# series identity rather than chart identity.  Slots 1-4 of the reference
+# palette in their published order, which is what the adjacent-pair CVD numbers
+# are quoted for.  Four is the cap here: the fifth slot puts yellow beside
+# orange, and that pair fails the all-pairs floors.
+STACK = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100")
+
 FONTS = ["Segoe UI", "Helvetica Neue", "Arial", "DejaVu Sans"]
 
 # =============================================================================
@@ -318,6 +325,81 @@ def barchart(fig, rect_, title, labels, values, texts, color,
     return ax
 
 
+def stacked_barchart(fig, rect_, title, labels, series, colors=None,
+                     fs=8.0, title_y=None, gutter=0.38, head=1.30,
+                     legend_y=None):
+    """A HORIZONTAL bar chart whose bars are split into segments.
+
+    series is [(name, [value per label]), ...].  The row total is labelled at
+    the end of the bar; the segments are not labelled individually, because at
+    this size the numbers would collide - the legend and the total are what the
+    reader needs, and the exact split is in the terminal.
+
+    A 2px surface gap separates the segments, per the mark spec, so two
+    adjacent colours never read as one block.
+    """
+    x0, y0, w, h = rect_
+    ax = fig.add_axes(rect_)
+    ax.set_axis_off()
+    ax.patch.set_alpha(0.0)
+    colors = colors or STACK
+
+    n = max(len(labels), 1)
+    totals = [sum(vals[i] for _nm, vals in series) for i in range(len(labels))]
+    top = max(totals + [0.0]) or 1.0
+    ax.set_xlim(-gutter * top, head * top)
+    ax.set_ylim(n, 0)
+
+    span_x = (gutter + head) * top
+    rx = BAR_R_IN * span_x / (w * PAGE_W)
+    ry = BAR_R_IN * n / (h * PAGE_H)
+    pad = 0.022 * top
+
+    from matplotlib.patches import Rectangle
+    for i, lab in enumerate(labels):
+        yb = i + (1.0 - BAR_FRAC) / 2.0
+        run = 0.0
+        parts = [(k, vals[i]) for k, (_nm, vals) in enumerate(series)
+                 if vals[i] > 0]
+        for j, (k, v) in enumerate(parts):
+            last = j == len(parts) - 1
+            if last:
+                #  only the outermost segment gets the rounded data end
+                _rounded_bar(ax, yb, BAR_FRAC, run + v, colors[k % len(colors)],
+                             rx, ry)
+                #  redraw the ones before it on top, so the rounding shows
+                #  only at the very end of the bar
+                back = 0.0
+                for k2, v2 in parts[:-1]:
+                    ax.add_patch(Rectangle(
+                        (back, yb), v2, BAR_FRAC,
+                        facecolor=colors[k2 % len(colors)], edgecolor=SURFACE,
+                        linewidth=2, zorder=4))
+                    back += v2
+            run += v
+        ax.text(-pad, i + 0.5, lab, ha="right", va="center", fontsize=fs,
+                color=INK3)
+        ax.text(totals[i] + pad, i + 0.5, fmt_int(totals[i]), ha="left",
+                va="center", fontsize=fs, color=INK, fontweight="bold")
+
+    if title_y is None:
+        title_y = y0 + h + 0.014
+    fig.text(x0, title_y, title, fontsize=10.5, fontweight="bold", color=INK)
+
+    #  a legend is not optional with more than one series: identity must never
+    #  be carried by colour alone
+    if legend_y is None:
+        legend_y = y0 - 0.024
+    lx = x0
+    for k, (name, _vals) in enumerate(series):
+        rect(fig, lx, legend_y, 0.011, 0.008, colors[k % len(colors)], zorder=3)
+        fig.text(lx + 0.016, legend_y, name, fontsize=7.5, color=INK2,
+                 va="baseline")
+        lx += 0.020 + 0.0088 * len(name)
+    hline(fig, y0 - 0.008, x0, x0 + w, color=BASELINE, lw=0.8)
+    return ax
+
+
 def vbarchart(fig, rect_, title, labels, values, texts, color,
               vmax=None, fs=5.4, title_y=None):
     """One VERTICAL bar chart: columns left to right, labels turned on their
@@ -450,6 +532,23 @@ def self_test() -> int:
     buf = io.BytesIO()
     fig.savefig(buf, format="pdf", facecolor=SURFACE)
     check("a page with every element renders", buf.getvalue()[:5], b"%PDF-")
+
+    st = figure()
+    stacked_barchart(st, (L, 0.40, 0.405, 0.20), "Stacked",
+                     ["Hong Kong", "Japan"],
+                     [("short sell", [152.0, 2.0]), ("open", [31.0, 0.0]),
+                      ("close", [12.0, 1.0]), ("continuous", [44.0, 0.0])])
+    b_st = io.BytesIO()
+    st.savefig(b_st, format="pdf", facecolor=SURFACE)
+    check("a stacked chart renders", b_st.getvalue()[:5], b"%PDF-")
+    st0 = figure()
+    stacked_barchart(st0, (L, 0.4, 0.405, 0.2), "All zero", ["a", "b"],
+                     [("x", [0.0, 0.0]), ("y", [0.0, 0.0])])
+    b0 = io.BytesIO()
+    st0.savefig(b0, format="pdf", facecolor=SURFACE)
+    check("and one whose stacks are all empty", b0.getvalue()[:5], b"%PDF-")
+    check("the stack palette caps at four - the fifth slot puts yellow beside "
+          "orange", len(STACK), 4)
 
     empty = figure()
     barchart(empty, (L, 0.4, 0.405, 0.2), "No data", [], [], [], BLUE)
