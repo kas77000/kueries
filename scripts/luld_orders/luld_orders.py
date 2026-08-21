@@ -97,6 +97,36 @@ DPI = 200
 MIN_LIMIT_MINS = 20.0
 
 # -----------------------------------------------------------------------------
+# EMAIL.  Edit these, or put them in local_settings.py.  No command line
+# arguments, by design: who gets this report is part of what the report IS,
+# not of one run of it - a distribution list that lives in whatever someone
+# last typed is a list that quietly loses people.
+#
+# EMAIL_TO empty means DO NOT SEND.  That is the whole switch; there is no
+# separate enable flag to leave in the wrong position.
+# -----------------------------------------------------------------------------
+
+EMAIL_TO = []                  # ["desk@example.com", "compliance@example.com"]
+EMAIL_CC = []
+EMAIL_BCC = []
+EMAIL_FROM = ""                # "algo-reports@example.com"
+
+# The relay takes mail from the host this runs on, so there is nothing to
+# authenticate with: host, port and timeout is the whole of it.
+SMTP_HOST = ""                 # "mail.example.com"
+SMTP_PORT = 0                  # 0 -> 25
+SMTP_TIMEOUT = 30              # seconds
+
+# True builds the message and reports who it would go to without opening a
+# socket - the way to check a new recipient list.
+EMAIL_DRY_RUN = False
+
+# What the mail says.  Just this - the report is the attachment, and a body
+# that restates it is a second copy to keep in step and one more thing to
+# render wrong in somebody's client.
+EMAIL_SIGNATURE = "Best Regards,\n\nKhalife"
+
+# -----------------------------------------------------------------------------
 # Anything above can be overridden from a local_settings.py beside this script,
 # which git ignores - so the servers survive a pull and this file never has to
 # be edited.
@@ -1316,6 +1346,83 @@ def write_raw(lines, out_dir, stem) -> Path:
 
 
 # =============================================================================
+# EMAIL
+#
+# The settings live in the EMAIL block at the top of this file, or in a
+# local_settings.py beside it.
+# =============================================================================
+
+def _cfg(name, default):
+    """A setting, or its default.
+
+    Reads the module globals rather than naming each constant, so a
+    local_settings.py that overrides one is picked up without this having to
+    know which.
+    """
+    return globals().get(name, default)
+
+
+def _mailer():
+    try:
+        from lib import mailer
+    except ImportError as e:                     # noqa: BLE001
+        raise SystemExit(
+            f"EMAIL_TO is set but scripts/lib/mailer.py will not import "
+            f"({e}).  It sits beside this script's folder; copy scripts/lib "
+            f"too if you moved this one.")
+    return mailer
+
+
+def email_configured() -> bool:
+    """No recipients is the off switch, and it is the whole switch."""
+    return bool(_cfg("EMAIL_TO", []) or _cfg("EMAIL_CC", [])
+                or _cfg("EMAIL_BCC", []))
+
+
+def mail_body() -> str:
+    """The sign-off, and nothing else.
+
+    The report is the ATTACHMENT.  A body that restates the table is a
+    second copy of the numbers to keep in step, and one more thing to render
+    wrong in somebody's client.
+    """
+    return _cfg("EMAIL_SIGNATURE", "Best Regards,")
+
+
+def mail_report(when, files) -> None:
+    """Send it: the PDF, and a body that is just the sign-off."""
+    m = _mailer()
+    pdf = next((q for q in files if q.suffix == ".pdf"), None)
+    sender = _cfg("EMAIL_FROM", "")
+    if not sender:
+        raise SystemExit(
+            "EMAIL_TO is set but EMAIL_FROM is empty. Both live in the EMAIL "
+            "block near the top of luld_orders.py, or in a local_settings.py "
+            "beside it.")
+    if pdf is None:
+        raise SystemExit("nothing to attach: no PDF was written")
+
+    msg = m.build_message(m.Mail(
+        subject=f"{TITLE} - {when}", sender=sender,
+        to=_cfg("EMAIL_TO", []), cc=_cfg("EMAIL_CC", []),
+        bcc=_cfg("EMAIL_BCC", []),
+        text=mail_body(), attachments=[pdf]))
+    smtp = m.Smtp(host=_cfg("SMTP_HOST", ""), port=_cfg("SMTP_PORT", 0),
+                  timeout=_cfg("SMTP_TIMEOUT", 30))
+    log("  email:")
+    log(m.describe(msg))
+    dry = _cfg("EMAIL_DRY_RUN", False)
+    rcpt = m.send(msg, smtp, dry_run=dry)
+    n = len(rcpt)
+    if dry:
+        log(f"  EMAIL_DRY_RUN: NOT sent, {n} recipient"
+            f"{'' if n == 1 else 's'} would have been")
+    else:
+        log(f"  sent to {n} recipient{'' if n == 1 else 's'} via "
+            f"{smtp.host}:{smtp.resolved_port()}")
+
+
+# =============================================================================
 # PLAN
 # =============================================================================
 
@@ -1328,6 +1435,7 @@ class Plan(NamedTuple):
     dates: list
     stem: str
     subtitle: str
+    when: str                  # what the subject line says it covers
 
 
 def month_dates(year, month) -> list:
@@ -1354,13 +1462,16 @@ def plan(monthly, date, now=None) -> Plan:
         y, mo = parse_month(monthly)
         return Plan(True, True, order, qatt, names, month_dates(y, mo),
                     f"luld_orders_{y:04d}-{mo:02d}",
-                    f"By region  ·  {calendar.month_name[mo]} {y}")
+                    f"By region  ·  {calendar.month_name[mo]} {y}",
+                    f"{calendar.month_name[mo]} {y}")
     if date is not None:
         return Plan(True, False, order, qatt, names, [date],
-                    f"luld_orders_{date:%Y-%m-%d}", f"By region  ·  {date}")
+                    f"luld_orders_{date:%Y-%m-%d}", f"By region  ·  {date}",
+                    f"{date}")
     return Plan(False, False, order, qatt, names, [None],
                 f"luld_orders_{now:%Y-%m-%d}",
-                f"By region  ·  {now:%Y-%m-%d %H:%M}")
+                f"By region  ·  {now:%Y-%m-%d %H:%M}",
+                f"{now:%Y-%m-%d %H:%M}")
 
 
 # =============================================================================
@@ -1441,11 +1552,13 @@ def run(args) -> int:
                      lines)
     if len(figs) > 2:
         log(f"  the order listing runs to {len(figs) - 1} pages")
-    save(figs, args.out_dir, pl.stem, dpi=DPI)
+    files = save(figs, args.out_dir, pl.stem, dpi=DPI)
     if args.csv:
         write_csv(rows, tot, args.out_dir, pl.stem)
     if args.raw:
         write_raw(lines, args.out_dir, pl.stem)
+    if email_configured() and not args.no_email:
+        mail_report(pl.when, files)
     return 0
 
 
@@ -1619,6 +1732,7 @@ def demo(out_dir, want_csv=True) -> int:
 
 def self_test() -> int:
     import io
+    import tempfile
     ok = True
 
     def check(name, got, want):
@@ -2055,6 +2169,55 @@ def self_test() -> int:
            if d.weekday() > 4], [])
     check("the file is named for what it covers",
           plan("2026-07", None, now).stem, "luld_orders_2026-07")
+    check("and the subject line says what it covers, not how",
+          plan("2026-07", None, now).when, "July 2026")
+
+    print("\nemail")
+    try:
+        m = _mailer()
+    except SystemExit as e:
+        print(f"  ..    {e}")
+        print("\n" + ("all checks passed" if ok else "SOME CHECKS FAILED"))
+        return 0 if ok else 1
+    check("an empty EMAIL_TO is the off switch", email_configured(), False)
+    #  a bcc-only list is still a distribution list, and forgetting that is
+    #  how a report goes quiet for the people who only ever got it blind
+    globals()["EMAIL_BCC"] = ["quiet@example.com"]
+    check("but a bcc alone still counts as configured", email_configured(),
+          True)
+    globals()["EMAIL_BCC"] = []
+    check("and putting it back turns it off again", email_configured(), False)
+    check("nothing to authenticate with, by design",
+          [f for f in ("SMTP_USER", "SMTP_PASSWORD", "USER", "PASSWORD")
+           if f in globals()], [])
+    check("the body is the signature and nothing else",
+          mail_body(), "Best Regards,\n\nKhalife")
+    check("no table in it", "Region" in mail_body(), False)
+    check("no numbers in it", any(c.isdigit() for c in mail_body()), False)
+
+    with tempfile.TemporaryDirectory() as d:
+        files = save(withl, d, "luld_orders_2026-07")
+        pdfs = [f for f in files if f.suffix == ".pdf"]
+        check("one PDF for the whole report, however many pages",
+              len(pdfs), 1)
+        msg = m.build_message(m.Mail(
+            subject=f"{TITLE} - x", sender="a@b.com",
+            to=["c@d.com", "e@f.com"], cc=["g@h.com"],
+            text=mail_body(), attachments=pdfs))
+        check("the PDF is the only thing attached",
+              [q.get_filename() for q in msg.walk() if q.get_filename()],
+              ["luld_orders_2026-07.pdf"])
+        check("no page is inlined",
+              any(q.get_content_type().startswith("image/")
+                  for q in msg.walk()), False)
+        check("the message is plain text, with no html part",
+              [q.get_content_type() for q in msg.walk()
+               if q.get_content_type() == "text/html"], [])
+        check("and it goes to everyone it should, bcc included",
+              sorted(m.recipients(msg)),
+              ["c@d.com", "e@f.com", "g@h.com"])
+        check("the subject says what the report is and what it covers",
+              msg["Subject"], f"{TITLE} - x")
 
     print("\n" + ("all checks passed" if ok else "SOME CHECKS FAILED"))
     return 0 if ok else 1
@@ -2091,6 +2254,9 @@ def main(argv=None) -> int:
                    help="render a sample off synthetic data, no kdb needed")
     p.add_argument("--self-test", action="store_true",
                    help="check the analytics and the q, no kdb needed")
+    p.add_argument("--no-email", action="store_true",
+                   help="write the report but do not send it, whatever "
+                        "EMAIL_TO says")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
 

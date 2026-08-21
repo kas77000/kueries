@@ -443,6 +443,50 @@ Nothing is done about it yet. Chaining is step 2.
 
 ---
 
+## Email
+
+Configured in the `EMAIL` block at the top of the script, or in
+`local_settings.py` — **not on the command line**. Who gets this report is part
+of what the report *is*, not of one run of it: a distribution list that lives in
+whatever someone last typed is a list that quietly loses people.
+
+**`EMAIL_TO` empty means do not send.** That is the whole switch; there is no
+separate enable flag to leave in the wrong position. A `EMAIL_BCC` alone still
+counts as configured — forgetting that is how a report goes quiet for the people
+who only ever got it blind.
+
+```python
+EMAIL_TO = ["desk@example.com"]
+EMAIL_FROM = "algo-reports@example.com"
+SMTP_HOST = "mail.example.com"
+EMAIL_DRY_RUN = True     # build it, say who it would go to, open no socket
+```
+
+The report is the **attachment** — one PDF, however many pages the listing ran
+to. The body is just the sign-off:
+
+```
+Best Regards,
+
+Khalife
+```
+
+No HTML part, no tables in the body, no page inlined as an image. A body that
+restates the numbers is a second copy to keep in step and one more thing to
+render wrong in somebody's client — checks assert all of that, including that
+the body carries no digits at all.
+
+SMTP is **host, port and timeout**: no credentials and no STARTTLS. These go
+through an internal relay that takes mail from the host they run on, so there is
+nothing to authenticate with — and an auth path nobody exercises is broken by
+the time somebody needs it. Same shape as
+[`short_sell_report`](../short_sell_report/README.md), which shares
+[`scripts/lib/mailer.py`](../lib/README.md).
+
+`--no-email` writes the report and sends nothing, whatever `EMAIL_TO` says.
+
+---
+
 ## Settings
 
 Servers live in the block at the top of the script, and can be overridden from a
@@ -454,6 +498,9 @@ ORDER_SERVER_RT = "prod-oms-1:5012"
 ORDER_SERVER_HIST = "prod-oms-hist:5010"
 QATT_SERVER_RT = "prod-qatt-1:5013"
 QATT_SERVER_HIST = "prod-qatt-hist:5011"
+EMAIL_TO = ["desk@example.com"]
+EMAIL_FROM = "algo-reports@example.com"
+SMTP_HOST = "mail.example.com"
 MIN_LIMIT_MINS = 20.0
 ```
 
@@ -476,7 +523,7 @@ conversion anywhere. That is relied on and is not a gap.
 
 Nothing is grouped in q: a `target` row is one send and a `workorder` row is one
 child. Every sum and count happens in Python, where `--self-test` can prove it —
-148 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
+162 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
 synthetic data.
 
 ---
@@ -486,7 +533,7 @@ synthetic data.
 - **Chaining** replaced orders back into one order (step 2).
 - **The marketable window**, and whether a split was actually on the book during
   it — the question this is being built towards.
-- **Rejections**, email, and the findings table.
+- **Rejections**, and the findings table.
 - **A price sanity check that actually filters.** `pct_from_close` is now
   *reported* on every raw line, but nothing is dropped on it — so a thin book,
   a halt or an auction imbalance still reads as a limit period.
