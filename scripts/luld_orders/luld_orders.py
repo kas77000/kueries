@@ -135,6 +135,7 @@ REGIONS = (
 )
 
 REGION_CODES = tuple(r.code for r in REGIONS)
+REGION_NAME = {r.code: r.name for r in REGIONS}
 SUFFIX_REGION = {s: r.code for r in REGIONS for s in r.suffixes}
 #  the patterns q filters on are BUILT FROM the table Python maps back with, so
 #  the two cannot drift apart
@@ -632,6 +633,81 @@ def write_csv(rows, tot, out_dir, stem) -> Path:
 
 
 # =============================================================================
+# RAW
+#
+# The lines the page is made of.  Not a second answer: summing order_qty and
+# executed over this file reproduces the table exactly, and a check holds it to
+# that.  One row per ORDER, the same unit the page counts - a row per limit
+# period would read more raw and add up to more than the report.
+# =============================================================================
+
+RAW_HEADER = (
+    "date", "region", "sym", "side", "id_server", "id_target", "tag_9604",
+    "order_qty", "executed", "completion_pct", "order_start", "order_end",
+    "limit_periods", "limit_first_start", "limit_last_end", "limit_mins",
+    "limit_price", "overlap_mins",
+)
+
+
+def _hms(ms) -> str:
+    """A time as HH:MM:SS - what someone types back into a q query."""
+    if ms is None:
+        return ""
+    ms = max(0, int(ms))
+    return f"{ms // 3_600_000:02d}:{ms // 60_000 % 60:02d}:{ms // 1000 % 60:02d}"
+
+
+def overlap_mins(o, periods) -> float:
+    """How long the order and the limit actually coexisted, in minutes.
+
+    Summed over the periods it touched, each clipped to the order's own window.
+    An order still open is taken to the end of the day, the same way `overlap`
+    treats it - a missing bound cannot shorten what it cannot rule out.
+    """
+    lo = 0 if o.t_start is None else o.t_start
+    hi = 24 * 3_600_000 if o.t_end is None else o.t_end
+    total = 0
+    for w in periods:
+        total += max(0, min(hi, w.end) - max(lo, w.start))
+    return total / 60_000.0
+
+
+def raw_rows(orders, executed, hits) -> list:
+    """One row per order in scope, in the order the report counted them."""
+    out = []
+    for o in orders:
+        got = sorted(hits.get(o.key, ()), key=lambda w: w.start)
+        ex = executed.get(o.key, 0)
+        comp = _completion(ex, o.size)
+        out.append([
+            o.date.isoformat() if o.date else "",
+            REGION_NAME[o.region], o.sym, o.side, o.key[1], o.id_target,
+            o.client_id, o.size, ex,
+            "" if comp is None else f"{comp:.1f}",
+            _hms(o.t_start), _hms(o.t_end),
+            len(got),
+            _hms(got[0].start) if got else "",
+            _hms(got[-1].end) if got else "",
+            f"{sum(w.minutes for w in got):.1f}" if got else "",
+            f"{got[0].price:g}" if got else "",
+            f"{overlap_mins(o, got):.1f}",
+        ])
+    return out
+
+
+def write_raw(orders, executed, hits, out_dir, stem) -> Path:
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / f"{stem}_raw.csv"
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(RAW_HEADER)
+        w.writerows(raw_rows(orders, executed, hits))
+    log(f"  wrote {path}")
+    return path
+
+
+# =============================================================================
 # PLAN
 # =============================================================================
 
@@ -693,7 +769,7 @@ def run(args) -> int:
     oh = connect(pl.order_server)
     qh = connect(pl.qatt_server)
 
-    orders, executed, seen, no_limit_days = [], {}, 0, 0
+    orders, executed, hits, seen, no_limit_days = [], {}, {}, 0, 0
     for d in pl.dates:
         if not args.quiet and d is not None:
             log(f"  {d} ...")
@@ -710,10 +786,11 @@ def run(args) -> int:
             #  being calm
             no_limit_days += 1
             continue
-        kept, _hits = touched(day, lims)
+        kept, day_hits = touched(day, lims)
         if not kept:
             continue
         orders.extend(kept)
+        hits.update(day_hits)
         executed.update(executed_by_order(wr, kept))
 
     rows = by_region(orders, executed)
@@ -743,6 +820,8 @@ def run(args) -> int:
     save(figs, args.out_dir, pl.stem, dpi=DPI)
     if args.csv:
         write_csv(rows, tot, args.out_dir, pl.stem)
+    if args.raw:
+        write_raw(orders, executed, hits, args.out_dir, pl.stem)
     return 0
 
 
@@ -763,9 +842,13 @@ def _t(idt, region, size, d=None, srv=1, sym=None, side="sell",
     return {"date": d, "id_server": srv, "id_target": idt,
             "sym": sym or f"{1000 + idt}{sfx}", "side": side,
             "sidesign": -1 if side == "sell" else 1, "size": size,
-            "t_start": dt.timedelta(milliseconds=t_start),
-            "t_end": dt.timedelta(milliseconds=t_end),
+            #  None is a real value here: a target still working has no t_end
+            "t_start": _td(t_start), "t_end": _td(t_end),
             "fixmsg": fix + "59=0"}
+
+
+def _td(ms):
+    return None if ms is None else dt.timedelta(milliseconds=ms)
 
 
 def _wo(idw, idt, make, d=None, srv=1):
@@ -811,19 +894,20 @@ def demo_session(d=None):
     wr.append(_wo(k, k, 88_000, d=d))
 
     orders = to_orders(tr)
-    kept, _hits = touched(orders, to_limits(lims, d))
+    kept, hits = touched(orders, to_limits(lims, d))
     ex = executed_by_order(wr, kept)
     rows = by_region(kept, ex)
-    return kept, ex, rows, totals(rows)
+    return kept, ex, hits, rows, totals(rows)
 
 
 def demo(out_dir, want_csv=True) -> int:
-    _o, _e, rows, tot = demo_session()
+    orders, ex, hits, rows, tot = demo_session()
     figs = pages_for(rows, tot, "By region  ·  SAMPLE",
                      "SAMPLE - synthetic data, not from kdb")
     save(figs, out_dir, "luld_orders_SAMPLE", dpi=DPI)
     if want_csv:
         write_csv(rows, tot, out_dir, "luld_orders_SAMPLE")
+        write_raw(orders, ex, hits, out_dir, "luld_orders_SAMPLE")
     log("  these are made up numbers - do not circulate them as a report")
     return 0
 
@@ -960,7 +1044,7 @@ def self_test() -> int:
           sh[0].client_id, "ONE")
 
     print("\nthe page")
-    _o, _e, drows, dtot = demo_session()
+    dorders, dex, dhits, drows, dtot = demo_session()
     check("the demo has orders in every region",
           [r.code for r in drows if not r.orders], [])
     check("the blip is under the minimum and is not one of them",
@@ -990,6 +1074,42 @@ def self_test() -> int:
     check("a percentage with nothing to measure is empty, not 0.0",
           csv_rows([Row("TH", "Thailand", 0, 0, 0)],
                    Totals(0, 0, 0))[0][4], "")
+
+    print("\nthe raw rows")
+    rr = raw_rows(dorders, dex, dhits)
+    check("a line per order in scope, and no more", len(rr), dtot.orders)
+    check("the header names every column", len(RAW_HEADER), len(rr[0]))
+    qi = RAW_HEADER.index("order_qty")
+    ei = RAW_HEADER.index("executed")
+    check("the raw file adds back up to the page - quantity",
+          sum(r[qi] for r in rr), dtot.order_qty)
+    check("and executed", sum(r[ei] for r in rr), dtot.executed)
+    ri = RAW_HEADER.index("region")
+    check("region by region too",
+          sum(r[qi] for r in rr if r[ri] == "Japan"),
+          {x.code: x for x in drows}["JP"].order_qty)
+    check("every line names a limit period, or it would not be a line",
+          [r for r in rr if not r[RAW_HEADER.index("limit_periods")]], [])
+    #  one order, one period, overlapping by half an hour of the period's hour
+    ro = to_orders([_t(1, "JP", 1000, t_start=11 * H + 1_800_000,
+                       t_end=15 * H)])
+    rw = to_limits([_lim(ro[0].sym, 11 * H, 12 * H)], min_mins=0.0)
+    rk, rh = touched(ro, rw)
+    one = raw_rows(rk, executed_by_order([_wo(9, 1, 250)], rk), rh)[0]
+    check("the limit period is 60 minutes",
+          one[RAW_HEADER.index("limit_mins")], "60.0")
+    check("but the order was only live for the second half of it",
+          one[RAW_HEADER.index("overlap_mins")], "30.0")
+    check("times are HH:MM:SS, ready to type back into a query",
+          one[RAW_HEADER.index("limit_first_start")], "11:00:00")
+    check("an order still open overlaps to the end of the day, not to zero",
+          overlap_mins(to_orders([_t(1, "JP", 1, t_start=11 * H,
+                                     t_end=None)])[0],
+                       [Limit("x", None, 23 * H, 24 * H, 1.0, 5)]), 60.0)
+    check("a period the order never saw contributes nothing",
+          overlap_mins(to_orders([_t(1, "JP", 1, t_start=9 * H,
+                                     t_end=10 * H)])[0],
+                       [Limit("x", None, 11 * H, 12 * H, 1.0, 5)]), 0.0)
 
     print("\nthe plan")
     now = dt.datetime(2026, 7, 24, 18, 37)
@@ -1034,6 +1154,10 @@ def main(argv=None) -> int:
                         "last to count as a limit period")
     p.add_argument("--csv", action="store_true",
                    help="also write the table as CSV beside the PDF")
+    p.add_argument("--raw", action="store_true",
+                   help="also write the rows the table is made of: one line "
+                        "per order, with the limit period it was live "
+                        "through, as <stem>_raw.csv")
     p.add_argument("--out-dir", default=str(OUT_DIR))
     p.add_argument("--demo", action="store_true",
                    help="render a sample off synthetic data, no kdb needed")

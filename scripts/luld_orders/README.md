@@ -8,7 +8,7 @@ region.
 python scripts/luld_orders/luld_orders.py                       # today, realtime
 python scripts/luld_orders/luld_orders.py --date 2026-07-01     # one session
 python scripts/luld_orders/luld_orders.py --monthly 2026-07     # a month
-python scripts/luld_orders/luld_orders.py --monthly 2026-07 --csv
+python scripts/luld_orders/luld_orders.py --monthly 2026-07 --csv --raw
 
 python scripts/luld_orders/luld_orders.py --self-test           # no kdb needed
 python scripts/luld_orders/luld_orders.py --demo                # sample page
@@ -42,7 +42,43 @@ is a different statement from nothing done.
 Written to `--out-dir` as a PDF and a PNG. `--csv` writes the same rows beside
 it as `luld_orders_<stamp>.csv` — built from **the same `Row` objects the page
 draws**, so the two cannot disagree. A CSV re-derived from the source would be
-a second answer to keep in step.
+a second answer to keep in step. `--raw` writes the order-level lines those
+rows are made of; see below.
+
+---
+
+## `--raw` — the lines the table is made of
+
+`--raw` writes `<stem>_raw.csv`: **one line per order in scope**, with the limit
+period it was live through. This is the file to open when a regional figure
+looks wrong.
+
+```
+date,region,sym,side,id_server,id_target,tag_9604,order_qty,executed,
+completion_pct,order_start,order_end,limit_periods,limit_first_start,
+limit_last_end,limit_mins,limit_price,overlap_mins
+```
+
+| column | what it is |
+|---|---|
+| `id_target`, `id_server` | the target row this line is, so it can be looked up |
+| `tag_9604` | the client's own id — empty when the client sent none |
+| `order_start`, `order_end` | the order's live window, `HH:MM:SS`, ready to type back into a query. Empty end = still working |
+| `limit_periods` | how many qualifying periods the order was live through |
+| `limit_first_start`, `limit_last_end` | the span those periods cover |
+| `limit_mins` | how long the periods lasted, summed |
+| `overlap_mins` | how long the order and the limit actually **coexisted** — each period clipped to the order's own window |
+
+`limit_mins` and `overlap_mins` differ whenever the order arrived late or
+finished early: a 60-minute limit an order only saw the second half of is
+`60.0` and `30.0`. `overlap_mins` is the one that matters — it is the first
+piece of the marketable window this is being built towards.
+
+**One line per order, not per limit period.** An order live through three
+periods is still one line, because that is the unit the page counts: summing
+`order_qty` and `executed` over this file reproduces the table exactly, region
+by region, and a check holds it to that. A line per period would read more raw
+and add up to more than the report.
 
 ---
 
@@ -192,7 +228,7 @@ conversion anywhere. That is relied on and is not a gap.
 
 Nothing is grouped in q: a `target` row is one send and a `workorder` row is one
 child. Every sum and count happens in Python, where `--self-test` can prove it —
-61 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
+72 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
 synthetic data.
 
 ---
