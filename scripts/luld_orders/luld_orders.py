@@ -859,14 +859,26 @@ def write_csv(rows, tot, out_dir, stem) -> Path:
 # period would read more raw and add up to more than the report.
 # =============================================================================
 
-RAW_HEADER = (
+#  Three blocks, left to right: OURS, then the MARKET's, then the two put
+#  together.  A reader going along a line meets what we did first, what the
+#  book was doing second, and only then anything that needed both - and a
+#  column's block says which side to go and check when it looks wrong.
+ORDER_COLS = (
     "date", "region", "sym", "side", "otype", "id_server", "id_target",
     "tag_9604", "order_qty", "executed", "completion_pct", "t_gen",
-    "order_start", "order_end", "limit_periods", "limit_first_start", "limit_last_end",
-    "limit_mins", "limit_price", "ref_close", "pct_from_close", "limit_dir",
-    "limit_noask", "limit_nobid", "limit_net", "limit_locked", "overlap_mins",
-    "splits", "split_first_gen", "split_last_off",
+    "order_start", "order_end", "splits", "split_first_gen", "split_last_off",
 )
+
+LIMIT_COLS = (
+    "limit_periods", "limit_first_start", "limit_last_end", "limit_mins",
+    "limit_price", "ref_close", "pct_from_close", "limit_dir", "limit_noask",
+    "limit_nobid", "limit_net", "limit_locked",
+)
+
+#  the only column that needs both, and the one the next step is about
+BOTH_COLS = ("overlap_mins",)
+
+RAW_HEADER = ORDER_COLS + LIMIT_COLS + BOTH_COLS
 
 
 def line_direction(periods, ref: float = 0.0) -> str:
@@ -920,12 +932,14 @@ def raw_rows(orders, splits, hits) -> list:
         ex = sp.made
         comp = _completion(ex, o.size)
         out.append([
+            #  ORDER_COLS - what we did
             o.date.isoformat() if o.date else "",
             REGION_NAME[o.region], o.sym, o.side, o.otype, o.key[1],
-            o.id_target,
-            o.client_id, o.size, ex,
+            o.id_target, o.client_id, o.size, ex,
             "" if comp is None else f"{comp:.1f}",
             _hms(o.t_gen), _hms(o.t_start), _hms(o.t_end),
+            sp.n, _hms(sp.first_gen), _hms(sp.last_off),
+            #  LIMIT_COLS - what the book was doing
             len(got),
             _hms(got[0].start) if got else "",
             _hms(got[-1].end) if got else "",
@@ -937,8 +951,8 @@ def raw_rows(orders, splits, hits) -> list:
             sum(w.noask for w in got), sum(w.nobid for w in got),
             f"{got[0].net:g}" if got and got[0].net else "",
             "yes" if got and all(w.locked for w in got) else "no",
+            #  BOTH_COLS - what needed the two of them
             f"{overlap_mins(o, got):.1f}",
-            sp.n, _hms(sp.first_gen), _hms(sp.last_off),
         ])
     return out
 
@@ -1524,6 +1538,18 @@ def self_test() -> int:
     rr = raw_rows(dorders, dex, dhits)
     check("a line per order in scope, and no more", len(rr), dtot.orders)
     check("the header names every column", len(RAW_HEADER), len(rr[0]))
+    check("ours first, the market's second, both last",
+          RAW_HEADER, ORDER_COLS + LIMIT_COLS + BOTH_COLS)
+    check("nothing of the market's has drifted into ours",
+          [c for c in ORDER_COLS if c.startswith(("limit_", "ref_", "pct_"))],
+          [])
+    check("nor the other way",
+          [c for c in LIMIT_COLS
+           if c.startswith(("split", "order_", "t_gen", "tag_"))], [])
+    check("what the order did stays with the order",
+          ORDER_COLS[-3:], ("splits", "split_first_gen", "split_last_off"))
+    check("and the only column needing both of them is the last one",
+          (BOTH_COLS, RAW_HEADER[-1]), (("overlap_mins",), "overlap_mins"))
     qi = RAW_HEADER.index("order_qty")
     ei = RAW_HEADER.index("executed")
     check("the raw file adds back up to the page - quantity",

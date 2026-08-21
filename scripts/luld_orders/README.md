@@ -54,18 +54,26 @@ period it was live through. This is the file to open when a regional figure
 looks wrong.
 
 ```
+OURS ────────────────────────────────────────────────────────────────────────
 date,region,sym,side,otype,id_server,id_target,tag_9604,order_qty,executed,
-completion_pct,t_gen,order_start,order_end,limit_periods,limit_first_start,
-limit_last_end,limit_mins,limit_price,ref_close,pct_from_close,limit_dir,
-limit_noask,limit_nobid,limit_net,limit_locked,overlap_mins,splits,
-split_first_gen,split_last_off
+completion_pct,t_gen,order_start,order_end,splits,split_first_gen,
+split_last_off,
+THE MARKET'S ────────────────────────────────────────────────────────────────
+limit_periods,limit_first_start,limit_last_end,limit_mins,limit_price,
+ref_close,pct_from_close,limit_dir,limit_noask,limit_nobid,limit_net,
+limit_locked,
+BOTH ────────────────────────────────────────────────────────────────────────
+overlap_mins
 ```
 
-Every column, in order. **The order** is what the first block describes, **the
-limit** the second, and **the two together** the last — which is where the
-question this is being built towards lives.
+**Three blocks, left to right.** Everything **we** did comes first — the order
+and the children it sent. Then what the **book** was doing. Then, last, the one
+column that needed both. Going along a line you meet our side before the
+market's, and a column's block tells you which side to go and check when the
+number looks wrong. Checks hold the layout, so a new column cannot quietly land
+in the wrong block.
 
-#### The order — from `target`
+#### Ours — from `target`
 
 | column | source | what it means |
 |---|---|---|
@@ -82,7 +90,15 @@ question this is being built towards lives.
 | `t_gen` | `target.t_gen` | when the **order** was created. Not `split_first_gen`, which is the first child's |
 | `order_start`, `order_end` | `target.t_start`, `t_end` | the order's live window, `HH:MM:SS`, ready to type back into a query. **Empty end = still working** |
 
-#### The limit — from `qatt`, and `target_stock` for the close
+#### Ours, continued — the children, from `workorder`
+
+| column | source | what it means |
+|---|---|---|
+| `splits` | count of `workorder` rows | how many children the engine made under this target. **Every row counts**, whatever became of it — a rejected split is still one the engine made, and leaving those out would say the order tried less than it did. `0` is the interesting value |
+| `split_first_gen` | min `workorder.t_gen` | when the **first** child was created |
+| `split_last_off` | max `workorder.t_off_market` | when the **last** child left the book. Empty on a split that never reached the market — a missing time cannot move the bound, or the order would be dated to midnight |
+
+#### The market's — from `qatt`, and `target_stock` for the close
 
 | column | source | what it means |
 |---|---|---|
@@ -98,23 +114,16 @@ question this is being built towards lives.
 | `limit_net` | `qatt.netChange` | last resort evidence. Comes off the last *traded* price, so it is 0 or empty on exactly these stocks |
 | `limit_locked` | derived | `yes` when no side ever went missing — bid = ask throughout. These are the ones `ref_close` has to call |
 
-#### The children — from `workorder`
-
-| column | source | what it means |
-|---|---|---|
-| `splits` | count of `workorder` rows | how many children the engine made under this target. **Every row counts**, whatever became of it — a rejected split is still one the engine made, and leaving those out would say the order tried less than it did. `0` is the interesting value |
-| `split_first_gen` | min `workorder.t_gen` | when the **first** child was created |
-| `split_last_off` | max `workorder.t_off_market` | when the **last** child left the book. Empty on a split that never reached the market — a missing time cannot move the bound, or the order would be dated to midnight |
-
 #### The two together
 
 | column | what it means |
 |---|---|
 | `overlap_mins` | how long the order and the limit **actually coexisted** — each period clipped to the order's own window, summed |
 
-Put `split_first_gen` and `split_last_off` beside `limit_first_start` and
-`limit_last_end` and the question this is being built towards is on one line:
-**was anything of ours on the book while the stock was pinned?**
+Read `split_first_gen` and `split_last_off` against `limit_first_start` and
+`limit_last_end` — the last of our block against the first of the market's —
+and the question this is being built towards is on one line: **was anything of
+ours on the book while the stock was pinned?**
 
 ```
 sym       otype   limit window        splits  first gen  last off   executed
@@ -376,7 +385,7 @@ conversion anywhere. That is relied on and is not a gap.
 
 Nothing is grouped in q: a `target` row is one send and a `workorder` row is one
 child. Every sum and count happens in Python, where `--self-test` can prove it —
-130 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
+135 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
 synthetic data.
 
 ---
