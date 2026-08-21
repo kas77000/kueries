@@ -1419,6 +1419,21 @@ def attempt_marketable(a: "Attempt"):
     return marketable(a.country, a.refpx, a.limit_price, a.sidesign)
 
 
+def chain_marketable(c: "Chain"):
+    """Could this ORDER ever have traded?  True / False / None for unknown.
+
+    It survives if ANY attempt was marketable: a client who cancel/replaces an
+    off-limit price with a sane one had an order that could trade, and the
+    chain is one order.
+    """
+    verdicts = [attempt_marketable(a) for a in c.attempts]
+    if any(v is True for v in verdicts):
+        return True
+    if verdicts and all(v is False for v in verdicts):
+        return False
+    return None
+
+
 def split_marketable(chs) -> Marketability:
     """Sort the chains into the ones that had a chance and the ones that did not.
 
@@ -1428,15 +1443,14 @@ def split_marketable(chs) -> Marketability:
     kept, dead, unknown = [], [], []
     per = {c: 0 for c in MARKET_CODES}
     for c in chs:
-        verdicts = [attempt_marketable(a) for a in c.attempts]
-        if any(v is True for v in verdicts):
-            kept.append(c)
-        elif all(v is False for v in verdicts) and verdicts:
+        verdict = chain_marketable(c)
+        if verdict is False:
             dead.append(c)
             per[c.country] += 1
-        else:
+            continue
+        if verdict is None:
             unknown.append(c)
-            kept.append(c)
+        kept.append(c)
     return Marketability(kept, dead, unknown, per)
 
 
@@ -1461,6 +1475,178 @@ def report_marketable(m: Marketability, applied: bool) -> None:
         print(f"\n{len(m.unknown):,} orders could not be judged and are KEPT "
               f"({', '.join(MARKET_NAME[c] for c in codes)}: "
               f"{'; '.join(band_rule(c) for c in codes)})")
+
+
+# =============================================================================
+# THE ORDERS BEHIND THE PAGE
+#
+# --orders prints one line per order, with the rejections that belong to it;
+# --orders-csv writes the same thing with every field, for a spreadsheet.
+#
+# The page is six rows of arithmetic, and the only way to trust it is to be able
+# to take one of those rows apart.  So this dumps what the report ACTUALLY
+# counted, after chaining and after the marketable filter, with the numbers that
+# fed each column beside the inputs that produced them: the price and where it
+# came from, the fx, the limit and the previous close that decided marketability,
+# the children, and every rejection text.
+#
+# One row is one ORDER, so the rows sum to the page.  Rejections are counted in
+# the row and their texts are joined into one field, because a row per rejection
+# would no longer sum to anything.
+# =============================================================================
+
+DETAIL_COLUMNS = (
+    "date", "market", "sym", "client_id", "targets", "algo", "basket", "side",
+    "ordered_qty", "executed_qty", "completion_qty",
+    "limit_price", "prev_close", "price", "price_source", "fx",
+    "ordered_usd", "executed_usd", "completion_usd",
+    "marketable", "splits", "splits_rejected",
+    "rejections", "rej_short_sell", "rej_open", "rej_close",
+    "rej_continuous", "reject_texts")
+
+
+def order_details(chs, splits, rejects=()) -> list:
+    """One dict per order: what the page counted, and what it counted it from.
+
+    Priced exactly the way notional() prices it - the last attempt's price and
+    fx - so a row here and the market row above it cannot disagree.
+    """
+    kids_by_key = {}
+    for sp in splits:
+        kids_by_key.setdefault(sp.key, []).append(sp)
+    rej_by_key = {}
+    for r in rejects:
+        rej_by_key.setdefault(r.key, []).append(r)
+
+    out = []
+    for c in chs:
+        kids = [x for k in c.keys for x in kids_by_key.get(k, ())]
+        rs = [r for k in c.keys for r in rej_by_key.get(k, ())]
+        last = c.attempts[-1]
+        px, where = order_price(last, kids)
+        fx = last.fxlast
+        made = sum(x.make for x in kids)
+        valued = px > 0 and fx > 0
+        ordered_usd = c.size * px * fx if valued else 0.0
+        executed_usd = (sum(x.make * x.fill_price * fx for x in kids
+                            if x.fill_price > 0) if valued else 0.0)
+        mk = chain_marketable(c)
+        cats = {k: sum(1 for r in rs if r.category == k) for k in CATEGORIES}
+        #  distinct texts, commonest first: one venue wording repeated 40 times
+        #  is one reason, not forty
+        seen = {}
+        for r in rs:
+            seen[r.text] = seen.get(r.text, 0) + 1
+        texts = " | ".join(t for t, _ in sorted(seen.items(),
+                                                key=lambda kv: -kv[1]) if t)
+
+        out.append({
+            "date": c.date.isoformat() if c.date else "",
+            "market": MARKET_NAME[c.country], "sym": c.sym,
+            "client_id": c.client_id, "targets": fmt_target_ids(c),
+            "algo": c.algo, "basket": c.basket, "side": c.side,
+            "ordered_qty": c.size, "executed_qty": made,
+            "completion_qty": _completion(made, c.size),
+            "limit_price": last.limit_price, "prev_close": last.refpx,
+            "price": px if valued else 0.0,
+            "price_source": where if valued else "none", "fx": fx,
+            "ordered_usd": ordered_usd, "executed_usd": executed_usd,
+            "completion_usd": _completion(executed_usd, ordered_usd),
+            "marketable": {True: "yes", False: "no", None: "unknown"}[mk],
+            "splits": len(kids),
+            "splits_rejected": sum(1 for x in kids if x.rejected),
+            "rejections": len(rs),
+            "rej_short_sell": cats["short sell"], "rej_open": cats["open"],
+            "rej_close": cats["close"], "rej_continuous": cats["continuous"],
+            "reject_texts": texts})
+    #  worst first: the orders somebody would actually go and look at
+    out.sort(key=lambda r: (-r["rejections"], -r["ordered_usd"]))
+    return out
+
+
+def fmt_target_ids(c, budget=19) -> str:
+    """Every id_target the order was sent under, oldest first.
+
+    What does not fit is COUNTED, never dropped - `90001+90002 +3` still says
+    there were five sends, and any id shown is enough to pull the rest.
+    """
+    ids = [str(a.id_target) for a in c.attempts]
+    out = ids[0]
+    for i, x in enumerate(ids[1:], 2):
+        if len(out) + 1 + len(x) > budget:
+            return f"{out} +{len(ids) - i + 1}"
+        out += "+" + x
+    return out
+
+
+def _num(v, dp=0) -> str:
+    if v is None:
+        return "-"
+    return f"{v:,.{dp}f}"
+
+
+def dump_orders(details, top=0) -> int:
+    """The orders, as a console table.  Plain ASCII: a diagnostic that raises
+    UnicodeEncodeError on cp1252 is no use."""
+    if not details:
+        print("no orders")
+        return 0
+    shown = details[:top] if top else details
+    #  a daily run is one date and the column would be the same 10 characters
+    #  on every line; a month is not
+    dated = len({r["date"] for r in details}) > 1
+    dt_h = f"{'date':<11}" if dated else ""
+    head = (f"{dt_h}{'market':<10} {'sym':<13} {'targets':<19} {'algo':<8} "
+            f"{'ordered':>14} {'exec':>14} {'done':>6} "
+            f"{'ordered USD':>14} {'exec USD':>14} {'src':<6} "
+            f"{'kids':>5} {'rej':>4}  ss/op/cl/co")
+    print(f"{len(details):,} orders"
+          + (f", showing {len(shown):,}" if len(shown) < len(details) else "")
+          + " - worst first, one line per ORDER, so the lines sum to the page")
+    print(head)
+    print("-" * len(head))
+    for r in shown:
+        done = ("-" if r["completion_qty"] is None
+                else _num(r["completion_qty"], 1) + "%")
+        print(f"{r['date'] + '  ' if dated else ''}"
+              f"{r['market']:<10} {r['sym']:<13} {r['targets']:<19} "
+              f"{(r['algo'] or '-')[:7]:<8} "
+              f"{_num(r['ordered_qty']):>14} {_num(r['executed_qty']):>14} "
+              f"{done:>6} "
+              f"{_num(r['ordered_usd']):>14} {_num(r['executed_usd']):>14} "
+              f"{r['price_source']:<6} {r['splits']:>5} {r['rejections']:>4}  "
+              f"{r['rej_short_sell']}/{r['rej_open']}/{r['rej_close']}/"
+              f"{r['rej_continuous']}"
+              + ("   [NOT marketable]" if r["marketable"] == "no" else ""))
+        if r["reject_texts"]:
+            print(f"      {r['reject_texts'][:150]}")
+    if len(shown) < len(details):
+        print(f"\n{len(details) - len(shown):,} more - raise --top, or use "
+              f"--orders-csv PATH for all of them with every field")
+    else:
+        print("\n--orders-csv PATH writes these with every field, one row per "
+              "order")
+    return 0
+
+
+def write_orders_csv(details, path) -> "Path":
+    """The same rows, every field, for a spreadsheet.
+
+    utf-8-sig because Excel reads a plain utf-8 CSV as cp1252 and mangles any
+    venue that put a non-ASCII character in its rejection text.
+    """
+    import csv
+    path = Path(path)
+    if path.suffix.lower() != ".csv":
+        path = path.with_suffix(".csv")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(DETAIL_COLUMNS))
+        w.writeheader()
+        for r in details:
+            w.writerow({k: ("" if r[k] is None else r[k])
+                        for k in DETAIL_COLUMNS})
+    return path
 
 
 def by_market(chs, splits, rejects=()) -> list:
@@ -1914,7 +2100,7 @@ def run(args) -> int:
 
     if args.reject_reasons:
         return dump_reject_alerts(reject_alerts(alert_recs, attempts),
-                                  args.top)
+                                  args.top or 20)
 
     chs = to_chains(attempts, args.chain_qty, splits)
     over = over_filled(chs, splits)
@@ -1942,6 +2128,14 @@ def run(args) -> int:
 
     if args.chains:
         return dump_chains(chs)
+
+    #  after the chaining and after the filter, so this is what the page counts
+    if args.orders or args.orders_csv:
+        det = order_details(chs, splits, rejects)
+        rc = dump_orders(det, args.top or 0) if args.orders else 0
+        if args.orders_csv:
+            log(f"  wrote {write_orders_csv(det, args.orders_csv)}")
+        return rc
 
     rows = by_market(chs, splits, rejects)
     tot = totals(rows)
@@ -2921,6 +3115,120 @@ def self_test() -> int:
     check("every market is still on the page after the filter",
           len(by_market(m2.kept, [])), len(MARKETS))
 
+    print("\nthe orders behind the page")
+    #  a Thai order sent three times under one client id: rejected, rejected,
+    #  then cancelled with a partial fill.  One ORDER, three id_targets, and
+    #  every rejection belongs to it.
+    d_recs = [_p(i, "TH", 27_000_000, limit_price=1.0, refpx=1.0)
+              for i in (901, 902, 903)]
+    for i, r in enumerate(d_recs):
+        r["sym"] = "PTT.TB"
+        r["fixmsg"] = "9604=CLIENT-1;40=1"
+        r["algo"] = "vwap"
+        r["time"] = dt.time(9, 30, i)
+    d_att, _drop = to_attempts(d_recs)
+    d_sp = to_splits([_c(1, 903, 4_000_000, "cancelled", fill_px=1.0)], d_att)
+    d_rej = to_rejects(
+        [{"date": None, "id_server": 1, "id_target": t, "sym": "PTT.TB",
+          "alerttype": "REJECTTOOMANY", "alertstr": txt, "ntrigger": 1}
+         for t, txt in ((901, "Short Sell not permitted"),
+                        (901, "Short Sell not permitted"),
+                        (902, "Rejected before OPEN auction"))], d_att)
+    det = order_details(to_chains(d_att, "asked", d_sp), d_sp, d_rej)
+
+    check("three sends are one row", len(det), 1)
+    r0 = det[0]
+    check("with every id_target on it, so it can be looked up",
+          r0["targets"], "901+902+903")
+    check("and the client id that joined them", r0["client_id"], "CLIENT-1")
+    check("asking for 27m, not 81m", r0["ordered_qty"], 27_000_000)
+    check("executed is the sum of make", r0["executed_qty"], 4_000_000)
+    check("EVERY attempt's rejections come to the order", r0["rejections"], 3)
+    check("bucketed the same way the chart buckets them",
+          (r0["rej_short_sell"], r0["rej_open"], r0["rej_close"],
+           r0["rej_continuous"]), (2, 1, 0, 0))
+    check("the texts are DISTINCT and commonest first - one venue wording "
+          "repeated is one reason, not two",
+          r0["reject_texts"],
+          "Short Sell not permitted | Rejected before OPEN auction")
+    check("and the children are counted", r0["splits"], 1)
+
+    #  the row must agree with the page, or it is worse than useless
+    d_row = [x for x in by_market(to_chains(d_att, "asked", d_sp), d_sp, d_rej)
+             if x.code == "TH"][0]
+    check("the row's notional is the market row's notional",
+          round(r0["ordered_usd"], 6), round(d_row.ordered_usd, 6))
+    check("and so is the executed side",
+          round(r0["executed_usd"], 6), round(d_row.executed_usd, 6))
+    check("and the rejections", r0["rejections"], d_row.rejections)
+    check("which is the whole point: a line here explains a cell up there",
+          round(r0["completion_usd"], 6), round(d_row.completion, 6))
+
+    #  an unpriced order is shown, not hidden - it is the one dragging the page
+    np_att, _ = to_attempts([_p(950, "TH", 1000, limit_price=0.0, refpx=0.0)])
+    np_det = order_details(to_chains(np_att), [])
+    check("an order nothing could value still gets a line",
+          len(np_det), 1)
+    check("its notional is zero and its source says why",
+          (np_det[0]["ordered_usd"], np_det[0]["price_source"]), (0.0, "none"))
+    check("and completion is a dash, not a zero",
+          np_det[0]["completion_usd"], None)
+
+    #  the order the rows come in is the order somebody reads them in
+    many = order_details(to_chains(to_attempts(
+        [_p(960, "HK", 100, limit_price=1.0),
+         _p(961, "HK", 900, limit_price=1.0)])[0], "asked", []), [])
+    check("with no rejections anywhere, the biggest order leads",
+          [x["ordered_qty"] for x in many], [900, 100])
+
+    print("\nthe id_targets on an order")
+    check("one send is one id", fmt_target_ids(_chain("TW", "1.TT", 1.0)), "1")
+    ch3 = _chain("TW", "2.TT", 1.0, 1.0, 1.0)
+    check("three sends show all three", fmt_target_ids(ch3), "1+2+3")
+    check("what does not fit is COUNTED, never dropped",
+          fmt_target_ids(ch3, budget=2), "1 +2")
+    check("three fit in three characters exactly",
+          fmt_target_ids(ch3, budget=3), "1+2 +1")
+    check("and all of them in five", fmt_target_ids(ch3, budget=5), "1+2+3")
+    check("every id is either shown or counted, none lost",
+          [len(fmt_target_ids(ch3, budget=b).split(" +")[0].split("+"))
+           + int(fmt_target_ids(ch3, budget=b).split(" +")[1])
+           if " +" in fmt_target_ids(ch3, budget=b) else 3
+           for b in (1, 2, 3, 5)], [3, 3, 3, 3])
+
+    print("\nthe orders as a CSV")
+    import csv as _csv
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as td:
+        out = write_orders_csv(det, Path(td) / "orders")
+        check("a missing .csv suffix is added", out.name, "orders.csv")
+        with out.open(encoding="utf-8-sig", newline="") as fh:
+            got = list(_csv.DictReader(fh))
+        check("one row per order", len(got), 1)
+        check("every column, in order", list(got[0]), list(DETAIL_COLUMNS))
+        check("the text survives the trip", got[0]["reject_texts"],
+              r0["reject_texts"])
+        #  venue texts contain commas and quotes; the reader must give
+        #  back exactly what went in, or a column silently shifts
+        messy = [dict(det[0], reject_texts='Rejected: "no locate", retry')]
+        mp = write_orders_csv(messy, Path(td) / "messy.csv")
+        with mp.open(encoding="utf-8-sig", newline="") as fh:
+            back = list(_csv.DictReader(fh))
+        check("a comma and a quote in a rejection text survive intact",
+              back[0]["reject_texts"], 'Rejected: "no locate", retry')
+        check("and do not shift the columns", len(back[0]),
+              len(DETAIL_COLUMNS))
+        empty = write_orders_csv([], Path(td) / "none.csv")
+        with empty.open(encoding="utf-8-sig", newline="") as fh:
+            check("no orders still writes the header, not an empty file",
+                  fh.readline().strip().split(",")[0], "date")
+        #  a None must land as an empty cell, never as the string "None"
+        nn = write_orders_csv(np_det, Path(td) / "nn.csv")
+        with nn.open(encoding="utf-8-sig", newline="") as fh:
+            check("a null completion is an empty cell, not the word None",
+                  list(_csv.DictReader(fh))[0]["completion_usd"], "")
+
+
     print("\nthe headline is the real fill rate")
     #  the day this whole thread started from
     #  priced at 1.0 with fx 1.0, so the USD columns equal the share columns
@@ -3013,6 +3321,13 @@ def main(argv=None) -> int:
                    help="do NOT un-chain the orders that still execute more "
                         "than they asked for - leave them chained, and let the "
                         "page read over 100%%")
+    p.add_argument("--orders", action="store_true",
+                   help="print every order the report counted, with the "
+                        "rejections that belong to it, and exit.  --top N "
+                        "limits how many lines")
+    p.add_argument("--orders-csv", metavar="PATH",
+                   help="write those orders to a CSV, every field, one row "
+                        "per order.  Combine with --orders to see them too")
     p.add_argument("--keep-unmarketable", action="store_true",
                    help="do NOT drop orders priced beyond the day's limit up / "
                         "limit down band - count them, even though they could "
@@ -3029,8 +3344,10 @@ def main(argv=None) -> int:
                         "market and exit. Reads alerttype and alertstr off "
                         "ALERTS, keeping " + REJECT_ALERT + " alerts whose "
                         "text is about short selling")
-    p.add_argument("--top", type=int, default=20,
-                   help="how many distinct reasons per market to show")
+    p.add_argument("--top", type=int, default=None,
+                   help="limit the lines: distinct reasons per market for "
+                        "--reject-reasons (20 if unset), orders for --orders "
+                        "(ALL if unset)")
     p.add_argument("--no-tag", action="store_true",
                    help="list the targets carrying NO tag 9604, and exit - "
                         "they are counted as counting targets would, and this is how "

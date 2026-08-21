@@ -10,6 +10,7 @@ python scripts/short_sell_report/short_sell_report.py --monthly 2026-07
 python scripts/short_sell_report/short_sell_report.py --demo       # preview, no kdb
 python scripts/short_sell_report/short_sell_report.py --compare    # old counting beside the new
 python scripts/short_sell_report/short_sell_report.py --chains     # what got chained
+python scripts/short_sell_report/short_sell_report.py --orders     # every order, with its rejections
 python scripts/short_sell_report/short_sell_report.py --no-tag     # what carries no 9604
 python scripts/short_sell_report/short_sell_report.py --reject-reasons  # the rejection texts
 python scripts/short_sell_report/short_sell_report.py --self-test
@@ -474,6 +475,84 @@ order at 1,600 is dead where a flat 30% rule would have waved it through.
 Its children and its rejection alerts go with it, so a row on the page is always
 internally consistent: the rejections counted are rejections of orders that are
 also counted.
+
+---
+
+## The orders behind the page
+
+```
+python scripts/short_sell_report/short_sell_report.py --orders
+python scripts/short_sell_report/short_sell_report.py --orders --top 20
+python scripts/short_sell_report/short_sell_report.py --orders-csv out/orders.csv
+python scripts/short_sell_report/short_sell_report.py --monthly 2026-07 --orders-csv out/july.csv
+```
+
+The page is six rows of arithmetic. `--orders` is how you take one of them
+apart: **one line per order**, with the rejections that belong to it, so the
+lines sum to the page.
+
+```
+4 orders - worst first, one line per ORDER, so the lines sum to the page
+market     sym         targets       algo       ordered       exec   done    ordered USD       exec USD src    kids  rej  ss/op/cl/co
+-------------------------------------------------------------------------------------------------------------------------------------
+Thailand   PTT.TB      901+902+903   vwap    27,000,000  4,000,000  14.8%     27,000,000      4,000,000 limit     1    3  2/1/0/0
+      Short Sell not permitted - no locate | Rejected before OPEN auction
+Korea      005930.KS   45            vwap       197,500     80,975  41.0% 14,022,500,000  5,708,737,500 limit     1    1  0/0/1/0
+      CLOSE auction would not accept
+Japan      7203.JP     10            pov        215,000    150,000  69.8%    559,000,000    388,500,000 limit     1    0  0/0/0/0
+Hong Kong  700.HK      11            close       49,000     30,000  61.2%     20,065,500     12,270,000 quote     1    0  0/0/0/0
+```
+
+**It is what the report counted, not what the server holds** — after the
+chaining and after the marketable filter. That is the point: a number you cannot
+reconcile is a number nobody will defend. Four checks assert that a line's
+notional, executed and rejections are *the same values* the market row above it
+was built from.
+
+- **`targets`** — every `id_target` the order was sent under, oldest first, so a
+  row can be pulled back out of `target`. What does not fit is **counted**, never
+  dropped: `901+902 +3` still says five sends.
+- **`rej` and `ss/op/cl/co`** — the rejection count and its four buckets, in the
+  same order as the stacked chart.
+- **The indented line** is the **distinct** rejection texts, commonest first. One
+  venue wording repeated forty times is one reason, not forty.
+- **`src`** — where the price came from: `limit`, `quote`, `close`, or `none`.
+  `none` is an order nothing could value; it is shown rather than hidden,
+  because it is one of the orders dragging the notional.
+- **`[NOT marketable]`** only appears with `--keep-unmarketable`, since those
+  orders are otherwise gone. *Unknown* is not flagged per line — it is the normal
+  answer for Hong Kong, and tagging every line there would bury the verdict worth
+  seeing.
+- The **date** column appears only on a `--monthly` run. A single session is one
+  date, and the same ten characters on every line is not information.
+
+Rows come **worst first** — most rejections, then largest — because that is the
+order somebody actually reads them in. `--top N` limits the lines; unset shows
+**all** of them.
+
+### `--orders-csv PATH`
+
+The same rows with **every** field, one row per order, for a spreadsheet:
+
+```
+date, market, sym, client_id, targets, algo, basket, side,
+ordered_qty, executed_qty, completion_qty,
+limit_price, prev_close, price, price_source, fx,
+ordered_usd, executed_usd, completion_usd,
+marketable, splits, splits_rejected,
+rejections, rej_short_sell, rej_open, rej_close, rej_continuous, reject_texts
+```
+
+`limit_price` and `prev_close` are there so the **marketable** verdict can be
+checked by hand against the band, and `price`, `price_source` and `fx` so the
+notional can. Combine with `--orders` to see them as well as write them.
+
+Written `utf-8-sig`, because Excel reads a plain UTF-8 CSV as cp1252 and mangles
+any venue that put a non-ASCII character in its rejection text. A run with no
+orders still writes the header row rather than an empty file.
+
+Rejections are **counted** in the row and their texts joined into one field. A
+row per rejection would read more easily and would no longer sum to anything.
 
 ---
 
