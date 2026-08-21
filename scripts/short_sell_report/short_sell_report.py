@@ -279,6 +279,11 @@ Q_STOCK = """
   es:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; fxlast:0#0n;
          adjclose:0#0n; orgclose:0#0n);
   if[0=count ids; :es];
+  / PyKX sends a Python list of ints as a LONG vector, and this column is an
+  / INT on every server we have seen.  `in` across the two is not something to
+  / rely on - it may match, it may return nothing, and with an attribute on the
+  / column it may raise `type - so ask the table what it wants and give it that.
+  ids:(first exec t from meta target_stock where c=`id_target)$ids;
   s:$[hist;
       select date,id_server,id_target,fxlast,adjclose,orgclose
         from target_stock where date=d, id_target in ids;
@@ -294,6 +299,7 @@ Q_WORK = """
          state:0#`; avg_fill_price:0#0n; t_transmit:0#0Nt;
          transmit_bidprice:0#0n; transmit_askprice:0#0n);
   if[0=count ids; :ew];
+  ids:(first exec t from meta workorder where c=`id_target)$ids;
   w:$[hist;
       select date,id_server,id_work,id_target,make,state,avg_fill_price,
           t_transmit,transmit_bidprice,transmit_askprice
@@ -315,11 +321,22 @@ Q_WORK = """
 # pulled and the filtering happens in Python, so --self-test can prove the rule
 # and so the run can also say what OTHER alert types were there - a filter that
 # cannot tell you what it discarded is a filter you have to trust blindly.
+#  What a failing stage asks the server about itself.  `meta is cheap on every
+#  table shape - partitioned included, where it reads one partition's header -
+#  and `type says whether the thing is even a table: 98h plain, 99h keyed or a
+#  dictionary, which a select would refuse with exactly the `type this once
+#  came back with.
+Q_META = """
+{[t] (type value t; 0!meta t)}
+"""
+
+
 Q_ALERTS = """
 {[hist;d;ids]
   ea:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; alerttype:0#`;
          alertstr:0#`; ntrigger:0#0i);
   if[0=count ids; :ea];
+  ids:(first exec t from meta alerts where c=`id_target)$ids;
   $[hist;
     select date,id_server,id_target,sym,alerttype,alertstr,ntrigger
       from alerts where date=d, id_target in ids;
@@ -366,11 +383,48 @@ def connect(endpoint: str):
 # type.  The realtime branch never looks at it.
 _UNUSED_DATE = dt.date(2000, 1, 1)
 
-def _stage(name: str, table: str, cols: str, d, fn):
+def describe_table(handle, table: str) -> str:
+    """meta of one table, as text.  Best effort - this runs while something has
+    already gone wrong, so it must never raise on its own account."""
+    try:
+        kind, m = handle(Q_META, table.encode())
+        rows = m.pd().to_dict("records")
+        shape = {98: "table", 99: "KEYED table or a DICTIONARY"}.get(
+            int(kind), f"type {int(kind)}")
+        out = [f"  {table} is a {shape}, {len(rows)} columns:"]
+        for r in rows:
+            out.append(f"      {_s(r.get('c')):<22} {_s(r.get('t')):<3} "
+                       f"{_s(r.get('a'))}")
+        return "\n".join(out)
+    except Exception as e:                                   # noqa: BLE001
+        return f"  and meta {table} failed too: {type(e).__name__}: {e}"
+
+
+TABLES = ("target", "target_stock", "workorder", "alerts")
+
+
+def probe(handle) -> int:
+    """meta for every table the report reads, and nothing else.
+
+    The report asks four tables for about thirty columns, and when a server
+    disagrees about one of them the run dies on whichever it reached first.
+    This asks all four up front, so a schema that has moved is one command away
+    rather than four failed runs away.
+    """
+    print("the tables short_sell_report reads, as this server has them\n")
+    for t in TABLES:
+        print(describe_table(handle, t))
+        print()
+    return 0
+
+
+def _stage(handle, name: str, table: str, cols: str, d, fn):
     """Run one query and, if q refuses it, say WHICH one and against what.
 
-    A bare `nyi out of pykx names no table and no column, and the reader is
-    left diffing a 60 line lambda against a schema.
+    A bare `nyi or `type out of pykx names no table and no column, and the
+    reader is left diffing a lambda against a schema by eye.  So the schema is
+    fetched and printed instead: the column that is missing, or the type that is
+    not what the query assumed, is then on the screen beside the error.
     """
     try:
         return fn().pd().to_dict("records")
@@ -378,10 +432,11 @@ def _stage(name: str, table: str, cols: str, d, fn):
         raise SystemExit(
             f"the {name} query failed{f' for {d}' if d is not None else ''}.\n"
             f"  q said:  {type(e).__name__}: {e}\n"
-            f"  table:   {table}\n"
-            f"  columns: {cols}\n"
-            f"Check that table and those columns exist on this server "
-            f"(meta {table}), and that nothing else in the schema moved.") from e
+            f"  columns it asked for: {cols}\n"
+            + describe_table(handle, table)
+            + f"\nCompare the two.  A column that is absent, a type that is not "
+            f"what the query assumed, or a KEYED table where a plain one was "
+            f"expected are what this error is.") from e
 
 
 def fetch(handle, hist: bool, d: Optional[dt.date]):
@@ -393,16 +448,19 @@ def fetch(handle, hist: bool, d: Optional[dt.date]):
     dd = d if d is not None else _UNUSED_DATE
     sfx = [p.encode() for p in SYM_PATTERNS]
 
-    pr = _stage("target", "target", "sym size fixmsg oes_oid basket side algo "
-                "sidesign limit_price t_start t_end time", d,
+    pr = _stage(handle, "target", "target",
+                "sym size fixmsg oes_oid basket side algo sidesign "
+                "limit_price t_start t_end time", d,
                 lambda: handle(Q_TARGETS, hist, dd, sfx,
                                SHORTSELL_SIDE.encode()))
     ids = sorted({_i(r.get("id_target")) for r in pr})
 
-    st = _stage("target_stock", "target_stock", "fxlast adjclose orgclose", d,
+    st = _stage(handle, "target_stock", "target_stock",
+                "id_target fxlast adjclose orgclose", d,
                 lambda: handle(Q_STOCK, hist, dd, [int(i) for i in ids]))
-    wr = _stage("workorder", "workorder", "id_work make state avg_fill_price "
-                "t_transmit transmit_bidprice transmit_askprice", d,
+    wr = _stage(handle, "workorder", "workorder",
+                "id_target id_work make state avg_fill_price t_transmit "
+                "transmit_bidprice transmit_askprice", d,
                 lambda: handle(Q_WORK, hist, dd, [int(i) for i in ids]))
 
     return merge_stock(pr, st), wr
@@ -2098,6 +2156,8 @@ def run(args) -> int:
     log(f"short_sell_report  {'historical' if pl.hist else 'realtime'}  "
         f"{pl.endpoint}")
     h = connect(pl.endpoint)
+    if args.probe:
+        return probe(h)
 
     attempts, splits, rejects, dropped, traded = [], [], [], 0, 0
     alert_recs = []
@@ -2377,12 +2437,13 @@ def self_test() -> int:
     print("short_sell_report --self-test\n\nthe q holds together")
     QUERIES = (("Q_TARGETS", Q_TARGETS), ("Q_STOCK", Q_STOCK),
                ("Q_WORK", Q_WORK), ("Q_ALERTS", Q_ALERTS))
-    for nm, src in QUERIES:
+    for nm, src in QUERIES + (("Q_META", Q_META),):
         check(f"{nm}: no q reserved word as a name", reserved_used(src), [])
         check(f"{nm}: brackets balance", balanced(src), True)
-        #  the whole point of splitting the session query in three: a plain
-        #  select fails by NAME, a lambda that also joins and groups fails as
-        #  one opaque `nyi
+    #  the whole point of splitting the session query in three: a plain select
+    #  fails by NAME, a lambda that also joins and groups fails as one opaque
+    #  `nyi.  Q_META is exempt below - its 0! flattens meta, not a group
+    for nm, src in QUERIES:
         check(f"{nm}: joins nothing", joins(src), [])
         check(f"{nm}: groups nothing", groups_in_q(src), [])
     check("Q_TARGETS: the suffixes go in as strings, for like",
@@ -2393,6 +2454,80 @@ def self_test() -> int:
           reserved_used("{[d;ss] ss:1}"), ["ss"])
     check("and the join check would still catch a join",
           joins("t:t lj `date xkey x"), ["lj", "xkey"])
+    #  Q_META is the exception, and the only one: 0! there flattens `meta for
+    #  printing, it does not flatten a group
+    check("Q_META flattens meta and nothing else", joins(Q_META), ["0!"])
+    check("and groups nothing either", groups_in_q(Q_META), [])
+    check("every table the report reads is probed",
+          sorted(TABLES),
+          sorted(["alerts", "target", "target_stock", "workorder"]))
+    for t in TABLES:
+        check(f"{t} is actually read by a query",
+              any(t in q for _n, q in QUERIES), True)
+
+    print("\nwhen a query fails, the schema comes with the error")
+    class _Frame:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def pd(self):
+            import pandas as pd
+            return pd.DataFrame(self.rows)
+
+    _META = [{"c": "date", "t": "d", "a": ""},
+             {"c": "id_target", "t": "i", "a": "g"},
+             {"c": "fxlast", "t": "f", "a": ""}]
+
+    def _handle(kind=98, rows=None, boom=False):
+        def h(q, *a):
+            if boom:
+                raise RuntimeError("nyi")
+            return (kind, _Frame(_META if rows is None else rows))
+        return h
+
+    d1 = describe_table(_handle(), "target_stock")
+    check("it says what kind of thing the table is",
+          "target_stock is a table, 3 columns" in d1, True)
+    check("and lists the columns with their types",
+          "id_target" in d1 and " i " in d1, True)
+    check("and their attributes - an index on a column is why the same query "
+          "can raise on one server and not another",
+          [ln.split()[-1] for ln in d1.splitlines()
+           if "id_target" in ln], ["g"])
+    check("a KEYED table is called out, because a select refuses one",
+          "KEYED table or a DICTIONARY" in describe_table(_handle(99),
+                                                          "target_stock"),
+          True)
+    check("an unexpected kind is reported, not guessed at",
+          "type 11" in describe_table(_handle(11), "x"), True)
+    #  this runs while something has ALREADY gone wrong
+    check("meta failing does not mask the real error",
+          describe_table(_handle(boom=True), "target_stock"),
+          "  and meta target_stock failed too: RuntimeError: nyi")
+
+    try:
+        _stage(_handle(), "target_stock", "target_stock", "orgclose", None,
+               lambda: (_ for _ in ()).throw(RuntimeError("type")))
+        msg = ""
+    except SystemExit as e:
+        msg = str(e)
+    check("the error names the stage", msg.startswith(
+        "the target_stock query failed."), True)
+    check("says what q said", "q said:  RuntimeError: type" in msg, True)
+    check("says what was asked for", "columns it asked for: orgclose" in msg,
+          True)
+    check("and puts the schema underneath it, so the two can be compared",
+          "target_stock is a table" in msg, True)
+    try:
+        _stage(_handle(), "workorder", "workorder", "make",
+               dt.date(2026, 7, 1),
+               lambda: (_ for _ in ()).throw(RuntimeError("x")))
+        dated = ""
+    except SystemExit as e:
+        dated = str(e)
+    check("a dated run says WHICH date - a month fails on one of twenty three",
+          dated.startswith("the workorder query failed for 2026-07-01."), True)
+
 
     print("\njoining target_stock on, in Python")
     import datetime as _dt
@@ -3377,6 +3512,10 @@ def main(argv=None) -> int:
                    help="do NOT un-chain the orders that still execute more "
                         "than they asked for - leave them chained, and let the "
                         "page read over 100%%")
+    p.add_argument("--probe", action="store_true",
+                   help="print meta for every table the report reads, and "
+                        "exit - what to run when a query comes back with a "
+                        "bare `type or `nyi")
     p.add_argument("--orders", action="store_true",
                    help="print every order the report counted, with the "
                         "rejections that belong to it, and exit.  --top N "

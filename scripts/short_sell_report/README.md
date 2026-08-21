@@ -11,6 +11,7 @@ python scripts/short_sell_report/short_sell_report.py --demo       # preview, no
 python scripts/short_sell_report/short_sell_report.py --compare    # old counting beside the new
 python scripts/short_sell_report/short_sell_report.py --chains     # what got chained
 python scripts/short_sell_report/short_sell_report.py --orders     # every order, with its rejections
+python scripts/short_sell_report/short_sell_report.py --probe      # meta for every table it reads
 python scripts/short_sell_report/short_sell_report.py --no-tag     # what carries no 9604
 python scripts/short_sell_report/short_sell_report.py --reject-reasons  # the rejection texts
 python scripts/short_sell_report/short_sell_report.py --self-test
@@ -639,11 +640,41 @@ columns it asked for:
 
 ```
 the target_stock query failed for 2026-07-01.
-  q said:  QError: nyi
-  table:   target_stock
-  columns: fxlast adjclose orgclose
-Check that table and those columns exist on this server (meta target_stock),
-and that nothing else in the schema moved.
+  q said:  QError: type
+  columns it asked for: id_target fxlast adjclose orgclose
+  target_stock is a table, 96 columns:
+      date                   d
+      id_target              j   g
+      fxlast                 f
+      adjclose               f
+Compare the two.  A column that is absent, a type that is not what the query
+assumed, or a KEYED table where a plain one was expected are what this error is.
+```
+
+**The schema comes with the error.** `` `type `` and `` `nyi `` name nothing at
+all, and reading them off a photograph of a terminal against a schema by eye is
+how an afternoon goes. So a failing stage asks the server for `meta` of the
+table it was querying and prints it underneath — the missing column, or the type
+that is not what the query assumed, is then on the screen beside the error. It
+also says whether the thing is a plain table, a **keyed** one or a dictionary,
+because a `select` refuses the last two with exactly `` `type ``.
+
+`--probe` asks all four tables up front without running the report, which is
+what to reach for rather than four failed runs:
+
+```
+python scripts/short_sell_report/short_sell_report.py --probe
+```
+
+### ids go in as the column's own type
+
+PyKX sends a Python list of ints as a **long** vector, and `id_target` is an
+**int** on every server here. `in` across the two is not something to rely on —
+it may match, it may quietly match nothing, and with an index on the column it
+may raise. So each query asks the table what it wants and casts to that:
+
+```q
+ids:(first exec t from meta target_stock where c=`id_target)$ids;
 ```
 
 The join `Q_STOCK` used to do in q is now `merge_stock()` in Python, keyed on
