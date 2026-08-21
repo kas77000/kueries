@@ -441,6 +441,28 @@ def overlap(a0, a1, b0, b1):
     return (lo, hi) if hi > lo else None
 
 
+def attempt_chain_key(a, client_id=None) -> tuple:
+    """The key two target rows share when they are the same order.
+
+    scripts/lib/order_chains gives the client's half of it - the 9604, or the
+    target's own id when it sent none.  SYM IS ADDED HERE, and it is not
+    decoration: a cancel/replace never changes the instrument, so two targets on
+    DIFFERENT stocks are two orders whatever id the client put on them.
+
+    Without it, July 2026 printed Korea 417 asked against 675 executed - 161.9%
+    - and executed quantity in Japan and Thailand against no order at all.  One
+    9604 covered targets in two markets; the chain was counted whole in its last
+    attempt's market while its splits stayed in their own, so an order's
+    quantity landed in one row and its fills in another.  The run already warned
+    that such chains disagree on `sym`; this stops them forming.
+
+    It does NOT make the tag unique - two orders on the SAME stock under one
+    9604 still merge, and `mixed` in the run's diagnostics still says so.
+    """
+    cid = a.client_id if client_id is None else client_id
+    return chain_key(a.date, cid, a.key[1], a.id_target) + (a.sym,)
+
+
 class Attempt(NamedTuple):
     """ONE TARGET ROW - one SEND of an order.
 
@@ -465,7 +487,7 @@ class Attempt(NamedTuple):
 
     @property
     def chain_key(self) -> tuple:
-        return chain_key(self.date, self.client_id, self.key[1], self.id_target)
+        return attempt_chain_key(self)
 
 
 class Chain(NamedTuple):
@@ -766,7 +788,7 @@ def unchain(chains, over) -> list:
         if c.chain_key not in bad:
             continue
         for a in c.attempts:
-            out.append(Chain(chain_key=(a.date, "", a.key[1], a.id_target),
+            out.append(Chain(chain_key=attempt_chain_key(a, client_id=""),
                              date=a.date, market=a.market, sym=a.sym,
                              side=a.side, sidesign=a.sidesign, size=a.size,
                              doclose=a.doclose, client_id=a.client_id,
@@ -854,13 +876,21 @@ def by_market(chains, splits) -> list:
     qty = {c: 0 for c in MARKET_CODES}
     made = {c: 0 for c in MARKET_CODES}
     rej = {c: 0 for c in MARKET_CODES}
+    #  a split is attributed to the market of the ORDER that owns it, not to
+    #  its own attempt's.  The two are the same now that a chain cannot span
+    #  instruments, and going through the chain is what keeps them that way:
+    #  order qty and executed on one row are then always the same orders'.
+    owner = {}
     for c in chains:
         orders[c.market] += 1
         qty[c.market] += c.size
+        for a in c.attempts:
+            owner[a.key] = c.market
     for s in splits:
-        made[s.market] += s.make
+        m = owner.get(s.key, s.market)
+        made[m] += s.make
         if s.rejected:
-            rej[s.market] += 1
+            rej[m] += 1
     return [Row(m.code, m.name, orders[m.code], qty[m.code],
                 made[m.code], rej[m.code]) for m in MARKETS]
 
@@ -1479,7 +1509,8 @@ def demo_session(d=None):
     #  a Japanese order sent three times under ONE client id, rejected twice
     #  and cancelled - what the chaining is for
     for k, idt in enumerate((90_001, 90_002, 90_003)):
-        pr.append(_p(idt, "JP", 40_000, sidesign=-1, cid="CLI-REPLACED", d=d,
+        pr.append(_p(idt, "JP", 40_000, sidesign=-1, cid="CLI-REPLACED",
+                     sym="9984.JP", d=d,
                      t_start=10 * H + k * 600_000, t_end=15 * H))
         wr.append(_w(idt, idt, 0, "rejected" if k < 2 else "cxl",
                      on=None, off=None, d=d))
@@ -1655,10 +1686,47 @@ def self_test() -> int:
     check("no id at all is an em dash, not an empty cell",
           fmt_targets(()), DASH)
     tg = to_chains(to_attempts(
-        [_p(11, "JP", 1000, cid="CLI-A", t_start=9 * H, t_end=15 * H),
-         _p(12, "JP", 1000, cid="CLI-A", t_start=9 * H, t_end=15 * H)]))[0]
+        [_p(11, "JP", 1000, cid="CLI-A", sym="7203.JP", t_start=9 * H,
+            t_end=15 * H),
+         _p(12, "JP", 1000, cid="CLI-A", sym="7203.JP", t_start=9 * H,
+            t_end=15 * H)]))[0]
     check("a chain carries every id it was sent under, oldest first",
           tg.target_ids, (11, 12))
+
+    print("\none 9604 over two instruments is two orders, not one")
+    #  July 2026 printed Korea 417 asked against 675 executed - 161.9% - and
+    #  Japan and Thailand executed quantity against no order at all.  Both are
+    #  one 9604 covering targets in DIFFERENT markets: the chain was counted
+    #  whole in its last attempt's market while its splits kept their own, so
+    #  the quantity landed in one row and the fills in another.
+    mk = to_attempts([_p(1, "KR", 417, cid="KR-ONLY", t_start=9 * H),
+                      _p(2, "KR", 1_000, cid="ONE-9604", t_start=9 * H),
+                      _p(3, "JP", 50_000, cid="ONE-9604", t_start=10 * H)])
+    mkw = to_splits([_w(101, 1, 417, "filled", on=11 * H, off=12 * H),
+                     _w(102, 2, 258, "filled", on=11 * H, off=12 * H),
+                     _w(103, 3, 5_703, "filled", on=11 * H, off=12 * H)], mk)
+    mkc = to_chains(mk, "asked", mkw)
+    check("two instruments never collapse into one order", len(mkc), 3)
+    check("and each keeps its own market",
+          sorted(c.market for c in mkc), ["JP", "KR", "KR"])
+    mkr = {r.code: r for r in by_market(mkc, mkw)}
+    check("the Korean quantity is the Korean orders'", mkr["KR"].order_qty,
+          417 + 1_000)
+    check("no market executes what it never had an order for",
+          [r.code for r in by_market(mkc, mkw)
+           if r.executed and not r.orders], [])
+    check("and no row can complete more than it asked for",
+          [r.code for r in by_market(mkc, mkw)
+           if r.completion is not None and r.completion > 100.0], [])
+    #  the same fault with nothing genuine in the row to hide it: Japan and
+    #  Thailand printed executed quantity against no order and no percentage
+    orph = to_attempts([_p(2, "KR", 1_000, cid="ONE-9604", t_start=9 * H),
+                        _p(3, "JP", 50_000, cid="ONE-9604", t_start=10 * H)])
+    orw = to_splits([_w(102, 2, 258, "filled", on=11 * H, off=12 * H)], orph)
+    orr = {r.code: r for r in by_market(to_chains(orph, "asked", orw), orw)}
+    check("an order with fills is an ORDER in that market", orr["KR"].orders, 1)
+    check("not a bare executed figure with nothing to measure it against",
+          orr["KR"].completion is None, False)
 
     print("\nwhich orders the limit touched")
     p1 = to_chains(to_attempts(
@@ -1677,8 +1745,10 @@ def self_test() -> int:
 
     print("\nchaining a replaced order")
     #  one order, sent three times under one client id, live 09:00-15:00
-    rep_recs = [_p(i, "JP", 1000, cid="CLI-R", t_start=(9 + i) * H,
-                   t_end=15 * H) for i in (1, 2, 3)]
+    #  the SAME stock every time - a cancel/replace does not change the
+    #  instrument, and a fixture that let it would not be chained any more
+    rep_recs = [_p(i, "JP", 1000, cid="CLI-R", sym="7203.JP",
+                   t_start=(9 + i) * H, t_end=15 * H) for i in (1, 2, 3)]
     ra = to_attempts(rep_recs)
     rc = to_chains(ra, "asked", [])
     check("three targets", len(ra), 3)
@@ -1795,12 +1865,16 @@ def self_test() -> int:
     check("untagged targets are counted per market",
           chain_stats(ua2, to_chains(ua2), []).no_id_by_market,
           {"JP": 1, "TH": 1})
-    mx = to_attempts([_p(1, "JP", 100, cid="CLI-M", algo="vwap"),
-                      _p(2, "JP", 100, cid="CLI-M", algo="twap")])
+    mx = to_attempts([_p(1, "JP", 100, cid="CLI-M", sym="7203.JP",
+                         algo="vwap"),
+                      _p(2, "JP", 100, cid="CLI-M", sym="7203.JP",
+                         algo="twap")])
     check("one id over two algos is REPORTED, not absorbed",
           len(chain_stats(mx, to_chains(mx), []).mixed), 1)
-    ov = to_attempts([_p(1, "JP", 100, cid="CLI-O", t_start=9 * H),
-                      _p(2, "JP", 100, cid="CLI-O", t_start=10 * H)])
+    ov = to_attempts([_p(1, "JP", 100, cid="CLI-O", sym="7203.JP",
+                         t_start=9 * H),
+                      _p(2, "JP", 100, cid="CLI-O", sym="7203.JP",
+                         t_start=10 * H)])
     ovsp = to_splits([_w(1, 1, 80, "filled"), _w(2, 2, 80, "filled")], ov)
     ovc = to_chains(ov, "max", ovsp)
     ovst = chain_stats(ov, ovc, ovsp)

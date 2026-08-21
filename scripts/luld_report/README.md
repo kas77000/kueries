@@ -165,6 +165,16 @@ together on **FIX tag 9604**, the client's own order id — the rule lives in
 [`scripts/lib/order_chains.py`](../lib/README.md) and is shared with
 [`short_sell_report`](../short_sell_report/README.md).
 
+**The key is the 9604 *and the sym*.** A cancel/replace never changes the
+instrument, so two targets on different stocks are two orders whatever id the
+client put on them. Without the sym, July 2026 printed **Korea 417 asked
+against 675 executed — 161.9%** — and executed quantity in Japan and Thailand
+against no order at all: one 9604 covered targets in two markets, the chain was
+counted whole in its *last* attempt's market, and its splits stayed in their
+own, so an order's quantity landed in one row and its fills in another. This
+does **not** make the tag unique — two orders on the *same* stock under one 9604
+still merge, and the `mixed` warning below still says so.
+
 **Splits are pooled across the chain**, and that is the part that matters here.
 Asking "was anything of ours on the book during the limit" of a *single attempt*
 gives a **false positive** whenever a sibling attempt was the one resting there:
