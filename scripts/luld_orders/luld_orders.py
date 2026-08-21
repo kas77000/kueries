@@ -161,19 +161,19 @@ def region_of(sym) -> Optional[str]:
 Q_ORDERS = """
 {[hist;d;sfx]
   et:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; side:0#`;
-         sidesign:0#0i; size:0#0i; t_start:0#0Nt; t_end:0#0Nt; fixmsg:0#`;
-         adjclose:0#0n; orgclose:0#0n);
+         sidesign:0#0i; size:0#0i; otype:0#`; t_start:0#0Nt; t_end:0#0Nt;
+         fixmsg:0#`; adjclose:0#0n; orgclose:0#0n);
   ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i);
 
   / parents.  Every side: a limit up is favourable to a seller and a limit down
   / to a buyer, and an unfavourable one can still be marketable, so nothing is
   / filtered away on side here.
   t:$[hist;
-      select date,id_server,id_target,sym,side,sidesign,size,t_start,t_end,
-          fixmsg
+      select date,id_server,id_target,sym,side,sidesign,size,otype,t_start,
+          t_end,fixmsg
         from target where date=d, any (upper sym) like/: sfx;
       update date:0Nd from select id_server,id_target,sym,side,sidesign,size,
-          t_start,t_end,fixmsg
+          otype,t_start,t_end,fixmsg
         from target where any (upper sym) like/: sfx];
   if[0=count t; :(et;ew)];
 
@@ -363,6 +363,7 @@ class Order(NamedTuple):
     region: str
     sym: str
     side: str
+    otype: str                 # `market`, `limit`, ... - as the feed sends it
     size: int
     t_start: Optional[int]     # ms since midnight
     t_end: Optional[int]
@@ -467,7 +468,8 @@ def to_orders(records) -> list:
             key=(_d(r.get("date")), _i(r.get("id_server")),
                  _i(r.get("id_target"))),
             date=_d(r.get("date")), region=region, sym=sym,
-            side=_s(r.get("side")), size=_i(r.get("size")),
+            side=_s(r.get("side")), otype=_s(r.get("otype")),
+            size=_i(r.get("size")),
             t_start=_ms(r.get("t_start")), t_end=_ms(r.get("t_end")),
             client_id=fix_tag(r.get("fixmsg")),
             id_target=_i(r.get("id_target")),
@@ -750,8 +752,8 @@ def write_csv(rows, tot, out_dir, stem) -> Path:
 # =============================================================================
 
 RAW_HEADER = (
-    "date", "region", "sym", "side", "id_server", "id_target", "tag_9604",
-    "order_qty", "executed", "completion_pct", "order_start", "order_end",
+    "date", "region", "sym", "side", "otype", "id_server", "id_target",
+    "tag_9604", "order_qty", "executed", "completion_pct", "order_start", "order_end",
     "limit_periods", "limit_first_start", "limit_last_end", "limit_mins",
     "limit_price", "ref_close", "pct_from_close", "limit_dir", "limit_noask",
     "limit_nobid", "limit_net", "limit_locked", "overlap_mins",
@@ -809,7 +811,8 @@ def raw_rows(orders, executed, hits) -> list:
         comp = _completion(ex, o.size)
         out.append([
             o.date.isoformat() if o.date else "",
-            REGION_NAME[o.region], o.sym, o.side, o.key[1], o.id_target,
+            REGION_NAME[o.region], o.sym, o.side, o.otype, o.key[1],
+            o.id_target,
             o.client_id, o.size, ex,
             "" if comp is None else f"{comp:.1f}",
             _hms(o.t_start), _hms(o.t_end),
@@ -964,8 +967,8 @@ def run(args) -> int:
 # =============================================================================
 
 def _t(idt, region, size, d=None, srv=1, sym=None, side="sell",
-       t_start=9 * 3_600_000 + 1_800_000, t_end=15 * 3_600_000, cid=None,
-       adjclose=100.0, orgclose=None):
+       otype="limit", t_start=9 * 3_600_000 + 1_800_000,
+       t_end=15 * 3_600_000, cid=None, adjclose=100.0, orgclose=None):
     """One target row.  cid goes into fixmsg as tag 9604 the way the client
     really sends it, so the fixture exercises the parse too."""
     sfx = dict((r.code, r.suffixes[0]) for r in REGIONS).get(region,
@@ -977,6 +980,7 @@ def _t(idt, region, size, d=None, srv=1, sym=None, side="sell",
     return {"date": d, "id_server": srv, "id_target": idt,
             "sym": sym or f"{1000 + idt}{sfx}", "side": side,
             "sidesign": -1 if side == "sell" else 1, "size": size,
+            "otype": otype,
             #  None is a real value here: a target still working has no t_end
             "t_start": _td(t_start), "t_end": _td(t_end),
             "fixmsg": fix + "59=0",
@@ -1017,7 +1021,10 @@ def demo_session(d=None):
             k += 1
             size = 20_000 + ((k * 7919) % 400) * 500
             side = "sell" if (k % 3) else "buy"
-            tr.append(_t(k, region, size, d=d, side=side))
+            #  market orders among them: marketable into a limit whichever way
+            #  the band went, which is why otype is on the line
+            otype = "market" if k % 4 == 0 else "limit"
+            tr.append(_t(k, region, size, d=d, side=side, otype=otype))
             sym = tr[-1]["sym"]
             start = 11 * H + (k % 90) * 60_000
             end = start + (25 + (k % 40)) * 60_000     # all over --min-mins
@@ -1286,6 +1293,20 @@ def self_test() -> int:
                                          noask=0, nobid=0)]), 1000.0), UP)
     check("no period at all is empty, not a direction", line_direction([]), "")
 
+    print("\nthe order type")
+    check("it comes off the target as the feed sends it",
+          to_orders([_t(1, "JP", 100, otype="market")])[0].otype, "market")
+    check("a limit order says so",
+          to_orders([_t(1, "JP", 100, otype="limit")])[0].otype, "limit")
+    check("an unset one is empty, not guessed at",
+          to_orders([_t(1, "JP", 100, otype="")])[0].otype, "")
+    check("nothing is filtered on it - a market order and a limit order are "
+          "both in scope",
+          len(touched(to_orders([_t(1, "JP", 100, otype="market"),
+                                 _t(2, "JP", 100, otype="limit")]),
+                      to_limits([_lim("1001.JP", 11 * H, 12 * H),
+                                 _lim("1002.JP", 11 * H, 12 * H)]))[0]), 2)
+
     print("\nthe raw rows")
     rr = raw_rows(dorders, dex, dhits)
     check("a line per order in scope, and no more", len(rr), dtot.orders)
@@ -1301,6 +1322,11 @@ def self_test() -> int:
           {x.code: x for x in drows}["JP"].order_qty)
     check("every line names a limit period, or it would not be a line",
           [r for r in rr if not r[RAW_HEADER.index("limit_periods")]], [])
+    oi = RAW_HEADER.index("otype")
+    check("every line says what kind of order it was",
+          sorted({r[oi] for r in rr}), ["limit", "market"])
+    check("and market orders carry their quantity like any other",
+          sum(r[qi] for r in rr if r[oi] == "market") > 0, True)
     di = RAW_HEADER.index("limit_dir")
     check("every line says which limit it was, unknown included",
           sorted({r[di] for r in rr}), [DOWN, UNKNOWN, UP])

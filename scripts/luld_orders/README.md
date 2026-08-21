@@ -54,26 +54,75 @@ period it was live through. This is the file to open when a regional figure
 looks wrong.
 
 ```
-date,region,sym,side,id_server,id_target,tag_9604,order_qty,executed,
+date,region,sym,side,otype,id_server,id_target,tag_9604,order_qty,executed,
 completion_pct,order_start,order_end,limit_periods,limit_first_start,
 limit_last_end,limit_mins,limit_price,ref_close,pct_from_close,limit_dir,
 limit_noask,limit_nobid,limit_net,limit_locked,overlap_mins
 ```
 
-| column | what it is |
+Every column, in order. **The order** is what the first block describes, **the
+limit** the second, and **the two together** the last — which is where the
+question this is being built towards lives.
+
+#### The order — from `target`
+
+| column | source | what it means |
+|---|---|---|
+| `date` | `target.date` | the session. Empty on a realtime run, which has only the one |
+| `region` | derived from `sym` | one of the eight, by suffix — never from `target_stock.country` |
+| `sym` | `target.sym` | the instrument, as the feed spells it |
+| `side` | `target.side` | `buy` or `sell` |
+| `otype` | `target.otype` | the order type — see the table below |
+| `id_server`, `id_target` | `target` | **the row this line is.** Look it up with these two and the date |
+| `tag_9604` | FIX tag 9604 in `target.fixmsg` | the client's own order id. Empty when the client sent none. Two lines sharing one are the same order re-sent — not chained here, see below |
+| `order_qty` | `target.size` | what this send asked for |
+| `executed` | Σ `workorder.make` | what its children did, whatever state they ended in |
+| `completion_pct` | `executed / order_qty` | empty when there was no quantity to measure against — which is not the same as 0% |
+| `order_start`, `order_end` | `target.t_start`, `t_end` | the order's live window, `HH:MM:SS`, ready to type back into a query. **Empty end = still working** |
+
+#### The limit — from `qatt`, and `target_stock` for the close
+
+| column | source | what it means |
+|---|---|---|
+| `limit_periods` | derived | how many qualifying periods this order was live through. Always ≥ 1, or the line would not exist |
+| `limit_first_start`, `limit_last_end` | `qatt.time` | the span those periods cover, first start to last end. **Not** one continuous period when `limit_periods > 1` |
+| `limit_mins` | derived | how long the periods lasted, summed. The stock's afternoon, not the order's |
+| `limit_price` | `qatt` | the band: the bid, or the ask when there is no bid — q's `?[0=qbid;qask;qbid]` |
+| `ref_close` | `target_stock.adjclose`, else `orgclose` | the previous close the band is measured from. Empty when the stock has no close on file |
+| `pct_from_close` | `limit_price` vs `ref_close` | how far the band sat from it. **Reported, never filtered on** — see *Not here yet* |
+| `limit_dir` | derived | `up`, `down`, `unknown` or `mixed` — see below |
+| `limit_noask` | Σ ticks with no ask | evidence for `limit_dir`: at limit up nobody will offer |
+| `limit_nobid` | Σ ticks with no bid | evidence for `limit_dir`: at limit down nobody bids |
+| `limit_net` | `qatt.netChange` | last resort evidence. Comes off the last *traded* price, so it is 0 or empty on exactly these stocks |
+| `limit_locked` | derived | `yes` when no side ever went missing — bid = ask throughout. These are the ones `ref_close` has to call |
+
+#### The two together
+
+| column | what it means |
 |---|---|
-| `id_target`, `id_server` | the target row this line is, so it can be looked up |
-| `tag_9604` | the client's own id — empty when the client sent none |
-| `order_start`, `order_end` | the order's live window, `HH:MM:SS`, ready to type back into a query. Empty end = still working |
-| `limit_periods` | how many qualifying periods the order was live through |
-| `limit_first_start`, `limit_last_end` | the span those periods cover |
-| `limit_mins` | how long the periods lasted, summed |
-| `ref_close` | the previous close the band is measured from — `target_stock.adjclose`, or `orgclose` where that is null |
-| `pct_from_close` | how far the band sat from it |
-| `limit_dir` | `up`, `down`, `unknown`, or `mixed` — see below |
-| `limit_noask`, `limit_nobid`, `limit_net` | the evidence `limit_dir` was decided from |
-| `limit_locked` | `yes` when no side ever went missing — bid = ask throughout |
-| `overlap_mins` | how long the order and the limit actually **coexisted** — each period clipped to the order's own window |
+| `overlap_mins` | how long the order and the limit **actually coexisted** — each period clipped to the order's own window, summed |
+
+`limit_mins` is the stock's; `overlap_mins` is ours. They differ whenever the
+order arrived late or finished early: a 60-minute limit an order only saw the
+second half of is `60.0` and `30.0`. **`overlap_mins` is the one that matters**
+— it is the first piece of the marketable window this is being built towards.
+
+### `otype`
+
+| value | what it means | why it is on the line |
+|---|---|---|
+| `market` | no price on it — takes whatever the book offers | **marketable whichever way the band went.** A market order sitting through a limit with nothing executed is a real question, not a favourable/unfavourable one |
+| `limit` | priced — fills only at that price or better | whether it was marketable depends on its price against the band, which this file does not carry yet |
+| *(empty)* | the feed sent none | not guessed at |
+
+Those are the two this feed is known to send, from
+[`luld_shortsell_check`](../luld_shortsell_check/README.md), which treats an
+unpriced split as a market order. **The value is passed through as it arrives**,
+so anything else the feed carries appears here as itself rather than being
+folded into one of these.
+
+Nothing is filtered on `otype` — a market order and a limit order are both in
+scope, and a check holds that.
 
 ### `limit_dir`
 
@@ -116,11 +165,6 @@ finding was favourable, so a period whose side was a tie was **thrown away**.
 Whether a limit was favourable to a given order is `side` against `limit_dir`
 — selling into `up`, or buying into `down` — and is left to whoever reads the
 file, since it is the interpretation rather than the observation.
-
-`limit_mins` and `overlap_mins` differ whenever the order arrived late or
-finished early: a 60-minute limit an order only saw the second half of is
-`60.0` and `30.0`. `overlap_mins` is the one that matters — it is the first
-piece of the marketable window this is being built towards.
 
 **One line per order, not per limit period.** An order live through three
 periods is still one line, because that is the unit the page counts: summing
@@ -278,7 +322,7 @@ conversion anywhere. That is relied on and is not a gap.
 
 Nothing is grouped in q: a `target` row is one send and a `workorder` row is one
 child. Every sum and count happens in Python, where `--self-test` can prove it —
-99 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
+105 checks, no kdb, no pykx, no q licence. `--demo` renders the sample above off
 synthetic data.
 
 ---
