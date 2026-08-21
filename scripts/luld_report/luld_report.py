@@ -84,6 +84,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lib.local_config import apply_local              # noqa: E402
 from lib.order_chains import (                                   # noqa: E402
     CLIENT_ID_TAG, DEFAULT_QTY, QTY_CHOICES, chain_key, chain_size, fix_tag)
+from lib.q_lint import (                                         # noqa: E402
+    balanced, groups_in_q, reserved_used, uncast_symbols)
 from lib.report_page import (                                    # noqa: E402
     BLUE, COL_W, DASH, GREEN, INK, INK2, INK3, L, R, RED,
     barchart, figure, fmt_hm, fmt_int, fmt_pct0, fmt_pct1, footer as _footer,
@@ -1537,23 +1539,6 @@ def demo(out_dir) -> int:
 
 # .Q.res - a name from this list cannot be a q parameter or local: q fails to
 # PARSE the lambda and returns the offending token as the error.
-Q_RESERVED = frozenset("""
-abs acos asin atan avg bin binr by cor cos cov delete dev div do each enlist
-exec exit exp from getenv hopen if in insert last like log max min prd select
-setenv sin sqrt ss string sum tan update var wavg where within wsum xexp
-""".split())
-
-
-def q_names(src: str) -> set:
-    import re
-    out = set()
-    for params in re.findall(r"\{\s*\[([^\]]*)\]", src):
-        out.update(n.strip() for n in params.split(";") if n.strip())
-    for name in re.findall(r"^\s*([a-zA-Z][a-zA-Z0-9_]*)\s*:(?!:)", src, re.M):
-        out.add(name)
-    return {n for n in out if n}
-
-
 def self_test() -> int:
     import io
     import tempfile
@@ -1569,10 +1554,8 @@ def self_test() -> int:
 
     print("luld_report --self-test\n\nthe q holds together")
     for nm, src in (("Q_ORDERS", Q_ORDERS), ("Q_PINS", Q_PINS)):
-        check(f"{nm}: no q reserved word as a name",
-              sorted(q_names(src) & Q_RESERVED), [])
-        check(f"{nm}: braces balance", src.count("{") == src.count("}"), True)
-        check(f"{nm}: brackets balance", src.count("[") == src.count("]"), True)
+        check(f"{nm}: no q reserved word as a name", reserved_used(src), [])
+        check(f"{nm}: brackets balance", balanced(src), True)
     for nm, (y0, h, ty) in (("market charts", MKT_BAND),
                             ("day chart 1", DAY_BANDS[0]),
                             ("day chart 2", DAY_BANDS[1])):
@@ -1582,17 +1565,11 @@ def self_test() -> int:
     #  page of zeros that follows looks exactly like a calm market
     for nm, src, args in (("Q_ORDERS", Q_ORDERS, ("sfx",)),
                           ("Q_PINS", Q_PINS, ("syms",))):
-        for arg in args:
-            used_bare = f"in {arg}" in src or f"like/: {arg}" in src
-            cast = f"{arg}:`${arg};" in src
-            like = f"like/: {arg}" in src
-            check(f"{nm}: {arg} is cast with `$ before use, or used with like",
-                  (cast or like) if used_bare else True, True)
+        check(f"{nm}: symbol arguments are cast with `$ before use, or used "
+              f"with like", uncast_symbols(src, args), [])
     check("the reserved word check would still catch one",
-          sorted(q_names("{[d;ss] ss:1}") & Q_RESERVED), ["ss"])
-    check("the order query groups nothing",
-          [ln.strip() for ln in Q_ORDERS.splitlines()
-           if "last " in ln and " by " in ln], [])
+          reserved_used("{[d;ss] ss:1}"), ["ss"])
+    check("the order query groups nothing", groups_in_q(Q_ORDERS), [])
 
     print("\nthe market is the sym suffix")
     check("Japan", market_of("7203.JP"), "JP")

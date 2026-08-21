@@ -140,6 +140,53 @@ Used by [`short_sell_report`](../short_sell_report/README.md) and
 
 ---
 
+## `q_lint.py`
+
+Reading the q in a Python file, so a broken query fails at `--self-test`.
+
+```python
+from lib.q_lint import reserved_used, balanced, uncast_symbols, joins
+
+reserved_used("{[d;ss] ss:1}")                   # ['ss']  - a PARSE error in q
+uncast_symbols("{[s] select from t where sym in s}", ["s"])   # ['s']
+joins("t:t lj `date xkey x")                     # ['lj', 'xkey']
+```
+
+```
+python scripts/lib/q_lint.py --self-test
+```
+
+**Why it exists.** These queries are q source held in Python strings. Nothing
+checks them until they reach a kdb server, and when one is wrong the server
+answers with two or three characters — `` `nyi ``, `` `type ``, `` `par `` —
+naming no table, no column and no line. A month against the historical server
+once failed with a bare `nyi` that took a schema diff to place.
+
+None of that needs kdb to catch. It is all visible in the text:
+
+- **`reserved_used`** — a name q will not allow. `` `ss `` is the one that
+  actually bit: it is string-search, so a parameter called `ss` is a parse error
+  that surfaces as `QError: ss`. Only *names* are looked at, so a query is free
+  to use `last`, `in` and `string` as the words they are.
+- **`uncast_symbols`** — the silent one. PyKX sends a Python `str` as a **char
+  vector**, and `sym in syms` against a symbol column with char vectors on the
+  right matches **nothing**. Not an error: the report just comes back empty, and
+  a dead query looks exactly like a quiet day. The fix is `` syms:`$syms; ``
+  before use; `like` is exempt, because it wants strings.
+- **`joins` / `groups_in_q`** — house style, enforced. These reports do their
+  joining and grouping in Python where `--self-test` can prove it, and keeping q
+  to plain selects is also what makes a failure name one table.
+- **`balanced`** — braces, brackets and parens.
+
+It is a lint, not a parser. It cannot type-check q, and it will not tell you a
+column is missing — that is what `_stage()`'s error message in
+`short_sell_report` is for.
+
+Used by [`short_sell_report`](../short_sell_report/README.md) and
+[`luld_report`](../luld_report/README.md).
+
+---
+
 ## `price_bands.py`
 
 The daily limit up / limit down band, and whether an order could ever have

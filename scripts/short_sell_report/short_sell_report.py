@@ -89,6 +89,8 @@ from typing import NamedTuple, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lib.local_config import apply_local              # noqa: E402
+from lib.q_lint import (                                         # noqa: E402
+    balanced, groups_in_q, joins, reserved_used, uncast_symbols)
 from lib.price_bands import (                                    # noqa: E402
     describe as band_rule, marketable)
 from lib.order_chains import (                                   # noqa: E402
@@ -232,23 +234,31 @@ TITLE = "Short-Sell Order Report"
 # =============================================================================
 # Q
 #
-# The query, plus what the chain needs: fixmsg is already there for the Japan
-# exclusion and carries tag 9604; oes_oid, basket, side and algo are for the
-# consistency checks, and time orders a chain's attempts.  Nothing else differs
-# - same suffix filter, same side filter, same refusal to group anything.
+# THREE SELECTS, NOT ONE LAMBDA.  Each is a plain select and nothing else: no
+# join, no `by`, no `0!`, no `xkey`.  The pieces are put together in Python,
+# where --self-test can prove it.
+#
+# This is not tidiness.  A single lambda that selects, groups and joins fails as
+# ONE call, and q reports `nyi with no idea which line meant it - which is
+# exactly what a month against the historical server did.  Three calls fail by
+# NAME, and the stage that broke is in the first line of the traceback.
+#
+# It also puts the file back in line with what it says it does everywhere else:
+# nothing is grouped in q.  A target is one send and a workorder is a child
+# order; the chaining, the sums and the counts all happen where they are tested.
+#
+# The columns: fixmsg is there for the Japan exclusion and carries tag 9604;
+# oes_oid, basket, side and algo are for the consistency checks; time orders a
+# chain's attempts.
 # =============================================================================
 
-Q_SESSION = """
+Q_TARGETS = """
 {[hist;d;sfx;sside]
   sside:`$sside;
   et:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; size:0#0i;
          fixmsg:0#`; oes_oid:0#`; basket:0#`; side:0#`; algo:0#`;
          sidesign:0#0i; limit_price:0#0n; t_start:0#0Nt; t_end:0#0Nt;
-         time:0#0Nt; fxlast:0#0n; refpx:0#0n);
-  ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i;
-         state:0#`; avg_fill_price:0#0n; t_transmit:0#0Nt;
-         transmit_bidprice:0#0n; transmit_askprice:0#0n);
-
+         time:0#0Nt);
   t:$[hist;
       select date,id_server,id_target,sym,size,fixmsg,oes_oid,basket,side,
           algo,sidesign,limit_price,t_start,t_end,time
@@ -256,23 +266,34 @@ Q_SESSION = """
       update date:0Nd from select id_server,id_target,sym,size,fixmsg,oes_oid,
           basket,side,algo,sidesign,limit_price,t_start,t_end,time
         from target where side=sside, any (upper sym) like/: sfx];
-  if[0=count t; :(et;ew)];
+  $[0=count t; et; t]
+  }
+"""
 
-  / fx and a reference close, for the notional.  target_stock is a REFERENCE
-  / table - one row per parent per day, describing the stock rather than the
-  / order - so `last` here is not the row-collapsing this file refuses to do
-  / elsewhere; it is picking the current value of a fact.
-  ids:exec distinct id_target from t;
-  x:$[hist;
+#  target_stock is a REFERENCE table - one row per parent per day, describing
+#  the STOCK rather than the order - so several rows for one target say the same
+#  thing, and Python takes the last.  That is picking the current value of a
+#  fact, not the row-collapsing this file refuses to do to orders.
+Q_STOCK = """
+{[hist;d;ids]
+  es:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; fxlast:0#0n;
+         adjclose:0#0n; orgclose:0#0n);
+  if[0=count ids; :es];
+  s:$[hist;
       select date,id_server,id_target,fxlast,adjclose,orgclose
         from target_stock where date=d, id_target in ids;
       update date:0Nd from select id_server,id_target,fxlast,adjclose,orgclose
         from target_stock where id_target in ids];
-  x:0!select refpx:last adjclose^last orgclose, fxlast:last fxlast
-       by date,id_server,id_target from x;
-  t:t lj `date`id_server`id_target xkey x;
+  $[0=count s; es; s]
+  }
+"""
 
-  ids:exec distinct id_target from t;
+Q_WORK = """
+{[hist;d;ids]
+  ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i;
+         state:0#`; avg_fill_price:0#0n; t_transmit:0#0Nt;
+         transmit_bidprice:0#0n; transmit_askprice:0#0n);
+  if[0=count ids; :ew];
   w:$[hist;
       select date,id_server,id_work,id_target,make,state,avg_fill_price,
           t_transmit,transmit_bidprice,transmit_askprice
@@ -280,16 +301,10 @@ Q_SESSION = """
       update date:0Nd from select id_server,id_work,id_target,make,state,
           avg_fill_price,t_transmit,transmit_bidprice,transmit_askprice
         from workorder where id_target in ids];
-  (t;w)
+  $[0=count w; ew; w]
   }
 """
 
-
-def fetch(handle, hist: bool, d: Optional[dt.date]):
-    sfx = [p.encode() for p in SYM_PATTERNS]
-    t, w = handle(Q_SESSION, hist, d if d is not None else _UNUSED_DATE,
-                  sfx, SHORTSELL_SIDE.encode())
-    return t.pd().to_dict("records"), w.pd().to_dict("records")
 
 # Why an order was rejected is on ALERTS.  Not on workorder, which has no text
 # field, and not on execution: a rejected order HAS no execution, and ostat and
@@ -351,11 +366,70 @@ def connect(endpoint: str):
 # type.  The realtime branch never looks at it.
 _UNUSED_DATE = dt.date(2000, 1, 1)
 
+def _stage(name: str, table: str, cols: str, d, fn):
+    """Run one query and, if q refuses it, say WHICH one and against what.
+
+    A bare `nyi out of pykx names no table and no column, and the reader is
+    left diffing a 60 line lambda against a schema.
+    """
+    try:
+        return fn().pd().to_dict("records")
+    except Exception as e:                                   # noqa: BLE001
+        raise SystemExit(
+            f"the {name} query failed{f' for {d}' if d is not None else ''}.\n"
+            f"  q said:  {type(e).__name__}: {e}\n"
+            f"  table:   {table}\n"
+            f"  columns: {cols}\n"
+            f"Check that table and those columns exist on this server "
+            f"(meta {table}), and that nothing else in the schema moved.") from e
+
+
 def fetch(handle, hist: bool, d: Optional[dt.date]):
+    """(target records, workorder records) for one session.
+
+    Three round trips, each a plain select.  The extra hops cost nothing next to
+    a month of data and they are what makes a failure legible.
+    """
+    dd = d if d is not None else _UNUSED_DATE
     sfx = [p.encode() for p in SYM_PATTERNS]
-    t, w = handle(Q_SESSION, hist, d if d is not None else _UNUSED_DATE,
-                  sfx, SHORTSELL_SIDE.encode())
-    return t.pd().to_dict("records"), w.pd().to_dict("records")
+
+    pr = _stage("target", "target", "sym size fixmsg oes_oid basket side algo "
+                "sidesign limit_price t_start t_end time", d,
+                lambda: handle(Q_TARGETS, hist, dd, sfx,
+                               SHORTSELL_SIDE.encode()))
+    ids = sorted({_i(r.get("id_target")) for r in pr})
+
+    st = _stage("target_stock", "target_stock", "fxlast adjclose orgclose", d,
+                lambda: handle(Q_STOCK, hist, dd, [int(i) for i in ids]))
+    wr = _stage("workorder", "workorder", "id_work make state avg_fill_price "
+                "t_transmit transmit_bidprice transmit_askprice", d,
+                lambda: handle(Q_WORK, hist, dd, [int(i) for i in ids]))
+
+    return merge_stock(pr, st), wr
+
+
+def merge_stock(targets, stock) -> list:
+    """Put fxlast and a reference close onto each target record.
+
+    The join q was doing, done where it can be tested.  Keyed on
+    (date, id_server, id_target) and the LAST row for a key wins - target_stock
+    describes the stock, so a second row is a restatement, not another order.
+
+    refpx is adjclose, else orgclose.  A target with no stock row at all gets
+    zeros, which every caller downstream already reads as "no price": the order
+    is counted, valued at nothing, and reported as unpriced.
+    """
+    ref = {}
+    for r in stock:
+        key = (_d(r.get("date")), _i(r.get("id_server")),
+               _i(r.get("id_target")))
+        adj, org = _f(r.get("adjclose")), _f(r.get("orgclose"))
+        ref[key] = (_f(r.get("fxlast")), adj if adj > 0 else org)
+    for r in targets:
+        key = (_d(r.get("date")), _i(r.get("id_server")),
+               _i(r.get("id_target")))
+        r["fxlast"], r["refpx"] = ref.get(key, (0.0, 0.0))
+    return targets
 
 # =============================================================================
 # RECORDS
@@ -2081,7 +2155,68 @@ def self_test() -> int:
         print(f"  {'ok  ' if good else 'FAIL'}  {name}"
               + ("" if good else f"   got {got!r}, want {want!r}"))
 
-    print("short_sell_report_v2 --self-test\n\nreading tag 9604 out of fixmsg")
+    print("short_sell_report --self-test\n\nthe q holds together")
+    QUERIES = (("Q_TARGETS", Q_TARGETS), ("Q_STOCK", Q_STOCK),
+               ("Q_WORK", Q_WORK), ("Q_ALERTS", Q_ALERTS))
+    for nm, src in QUERIES:
+        check(f"{nm}: no q reserved word as a name", reserved_used(src), [])
+        check(f"{nm}: brackets balance", balanced(src), True)
+        #  the whole point of splitting the session query in three: a plain
+        #  select fails by NAME, a lambda that also joins and groups fails as
+        #  one opaque `nyi
+        check(f"{nm}: joins nothing", joins(src), [])
+        check(f"{nm}: groups nothing", groups_in_q(src), [])
+    check("Q_TARGETS: the suffixes go in as strings, for like",
+          uncast_symbols(Q_TARGETS, ["sfx"]), [])
+    check("Q_TARGETS: the side is cast to a symbol before it is compared",
+          "sside:`$sside;" in Q_TARGETS, True)
+    check("the reserved word check would still catch one",
+          reserved_used("{[d;ss] ss:1}"), ["ss"])
+    check("and the join check would still catch a join",
+          joins("t:t lj `date xkey x"), ["lj", "xkey"])
+
+    print("\njoining target_stock on, in Python")
+    import datetime as _dt
+    D = _dt.date(2026, 7, 1)
+
+    def _tg(idt, srv=1, d=D):
+        return {"date": d, "id_server": srv, "id_target": idt}
+
+    def _sk(idt, fx, adj, org, srv=1, d=D):
+        return {"date": d, "id_server": srv, "id_target": idt, "fxlast": fx,
+                "adjclose": adj, "orgclose": org}
+
+    tg = merge_stock([_tg(1), _tg(2)], [_sk(1, 0.13, 10.0, 9.0),
+                                        _sk(2, 1.0, 0.0, 7.5)])
+    check("fx comes across", [r["fxlast"] for r in tg], [0.13, 1.0])
+    check("refpx is adjclose when there is one", tg[0]["refpx"], 10.0)
+    check("and orgclose when there is not", tg[1]["refpx"], 7.5)
+
+    check("a target with no stock row is priced at nothing, not dropped",
+          [(r["fxlast"], r["refpx"]) for r in merge_stock([_tg(9)], [])],
+          [(0.0, 0.0)])
+    check("and it is still a row", len(merge_stock([_tg(9)], [])), 1)
+
+    #  target_stock describes the STOCK, so a second row restates a fact
+    check("the last row for a key wins",
+          merge_stock([_tg(1)], [_sk(1, 1.0, 10.0, 0.0),
+                                 _sk(1, 2.0, 20.0, 0.0)])[0]["refpx"], 20.0)
+
+    #  the key is the whole key: two servers, two different orders
+    two = merge_stock([_tg(1, srv=1), _tg(1, srv=2)],
+                      [_sk(1, 1.0, 10.0, 0.0, srv=1),
+                       _sk(1, 1.0, 30.0, 0.0, srv=2)])
+    check("id_server is part of the key, so the servers do not cross",
+          [r["refpx"] for r in two], [10.0, 30.0])
+    days = merge_stock([_tg(1, d=D), _tg(1, d=_dt.date(2026, 7, 2))],
+                       [_sk(1, 1.0, 10.0, 0.0, d=D),
+                        _sk(1, 1.0, 40.0, 0.0, d=_dt.date(2026, 7, 2))])
+    check("and neither do the days", [r["refpx"] for r in days], [10.0, 40.0])
+    check("a realtime run has no date at all, and still joins",
+          merge_stock([_tg(1, d=None)],
+                      [_sk(1, 0.5, 11.0, 0.0, d=None)])[0]["refpx"], 11.0)
+
+    print("\nreading tag 9604 out of fixmsg")
     SOH = "\x01"
     check("a normal SOH separated message",
           fix_tag(f"8=FIX.4.2{SOH}35=D{SOH}9604=ABC123{SOH}59=0"), "ABC123")

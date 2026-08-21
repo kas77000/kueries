@@ -112,9 +112,9 @@ malformed or unacknowledged send rather than a venue saying no — and folding
 them in would inflate the one number on this page a compliance reader will
 quote.
 
-Nothing is grouped in q. A target is one send and a workorder is a child order;
-the chaining, the sums and the counts all happen in Python, where `--self-test`
-can prove them.
+Nothing is joined or grouped in q. A target is one send and a workorder is a
+child order; the chaining, the sums and the counts all happen in Python, where
+`--self-test` can prove them. See *Three selects, not one lambda*.
 
 
 ## The chain key: FIX tag 9604
@@ -527,16 +527,53 @@ so the historical branch's `date=d` never has to exist on the realtime side. The
 realtime branch bolts on `date:0Nd`, so everything downstream — the grouping,
 the join keys, the frame Python sees — has one shape.
 
+### Three selects, not one lambda
+
+`Q_TARGETS`, `Q_STOCK` and `Q_WORK` are three round trips, and each is a **plain
+select**: no join, no `by`, no `0!`, no `xkey`. The extra hops cost nothing next
+to a month of data.
+
+This is not tidiness. A month against the historical server once came back as:
+
+```
+pykx.exceptions.QError: nyi
+```
+
+and that was all of it — no table, no column, no line. One lambda that selects
+from three tables, groups one of them and joins it to another fails as **one
+call**, so `nyi` could have meant any of six things. Split up, the stage that
+broke is the first line of the traceback, and `_stage()` adds the table and the
+columns it asked for:
+
+```
+the target_stock query failed for 2026-07-01.
+  q said:  QError: nyi
+  table:   target_stock
+  columns: fxlast adjclose orgclose
+Check that table and those columns exist on this server (meta target_stock),
+and that nothing else in the schema moved.
+```
+
+The join `Q_STOCK` used to do in q is now `merge_stock()` in Python, keyed on
+`(date, id_server, id_target)`, last row wins — `target_stock` describes the
+*stock*, so a second row is a restatement rather than another order. A target
+with no stock row keeps its place and is valued at nothing, which downstream
+already reads as *unpriced* and reports. All of that is under `--self-test`; the
+`lj` never was.
+
 ### A note on names in the q
 
 `ss` is q's string-search keyword, so a lambda parameter called `ss` is a
 **parse** error — the query dies on the name before it does anything, and comes
 back as `QError: ss`. Nothing local can catch that: it needs a real q process.
 
-`--self-test` therefore pulls every parameter and local out of `Q_SESSION` and
-checks them against `.Q.res`. Add a name to the query and the check covers it
-automatically. The one to watch for is a plausible-looking short name — `ss`,
-`in`, `var`, `max`, `string`, `last`, `like`, `div`, `bin`, `do`, `if`.
+[`scripts/lib/q_lint.py`](../lib/README.md) reads the query text instead, and
+`--self-test` runs it over all four queries: reserved words used as names,
+unbalanced brackets, a symbol argument compared against char vectors, and any
+join or `by`-aggregation that creeps back in. Add a name to a query and the
+check covers it automatically. The one to watch for is a plausible-looking short
+name — `ss`, `in`, `var`, `max`, `string`, `last`, `like`, `div`, `bin`, `do`,
+`if`.
 
 Set both endpoints before the first run:
 
