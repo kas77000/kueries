@@ -997,6 +997,23 @@ CLOSE_RE = r"close"
 #  it OPEN would file it under the session instead
 CATEGORIES = ("short sell", "open", "close", "continuous")
 
+#  What the CHART shows.  Four segments on a bar that is nine pixels tall for
+#  half the markets is four things nobody can compare; the split that earns its
+#  ink on this page is the rule we report on against everything else.
+#
+#  Only the drawing is folded.  All four are still counted, still in the table's
+#  Rejections column, still in --orders and still in the CSV - so the detail is
+#  a command away rather than gone.
+CHART_CATEGORIES = ("short sell", "other")
+OTHER_CATEGORIES = tuple(k for k in CATEGORIES if k != "short sell")
+
+
+def chart_cat(row, name) -> int:
+    """One market's count for a CHART bucket."""
+    if name == "other":
+        return sum(row.cat(k) for k in OTHER_CATEGORIES)
+    return row.cat(name)
+
 
 def categorise(text) -> str:
     """Which bucket one REJECTTOOMANY alert falls in."""
@@ -1794,9 +1811,12 @@ Y_FOOTER = 0.048
 
 # Where the two by market charts sit, and how tall they are.  --monthly gives up
 # most of that band, and some of the table's row pitch, to the per day pair.
-MKT_BAND = {                      # (y0, height, title y)
-    "daily": (0.195, 0.265, 0.478),
-    "monthly": (0.455, 0.110, 0.578),
+#  The legend of the rejections chart is part of this band, not an afterthought
+#  under it: on a monthly page the by day charts start immediately below, and a
+#  legend left to float landed on top of the first one's bars.
+MKT_BAND = {                      # (y0, height, title y, legend y)
+    "daily": (0.195, 0.265, 0.478, 0.169),
+    "monthly": (0.455, 0.110, 0.578, 0.437),
 }
 # The per day band stops clear of the notes: its baseline hairline is drawn 0.008
 # below y0, and a baseline running through a line of text is the one collision
@@ -1806,9 +1826,13 @@ MKT_BAND = {                      # (y0, height, title y)
 # they want about 0.045 of the page height beneath each plot.  (y0, height,
 # title y) for the completion chart and then the rejections one.
 DAY_BANDS = (
-    (0.330, 0.100, 0.443),
-    (0.152, 0.100, 0.265),
+    (0.318, 0.092, 0.422),
+    (0.150, 0.092, 0.254),
 )
+#  How much page a turned on its side YYYY-MM-DD needs under a baseline.  The
+#  charts do not reserve it - it is drawn outside the axes - so the checks below
+#  are the only thing standing between a date column and the title under it.
+DAY_LABEL_H = 0.045
 
 # (column label, width as a fraction of COL_W, right aligned)
 TABLE_COLS = (
@@ -1885,7 +1909,8 @@ def draw(rows, tot, subtitle, footer, days=None):
     comp = _sorted_pairs(rows, key=lambda r: (r.completion or 0.0))
     rej = _sorted_pairs(rows, key=lambda r: r.rejections)
 
-    mkt_y0, mkt_rect_h, mkt_title_y = MKT_BAND["monthly" if monthly else "daily"]
+    mkt_y0, mkt_rect_h, mkt_title_y, mkt_legend_y = MKT_BAND[
+        "monthly" if monthly else "daily"]
     half = 0.405
 
     barchart(fig, (L, mkt_y0, half, mkt_rect_h), "Completion by market",
@@ -1896,9 +1921,9 @@ def draw(rows, tot, subtitle, footer, days=None):
     stacked_barchart(fig, (R - half, mkt_y0, half, mkt_rect_h),
                      "Rejections by market",
                      [r.name for r in rej],
-                     [(k, [float(r.cat(k)) for r in rej]) for k in CATEGORIES],
-                     fs=8.0, title_y=mkt_title_y,
-                     legend_y=mkt_y0 - 0.026)
+                     [(k, [float(chart_cat(r, k)) for r in rej])
+                      for k in CHART_CATEGORIES],
+                     fs=8.0, title_y=mkt_title_y, legend_y=mkt_legend_y)
 
     # ---- completion and rejections by day ----------------------------------
     if monthly:
@@ -2888,6 +2913,24 @@ def self_test() -> int:
           categorise("undisclosed size rejected"), "close")
 
 
+    print("\ntwo buckets on the chart, four in the numbers")
+    cr = Row("HK", "Hong Kong", 10, 0, 0, 30, 0.0, 0.0,
+             {"short sell": 12, "open": 7, "close": 5, "continuous": 6})
+    check("short sell is itself", chart_cat(cr, "short sell"), 12)
+    check("and other is the three sessions added up",
+          chart_cat(cr, "other"), 18)
+    check("the two still make the whole column",
+          chart_cat(cr, "short sell") + chart_cat(cr, "other"), cr.rejections)
+    check("the chart buckets", list(CHART_CATEGORIES), ["short sell", "other"])
+    check("and they partition the four - none counted twice, none lost",
+          sorted(("short sell",) + OTHER_CATEGORIES), sorted(CATEGORIES))
+    check("a market with no rejections stacks to nothing",
+          [chart_cat(Row("XX", "Nowhere", 0, 0, 0, 0), k)
+           for k in CHART_CATEGORIES], [0, 0])
+    #  the folding is the DRAWING only
+    check("the four are still in the numbers", cr.cat("close"), 5)
+
+
     print("\nrejection alerts, per market")
     al_att, _ = to_attempts([_p(1, "HK", 1000), _p(2, "HK", 1000),
                              _p(3, "JP", 1000)])
@@ -2967,15 +3010,28 @@ def self_test() -> int:
     #  at fixed y, and a sixth row is what first pushed the two together
     for mode, row_h in (("daily", 0.040), ("monthly", 0.030)):
         bottom = Y_TABLE_TOP - H_TABLE_HEAD - len(MARKETS) * row_h
-        y0, h, ty = MKT_BAND[mode]
+        y0, h, ty, ly = MKT_BAND[mode]
         check(f"{mode}: the table ends above the chart titles", bottom > ty,
               True)
         check(f"{mode}: and the titles sit above their axes", ty > y0 + h, True)
+        check(f"{mode}: the legend sits below the bars, not across them",
+              ly < y0, True)
     (cy, ch, cty), (ry, rh, rty) = DAY_BANDS
-    check("the by day titles clear the market charts",
-          cty < MKT_BAND["monthly"][0], True)
+    m_y0, _m_h, _m_ty, m_ly = MKT_BAND["monthly"]
+    check("the by day titles clear the market charts", cty < m_y0, True)
     check("and each sits above its own axes",
           (cty > cy + ch, rty > ry + rh), (True, True))
+    #  the collision this layout actually had: the legend landed on the first
+    #  day chart's bars
+    check("the legend clears the completion by day title", m_ly > cty, True)
+    check("with room to be read - a hairline gap is a collision at print",
+          round(m_ly - cty, 3) >= 0.012, True)
+    check("and it clears that chart's plot too", m_ly > cy + ch, True)
+    #  the dates are drawn OUTSIDE the axes, so nothing else knows they are there
+    check("the first chart's dates clear the second chart's title",
+          cy - DAY_LABEL_H > rty, True)
+    check("and the second chart's dates clear the bottom rule",
+          ry - DAY_LABEL_H > Y_RULE_BOTTOM, True)
 
 
     print("\nputting an order in USD")

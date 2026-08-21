@@ -44,11 +44,11 @@ Short-sell orders   Overall completion   Rejections
 
 Completion by market            Rejections by market
    Japan ████████████ 84%          Hong Kong █████ ▓▓▓▓▓ 239
-  Taiwan ████████ 63%                  Korea ██ ▓▓ ▒▒ ░░ 152
+  Taiwan ████████ 63%                  Korea ███ ▓▓▓ 152
 Hong Kong ███████ 53%                  Taiwan █ ▓ 31
     Korea █████ 39%                     Japan 3
 
-                                █ short sell  ▓ open  ▒ close  ░ continuous
+                                █ short sell   ▓ other
 ```
 
 The rejections chart is **stacked by why** — see *Why an order was rejected*.
@@ -422,10 +422,23 @@ by `--self-test` so the behaviour is on the record rather than a surprise; if
 either shows up in real texts, tighten `OPEN_RE` / `CLOSE_RE` to a word
 boundary. `--reject-reasons` is how you find out.
 
-The four are drawn as one **stacked bar** per market, in that order, with the
-market total labelled at the end of the bar. Four segments is the most a stacked
-bar reads at, and these four are exhaustive and mutually exclusive, so the bar
-length is still the number in the Rejections column.
+### What the chart shows: two, not four
+
+The bar is stacked **short sell** against **other** — `open`, `close` and
+`continuous` added together:
+
+```python
+CHART_CATEGORIES = ("short sell", "other")
+```
+
+Four segments on a bar that is nine pixels long for half the markets is four
+things nobody can compare. The split that earns its ink on this page is the rule
+the report is about against everything else.
+
+**Only the drawing is folded.** All four are still counted, still summed in the
+Rejections column, still in `--orders` and still in the CSV — the detail is a
+command away rather than gone. The two segments partition the four exactly, so
+the bar length is still the number in the column.
 
 ---
 
