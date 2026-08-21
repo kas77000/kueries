@@ -494,6 +494,16 @@ class Chain(NamedTuple):
         return {a.key for a in self.attempts}
 
     @property
+    def target_ids(self) -> tuple:
+        """Every id_target this order was sent under, oldest first.
+
+        The findings table prints these so a row can be checked back against
+        `target`.  The 9604 that groups them would be the more natural key, but
+        it is a 40 character client string - too wide for a column - and these
+        are what a query takes."""
+        return tuple(a.id_target for a in self.attempts)
+
+    @property
     def t_start(self) -> Optional[int]:
         got = [a.t_start for a in self.attempts if a.t_start is not None]
         return min(got) if got else None
@@ -506,6 +516,38 @@ class Chain(NamedTuple):
     def disagrees_on(self) -> list:
         return [f for f in ("sym", "side", "algo", "basket")
                 if len({getattr(a, f) for a in self.attempts}) > 1]
+
+
+#  What the Target id column holds at fs 7.5: the column is 0.13 of the span,
+#  and a digit is about 0.0068 of the figure, which leaves thirteen characters
+#  before the cell reaches Side.  Nothing in the page toolkit clips text, so a
+#  cell that overruns silently prints over its neighbour - this is a promise
+#  this function has to keep, and the self test holds it to it for every id
+#  width the feed plausibly has.
+TID_CHARS = 13
+
+
+def fmt_targets(ids, budget=TID_CHARS) -> str:
+    """The chain's target ids for one table cell: `90001+90002`, `90001 +2`.
+
+    A chain is several sends and the table has one row, so the cell holds as
+    many ids as fit and COUNTS the rest rather than dropping them - the point of
+    the column is to be able to go and look, and a cell that quietly showed the
+    first id of five would send someone to the wrong order.  ANY id shown is
+    enough to pull the whole chain: query `target` for it and take its 9604,
+    which is what the other sends share and is itself far too long to print."""
+    ids = [str(i) for i in ids]
+    if not ids:
+        return DASH
+    out = []
+    for i, one in enumerate(ids):
+        rest = len(ids) - (i + 1)
+        tail = f" +{rest}" if rest else ""
+        if out and len("+".join(out + [one])) + len(tail) > budget:
+            break
+        out.append(one)
+    rest = len(ids) - len(out)
+    return "+".join(out) + (f" +{rest}" if rest else "")
 
 
 class Split(NamedTuple):
@@ -987,17 +1029,18 @@ MKT_COLS = (
 # The findings table.  Splits is the order's TOTAL child count: 0 means it never
 # worked, a number means it worked but not while the limit was there.
 MISS_COLS = (
-    ("Market", 0.10, False),
-    ("Symbol", 0.14, False),
-    ("Side", 0.07, False),
-    ("Order qty", 0.11, True),
-    ("Exec qty", 0.11, True),
+    ("Market", 0.08, False),
+    ("Symbol", 0.11, False),
+    ("Target id", 0.13, False),
+    ("Side", 0.06, False),
+    ("Order qty", 0.095, True),
+    ("Exec qty", 0.095, True),
     ("Completion", 0.10, True),
-    ("Limit", 0.08, True),
-    ("At", 0.06, False),
-    ("Limit period", 0.13, False),
-    ("Mins", 0.05, True),
-    ("Splits", 0.05, True),
+    ("Limit", 0.07, True),
+    ("At", 0.05, False),
+    ("Limit period", 0.12, False),
+    ("Mins", 0.045, True),
+    ("Splits", 0.045, True),
 )
 
 
@@ -1024,17 +1067,18 @@ def _market_table(fig, rows, y_top, row_h):
 
 
 def _miss_cells(m: Missed):
-    """Completion is the number in red: on a page about limits we could have
+    """Completion is the number in bold: on a page about limits we could have
     traded into, how little of the order got done IS the finding.  Order qty
     beside it is what that percentage is a percentage of - the two together give
     back the quantity missed, so nothing is lost by not printing it."""
     return [(MARKET_NAME.get(m.parent.market, m.parent.market), INK, "normal"),
             (m.parent.sym, INK, "normal"),
+            (fmt_targets(m.parent.target_ids), INK2, "normal"),
             (m.parent.side or ("buy" if m.parent.sidesign > 0 else "sell"),
              INK, "normal"),
             (fmt_int(m.parent.size), INK, "normal"),
             (fmt_int(m.executed), INK, "normal"),
-            (fmt_pct1(m.completion), RED, "bold"),
+            (fmt_pct1(m.completion), INK, "bold"),
             (f"{m.pin.price:,.4g}" if m.pin.price else DASH, INK, "normal"),
             (m.pin.side, INK2, "normal"),
             (f"{fmt_hm(m.window[0])}–{fmt_hm(m.window[1])}", INK2, "normal"),
@@ -1614,6 +1658,31 @@ def self_test() -> int:
     check("never reached the market cannot have been active",
           split_active(_split(on=None, off=None), w0, w1), False)
 
+    print("\nthe target ids on a finding")
+    check("one send is one id", fmt_targets((90_001,)), "90001")
+    check("a replaced order shows both", fmt_targets((90_001, 90_002)),
+          "90001+90002")
+    check("what does not fit is counted, never dropped",
+          fmt_targets((123_456_789, 123_456_790, 123_456_791, 123_456_792)),
+          "123456789 +3")
+    check("a three send chain says so", fmt_targets((90_001, 90_002, 90_003)),
+          "90001 +2")
+    _many = fmt_targets(tuple(range(1, 21)))
+    check("and every id is either shown or counted, none lost",
+          len(_many.split(" +")[0].split("+")) + int(_many.split(" +")[1]), 20)
+    check("a cell stays inside its column: nine digit ids, up to 99 sends",
+          max(len(fmt_targets(tuple(range(10 ** 8, 10 ** 8 + n))))
+              for n in range(1, 100)) <= TID_CHARS, True)
+    check("the only id there is is never the one dropped",
+          fmt_targets((123_456_789,) * 40).startswith("123456789"), True)
+    check("no id at all is an em dash, not an empty cell",
+          fmt_targets(()), DASH)
+    tg = to_chains(to_attempts(
+        [_p(11, "JP", 1000, cid="CLI-A", t_start=9 * H, t_end=15 * H),
+         _p(12, "JP", 1000, cid="CLI-A", t_start=9 * H, t_end=15 * H)]))[0]
+    check("a chain carries every id it was sent under, oldest first",
+          tg.target_ids, (11, 12))
+
     print("\nwhich orders the limit touched")
     p1 = to_chains(to_attempts(
         [_p(1, "JP", 1000, t_start=9 * H, t_end=15 * H),
@@ -1844,7 +1913,9 @@ def self_test() -> int:
     check("and so do the market ones",
           round(sum(c[1] for c in MKT_COLS), 6), 1.0)
     check("the findings table shows what was done, not what was not",
-          [c[0] for c in MISS_COLS][3:6], ["Order qty", "Exec qty", "Completion"])
+          [c[0] for c in MISS_COLS][4:7], ["Order qty", "Exec qty", "Completion"])
+    check("a finding says which target it was, so it can be checked back",
+          [c[0] for c in MISS_COLS][:3], ["Market", "Symbol", "Target id"])
     buf = io.BytesIO()
     figs[0].savefig(buf, format="pdf")
     check("page one renders", buf.getvalue()[:5], b"%PDF-")
@@ -1935,8 +2006,9 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         description="Limit Up / Limit Down Order Report - completion, "
                     "rejections and missed favourable limits by market. "
-                    "Mailing it is configured in the EMAIL block at the top "
-                    "of this file, not here.",
+                    "Servers and mailing are configured in the blocks at the "
+                    "top of this file, or in a local_settings.py beside it - "
+                    "not here.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--monthly", metavar="YYYY-MM",
                    help="report a whole month off the HISTORICAL servers, and "

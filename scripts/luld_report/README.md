@@ -45,16 +45,29 @@ Orders at a limit  Overall completion   Rejections    Favourable, no split
 **Page 2** — *Favourable limit, no split on the market*:
 
 ```
-┌────────┬─────────┬──────┬───────────┬──────────┬────────────┬───────┬──────┬─────────────┬──────┬────────┐
-│ Market │ Symbol  │ Side │ Order qty │ Exec qty │ Completion │ Limit │ At   │ Limit period│ Mins │ Splits │
-├────────┼─────────┼──────┼───────────┼──────────┼────────────┼───────┼──────┼─────────────┼──────┼────────┤
-│ Japan  │ 1010.JP │ sell │   215,000 │        0 │       0.0% │  12.5 │ up   │ 11:10–11:26 │   16 │      0 │
-│ Taiwan │ 1070.TT │ sell │   185,000 │        0 │       0.0% │  27.5 │ up   │ 12:10–12:46 │   36 │      0 │
-│ Korea  │ 1045.KS │ buy  │   197,500 │   80,975 │      41.0% │ 21.25 │ down │ 11:45–11:56 │   11 │      1 │
-└────────┴─────────┴──────┴───────────┴──────────┴────────────┴───────┴──────┴─────────────┴──────┴────────┘
+┌────────┬─────────┬───────────┬──────┬───────────┬──────────┬────────────┬───────┬──────┬─────────────┬──────┬────────┐
+│ Market │ Symbol  │ Target id │ Side │ Order qty │ Exec qty │ Completion │ Limit │ At   │ Limit period│ Mins │ Splits │
+├────────┼─────────┼───────────┼──────┼───────────┼──────────┼────────────┼───────┼──────┼─────────────┼──────┼────────┤
+│ Japan  │ 1010.JP │        10 │ sell │   215,000 │        0 │       0.0% │  12.5 │ up   │ 11:10–11:26 │   16 │      0 │
+│ Taiwan │ 1070.TT │        70 │ sell │   185,000 │        0 │       0.0% │  27.5 │ up   │ 12:10–12:46 │   36 │      0 │
+│ Korea  │ 1045.KS │        45 │ buy  │   197,500 │   80,975 │      41.0% │ 21.25 │ down │ 11:45–11:56 │   11 │      1 │
+│ Japan  │ 91003.JP│  90001 +2 │ sell │    40,000 │        0 │       0.0% │ 1,234 │ up   │ 12:00–13:00 │   60 │      3 │
+└────────┴─────────┴───────────┴──────┴───────────┴──────────┴────────────┴───────┴──────┴─────────────┴──────┴────────┘
 ```
 
-**Completion is the number in red**: on a page about limits we could have traded
+**Target id is there so a finding can be checked** rather than believed. A row is
+one ORDER, and an order that was rejected and re-sent is several `id_target`s —
+the cell shows as many as fit and counts the rest, `90001 +2` being a three-send
+chain. Any id shown is enough to pull the whole thing: look it up in `target`
+and take its **FIX tag 9604**, which is what the sends share. The 9604 itself is
+a 40-character client string, too wide for a column, which is why the ids are
+printed instead.
+
+That last row is also the shape a false positive would take if the chaining were
+wrong: three sends, nothing on the book. Chained, it is one finding; un-chained
+it would have been three, two of them pointing at sends that never worked.
+
+**Completion is the number in bold**: on a page about limits we could have traded
 into, how little of the order got done *is* the finding. Order qty beside it is
 what that percentage is a percentage of, so the quantity missed is still there —
 `Order qty × (1 − Completion)` — without a column spent printing it.
@@ -255,10 +268,36 @@ it is reported.
 
 ---
 
+## Settings
+
+Servers, recipients and SMTP live in the blocks at the top of the script — and
+can be overridden from a **`local_settings.py` beside it**, which git ignores,
+the same way as
+[`short_sell_report`](../short_sell_report/README.md). Put the real values
+there and `git pull` stays clean; the tracked file keeps its `CHANGEME`
+placeholders and never has to be edited.
+
+```python
+# scripts/luld_report/local_settings.py
+ORDER_SERVER_RT = "prod-oms-1:5012"
+ORDER_SERVER_HIST = "prod-oms-hist:5010"
+QATT_SERVER_RT = "prod-qatt-1:5013"
+QATT_SERVER_HIST = "prod-qatt-hist:5011"
+EMAIL_TO = ["desk@example.com"]
+```
+
+A commented template is in the repo working copy. It is **not tracked**, so it
+does not travel with a clone — write it once on the machine that runs the
+report. A name the script does not define is an error that stops the run, not a
+new setting: `EMAIL_T0` with a zero would otherwise sit there doing nothing
+while the report went to no one. See [`scripts/lib`](../lib/README.md).
+
+---
+
 ## Email
 
-Configured in the `EMAIL` block at the top of the script, not on the command
-line — same shape as
+Configured in the `EMAIL` block at the top of the script (or in
+`local_settings.py`), not on the command line — same shape as
 [`short_sell_report`](../short_sell_report/README.md#email). `EMAIL_TO` empty
 means do not send.
 
