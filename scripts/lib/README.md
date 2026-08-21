@@ -65,6 +65,48 @@ Used by [`short_sell_report`](../short_sell_report/README.md) and
 
 ---
 
+## `order_chains.py`
+
+Putting a rejected-and-replaced order back together. The engine writes a **new
+`id_target`** every time an order is re-sent, so counting target rows counts one
+economic order several times and multiplies its size.
+
+```python
+from lib.order_chains import chain_key, chain_size, fix_tag
+
+cid = fix_tag(row["fixmsg"])                     # the client's own order id
+key = chain_key(date, cid, id_server, id_target)
+qty = chain_size(sizes, fills, "asked")          # what the chain asked for
+```
+
+```
+python scripts/lib/order_chains.py --self-test
+```
+
+**The rule is here; the records are not.** Each report has its own idea of what
+an attempt carries and what it wants to say about one, and forcing those into a
+shared shape would buy nothing. What is shared is what must not drift: how to
+read the tag, what makes two rows one order, and what quantity that order asked
+for.
+
+- **`fix_tag`** splits `fixmsg` into fields and compares the *whole* tag, so
+  `19604=`, `96040=` and a `9604=` inside another field's value are ignored. The
+  separator is `;` (also SOH and `|`); a **caret is not** — it appears inside
+  values in this feed.
+- **`chain_key`** leaves `id_server` out: a trader can move an order to another
+  server and it is still the same order. A target with no 9604 keys on its own
+  server *and* `id_target`, so untagged orders never merge with each other.
+- **`chain_size`** defaults to `"asked"` — every attempt's fills plus what the
+  last one still had to do. It is the only rule that handles both a
+  **replacement** (3×27m that never traded is 27m) and a **top-up** (900, 1700,
+  2500 filling 3,600 asked for 5,100), and it cannot produce a completion over
+  100%.
+
+Used by [`short_sell_report`](../short_sell_report/README.md) and
+[`luld_report`](../luld_report/README.md).
+
+---
+
 ## `mailer.py`
 
 Send a report to a list of people: a plain text body, an HTML body with the

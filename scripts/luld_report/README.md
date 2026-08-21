@@ -144,24 +144,47 @@ is **counted on the page and logged**, never silently dropped.
 
 ---
 
-## Known gap: this does not chain replaced orders yet
+## Replaced orders are chained
 
-[`short_sell_report`](../short_sell_report/README.md) collapses a
-rejected-and-replaced order back into **one** order using FIX tag 9604, because
-the engine writes a **new `id_target`** for every re-send. **This report does
-not.** Until it does:
+The engine writes a **new `id_target`** every time an order is re-sent, so
+counting target rows counts one order several times. Attempts are chained back
+together on **FIX tag 9604**, the client's own order id — the rule lives in
+[`scripts/lib/order_chains.py`](../lib/README.md) and is shared with
+[`short_sell_report`](../short_sell_report/README.md).
 
-- **Orders** and **Order qty** are inflated wherever an order was replaced —
-  the same 3-orders-for-one, 81m-for-27m error that started that work.
-- **Completion** is depressed by the same amount, since it divides by that
-  inflated quantity.
-- **The favourable-no-split table can produce false positives.** An order
-  re-sent under a new `id_target` looks like a separate order that "sent
-  nothing during the limit", even when a sibling attempt *did* have a split on
-  the book. That is a finding pointing at nothing.
+**Splits are pooled across the chain**, and that is the part that matters here.
+Asking "was anything of ours on the book during the limit" of a *single attempt*
+gives a **false positive** whenever a sibling attempt was the one resting there:
 
-The chaining is worth porting across, and it is the same code: `fix_tag`,
-`to_attempts`, `to_chains` and the diagnostics.
+```
+limit:              |------- limit up -------|
+attempt 1:  |------|                            re-sent at 11:36
+attempt 2:          |=========== on the book ===========|
+
+  per attempt   attempt 1 "sent nothing during the limit"   <-- WRONG
+  per order     the order WAS on the book                   <-- right
+```
+
+A finding pointing at nothing is worse than no finding, so a check asserts both
+halves: chained, nothing is reported; un-chained, the first send is flagged.
+
+The **order's live window** spans every attempt — first send to last end — so a
+limit that arrives between two sends still counts as having touched the order.
+A close-only order is only excused if **every** attempt was close-only; one
+working attempt is a working order.
+
+Every run reports what the chaining did, and where it is not safe:
+
+```
+chains: 924 targets -> 429 orders (54 chained, longest 162)
+12 of 924 targets (1.3%) carry no tag 9604 and stand alone: JP 11, HK 1
+WARNING: 3 chains disagree on algo - a 9604 is covering more than one order
+         and these numbers are WRONG
+```
+
+A chain that executes more than it asked for is **un-chained** back into one
+order per target and its findings dropped, rather than printing a completion
+over 100%. `--keep-over` opts out; `--chain-qty` picks the quantity rule.
 
 ---
 
@@ -260,7 +283,7 @@ python scripts/luld_report/luld_report.py --self-test
 python scripts/luld_report/luld_report.py --demo
 ```
 
-129 checks, no kdb and no pykx: the suffix routing including the many-to-one
+151 checks, no kdb and no pykx: the suffix routing including the many-to-one
 markets, which limit a period was at, what counts as favourable, window
 arithmetic including open-ended splits, what makes a split active, which orders
 the limit touched, every guard on the findings table, the rollups, the mode

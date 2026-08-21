@@ -88,6 +88,8 @@ from typing import NamedTuple, Optional
 # Copy scripts/lib alongside this folder if you move it.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from lib.order_chains import (                                   # noqa: E402
+    CLIENT_ID_TAG, QTY_CHOICES, chain_key, chain_size, fix_tag)
 from lib.report_page import (                                    # noqa: E402
     BLUE, COL_W, DASH, GREEN, INK, INK2, INK3, L, R, RED,
     barchart, figure, fmt_int, fmt_pct0, fmt_pct1, footer as _footer, heading,
@@ -413,46 +415,9 @@ def to_splits(records, parents) -> list:
 # CHAINS
 # =============================================================================
 
-# THE SEPARATOR IS A SEMICOLON in this feed.  From a real fixmsg:
-#
-#   ...;16589=108223;9604=104642494_SG_HK_PORTAL_LIV_20260819162013;17717=...
-#
-# SOH and pipe are accepted too, since a stored copy may be rewritten either
-# way and neither appears inside a value here.
-#
-# A CARET IS NOT A SEPARATOR, even though it looks like one.  It is used INSIDE
-# values all over this feed - `SILK_FLOW^1008649713^TargetPart=30^SharedTempl^^`
-# and `9012=274=1^275=1` are both one field - so splitting on it would carve
-# values into pieces.  Nor is a space, for the same reason.
-#
-# If the real separator is none of these, fix_tag finds nothing and EVERY target
-# reads as having no 9604 - which the run reports in the first line of output
-# rather than quietly failing to chain anything.
-_FIX_SEPS = "\x01;|\n\r"
-CLIENT_ID_TAG = "9604"
-
-
-def fix_tag(fixmsg, tag=CLIENT_ID_TAG) -> str:
-    """The value of one FIX tag in a fixmsg, or "" if it is not there.
-
-    Split into fields first and compare the whole tag, rather than searching for
-    "9604=": that would also match 19604= and 9604X=, and a client id taken from
-    the wrong tag is worse than no client id at all.
-    """
-    txt = _s(fixmsg)
-    if not txt:
-        return ""
-    field = ""
-    for ch in txt:
-        if ch in _FIX_SEPS:
-            k, sep, val = field.partition("=")
-            if sep and k.strip() == tag:
-                return val.strip()
-            field = ""
-        else:
-            field += ch
-    k, sep, val = field.partition("=")
-    return val.strip() if sep and k.strip() == tag else ""
+# How a chain is put back together - reading tag 9604, what makes two rows one
+# order, and what quantity that order asked for - is scripts/lib/order_chains.
+# The luld report needs the same rule, and two copies of a rule drift.
 
 
 class Attempt(NamedTuple):
@@ -474,21 +439,7 @@ class Attempt(NamedTuple):
 
     @property
     def chain_key(self) -> tuple:
-        """What makes an order: the client's own id for it.
-
-        id_server is NOT in it - a trader can move an order to another order
-        server and it is still the same order, which is exactly the case a
-        server in the key would split back apart.
-
-        A target with no 9604 keys on its own server and id_target instead, so
-        it stands alone.  Grouping the un-tagged ones together would merge every
-        unrelated order the client did not label, which is the one mistake here
-        that would be invisible - and id_target alone is not unique across
-        servers, hence both.
-        """
-        if not self.client_id:
-            return (self.date, "", self.key[1], self.id_target)
-        return (self.date, self.client_id)
+        return chain_key(self.date, self.client_id, self.key[1], self.id_target)
 
 
 class Chain(NamedTuple):
@@ -595,21 +546,8 @@ def to_chains(attempts, qty=None, splits=()) -> list:
     for k, got in groups.items():
         got = sorted(got, key=lambda a: (a.seq, a.id_target))
         last = got[-1]
-        if qty == "asked":
-            #  every attempt's fills, plus whatever the last one still had left
-            #  to do.  A superseded attempt contributes only what it traded, so
-            #  a replacement is not counted twice; a top up contributes its
-            #  whole size, because it filled it.
-            done = [fills.get(a.key, 0) for a in got]
-            size = sum(done) + max(0, last.size - done[-1])
-        elif qty == "sum":
-            size = sum(a.size for a in got)
-        elif qty == "max":
-            size = max(a.size for a in got)
-        elif qty == "first":
-            size = got[0].size
-        else:
-            size = last.size
+        size = chain_size([a.size for a in got],
+                          [fills.get(a.key, 0) for a in got], qty)
         out.append(Chain(chain_key=k, date=last.date, country=last.country,
                          sym=last.sym, side=last.side, basket=last.basket,
                          algo=last.algo, client_id=last.client_id,
@@ -2097,7 +2035,7 @@ def main(argv=None) -> int:
     p.add_argument("--monthly", metavar="YYYY-MM")
     p.add_argument("--date", type=dt.date.fromisoformat, metavar="YYYY-MM-DD")
     p.add_argument("--chain-qty",
-                   choices=("asked", "sum", "max", "first", "last"),
+                   choices=QTY_CHOICES,
                    default=CHAIN_QTY,
                    help="what quantity a chain asked for. asked reads it off "
                         "the fills and cannot print over 100%%")

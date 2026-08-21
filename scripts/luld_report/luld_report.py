@@ -81,6 +81,8 @@ from typing import NamedTuple, Optional
 # `python scripts/luld_report/luld_report.py` from the repo root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from lib.order_chains import (                                   # noqa: E402
+    CLIENT_ID_TAG, DEFAULT_QTY, QTY_CHOICES, chain_key, chain_size, fix_tag)
 from lib.report_page import (                                    # noqa: E402
     BLUE, COL_W, DASH, GREEN, INK, INK2, INK3, L, R, RED,
     barchart, figure, fmt_hm, fmt_int, fmt_pct0, fmt_pct1, footer as _footer,
@@ -122,6 +124,10 @@ SMTP_PORT = 0                  # 0 -> 25
 SMTP_TIMEOUT = 30              # seconds
 
 EMAIL_DRY_RUN = False
+
+# What quantity a chain asked for - see scripts/lib/order_chains.  "asked"
+# reads it off the fills and is the only one that cannot print over 100%.
+CHAIN_QTY = DEFAULT_QTY
 
 # What the mail says.  Just this - the report is the attachment, and a body that
 # restates it is a second copy to keep in step and one more thing to render
@@ -203,7 +209,8 @@ TITLE = "Limit Up / Limit Down Order Report"
 Q_ORDERS = """
 {[hist;d;sfx]
   et:([] date:0#0Nd; id_server:0#0i; id_target:0#0i; sym:0#`; side:0#`;
-         sidesign:0#0i; size:0#0i; t_start:0#0Nt; t_end:0#0Nt; doclose:0#0i);
+         sidesign:0#0i; size:0#0i; t_start:0#0Nt; t_end:0#0Nt; doclose:0#0i;
+         fixmsg:0#`; basket:0#`; algo:0#`; time:0#0Nt);
   ew:([] date:0#0Nd; id_server:0#0i; id_work:0#0i; id_target:0#0i; make:0#0i;
          state:0#`; t_on_market:0#0Nt; t_off_market:0#0Nt);
 
@@ -211,10 +218,10 @@ Q_ORDERS = """
   / to a buyer, so neither side can be filtered away here.
   t:$[hist;
       select date,id_server,id_target,sym,side,sidesign,size,t_start,t_end,
-          doclose
+          doclose,fixmsg,basket,algo,time
         from target where date=d, any (upper sym) like/: sfx;
       update date:0Nd from select id_server,id_target,sym,side,sidesign,size,
-          t_start,t_end,doclose
+          t_start,t_end,doclose,fixmsg,basket,algo,time
         from target where any (upper sym) like/: sfx];
   if[0=count t; :(et;ew)];
 
@@ -423,8 +430,14 @@ def overlap(a0, a1, b0, b1):
     return (lo, hi) if hi > lo else None
 
 
-class Parent(NamedTuple):
-    key: tuple                 # (date, id_server, id_target) - unique per order
+class Attempt(NamedTuple):
+    """ONE TARGET ROW - one SEND of an order.
+
+    An order rejected and re-sent writes a new id_target, so several of these
+    can be one order.  What ties them together is the client's own id, FIX tag
+    9604 - see scripts/lib/order_chains.
+    """
+    key: tuple                 # (date, id_server, id_target) - one send
     date: Optional[dt.date]
     market: str
     sym: str
@@ -434,6 +447,56 @@ class Parent(NamedTuple):
     t_start: Optional[int]     # ms since midnight
     t_end: Optional[int]
     doclose: int
+    client_id: str             # tag 9604 - "" when the client sent none
+    basket: str
+    algo: str
+    id_target: int
+
+    @property
+    def chain_key(self) -> tuple:
+        return chain_key(self.date, self.client_id, self.key[1], self.id_target)
+
+
+class Chain(NamedTuple):
+    """ONE ORDER, however many times it was sent.
+
+    Its live window spans every attempt, and its splits are POOLED across them -
+    which is the whole point here.  Asking "was anything of ours on the book
+    during the limit" of a single attempt gives a false positive whenever a
+    SIBLING attempt was the one that traded.
+    """
+    chain_key: tuple
+    date: Optional[dt.date]
+    market: str
+    sym: str
+    side: str
+    sidesign: int
+    size: int
+    doclose: int
+    client_id: str
+    attempts: tuple
+
+    @property
+    def n(self) -> int:
+        return len(self.attempts)
+
+    @property
+    def keys(self) -> set:
+        return {a.key for a in self.attempts}
+
+    @property
+    def t_start(self) -> Optional[int]:
+        got = [a.t_start for a in self.attempts if a.t_start is not None]
+        return min(got) if got else None
+
+    @property
+    def t_end(self) -> Optional[int]:
+        got = [a.t_end for a in self.attempts if a.t_end is not None]
+        return max(got) if got else None
+
+    def disagrees_on(self) -> list:
+        return [f for f in ("sym", "side", "algo", "basket")
+                if len({getattr(a, f) for a in self.attempts}) > 1]
 
 
 class Split(NamedTuple):
@@ -463,7 +526,7 @@ class Pin(NamedTuple):
         return (self.end - self.start) / 60_000.0
 
 
-def to_parents(records) -> list:
+def to_attempts(records) -> list:
     out = []
     for r in records:
         sym = _s(r.get("sym"))
@@ -471,18 +534,67 @@ def to_parents(records) -> list:
         if market is None:
             continue
         d = _d(r.get("date"))
-        out.append(Parent(
-            key=(d, _i(r.get("id_server")), _i(r.get("id_target"))),
+        idt = _i(r.get("id_target"))
+        out.append(Attempt(
+            key=(d, _i(r.get("id_server")), idt),
             date=d, market=market, sym=sym, side=_s(r.get("side")),
             sidesign=_i(r.get("sidesign")), size=abs(_i(r.get("size"))),
             t_start=_ms(r.get("t_start")), t_end=_ms(r.get("t_end")),
-            doclose=_i(r.get("doclose"))))
+            doclose=_i(r.get("doclose")),
+            client_id=fix_tag(r.get("fixmsg")), basket=_s(r.get("basket")),
+            algo=_s(r.get("algo")), id_target=idt))
     return out
 
 
-def to_splits(records, parents) -> list:
-    """Workorder rows, keyed back onto the parents that survived."""
-    by_key = {p.key: p for p in parents}
+def attempt_fills(splits) -> dict:
+    """What each ATTEMPT executed, keyed on the target it belongs to."""
+    out = {}
+    for sp in splits:
+        out[sp.key] = out.get(sp.key, 0) + sp.make
+    return out
+
+
+def to_chains(attempts, qty=None, splits=()) -> list:
+    """Collapse attempts into orders on the client's id.
+
+    Ordered by (t_start, id_target) so "the last attempt" is the last one sent.
+    """
+    qty = qty or CHAIN_QTY
+    fills = attempt_fills(splits)
+    groups = {}
+    for a in attempts:
+        groups.setdefault(a.chain_key, []).append(a)
+
+    out = []
+    for k, got in groups.items():
+        got = sorted(got, key=lambda a: (a.t_start or 0, a.id_target))
+        last = got[-1]
+        size = chain_size([a.size for a in got],
+                          [fills.get(a.key, 0) for a in got], qty)
+        out.append(Chain(chain_key=k, date=last.date, market=last.market,
+                         sym=last.sym, side=last.side, sidesign=last.sidesign,
+                         size=size,
+                         #  close-only only excuses the order if EVERY attempt
+                         #  was close-only; one working attempt is a working
+                         #  order
+                         doclose=1 if all(a.doclose for a in got) else 0,
+                         client_id=last.client_id, attempts=tuple(got)))
+    return sorted(out, key=lambda c: (c.attempts[0].t_start or 0,
+                                      c.attempts[0].id_target))
+
+
+def to_splits(records, owners) -> list:
+    """Workorder rows, keyed back onto the orders that survived.
+
+    owners may be ATTEMPTS or CHAINS - a chain flattens to its attempts, since a
+    workorder belongs to one send.  Taking either is deliberate: every caller
+    has one or the other in hand, and making them convert is how a chain's
+    sibling attempts get dropped by accident.
+    """
+    att = []
+    for o in owners:
+        att.extend(o.attempts if hasattr(o, "attempts") else [o])
+    by_key = {a.key: a for a in att}
     out = []
     for r in records:
         key = (_d(r.get("date")), _i(r.get("id_server")), _i(r.get("id_target")))
@@ -521,6 +633,95 @@ def to_pins(records, d=None) -> list:
 # WHICH ORDERS THE LIMIT TOUCHED
 # =============================================================================
 
+class ChainStats(NamedTuple):
+    attempts: int
+    chains: int
+    multi: int
+    longest: int
+    no_id: int
+    no_id_by_market: dict
+    mixed: list                # chains disagreeing on sym/side/algo/basket
+    over: list                 # [(chain, executed)] filling more than they asked
+
+
+def chain_stats(attempts, chains, splits) -> ChainStats:
+    """What the run should say about its own assumptions.
+
+    `mixed` means one 9604 covered more than one order and the numbers are
+    wrong; `over` means a chain executed more than it asked for, which under
+    CHAIN_QTY="asked" should be impossible.
+    """
+    no_id = [a for a in attempts if not a.client_id]
+    by_mkt = {}
+    for a in no_id:
+        by_mkt[a.market] = by_mkt.get(a.market, 0) + 1
+    made = {}
+    for sp in splits:
+        made[sp.key] = made.get(sp.key, 0) + sp.make
+    over = []
+    for c in chains:
+        ex = sum(made.get(k, 0) for k in c.keys)
+        if c.size > 0 and ex > c.size:
+            over.append((c, ex))
+    return ChainStats(
+        attempts=len(attempts), chains=len(chains),
+        multi=sum(1 for c in chains if c.n > 1),
+        longest=max([c.n for c in chains], default=0),
+        no_id=len(no_id), no_id_by_market=by_mkt,
+        mixed=[c for c in chains if c.disagrees_on()], over=over)
+
+
+def report_chains(st: ChainStats) -> None:
+    log(f"  chains: {st.attempts:,} targets -> {st.chains:,} order"
+        f"{'' if st.chains == 1 else 's'} "
+        f"({st.multi:,} chained, longest {st.longest})")
+    if st.no_id == st.attempts and st.attempts:
+        log(f"  WARNING: NOT ONE of {st.attempts:,} targets carries tag "
+            f"{CLIENT_ID_TAG}. Either the client sends none, or fixmsg uses a "
+            f"separator fix_tag does not know - nothing has been chained")
+    elif st.no_id:
+        worst = ", ".join(f"{k} {v:,}" for k, v in
+                          sorted(st.no_id_by_market.items(),
+                                 key=lambda kv: -kv[1]))
+        log(f"  {st.no_id:,} of {st.attempts:,} targets "
+            f"({100.0 * st.no_id / max(st.attempts, 1):.1f}%) carry no tag "
+            f"{CLIENT_ID_TAG} and stand alone: {worst}")
+    if st.mixed:
+        fields = sorted({f for c in st.mixed for f in c.disagrees_on()})
+        log(f"  WARNING: {len(st.mixed):,} chains disagree on "
+            f"{', '.join(fields)} - a {CLIENT_ID_TAG} is covering more than "
+            f"one order and these numbers are WRONG")
+    if st.over:
+        log(f"  WARNING: {len(st.over):,} chains executed MORE than the "
+            f"quantity taken for them; they have been UN-CHAINED and counted "
+            f"one order per target:")
+        for c, ex in st.over[:5]:
+            log(f"      {CLIENT_ID_TAG}={c.client_id or '(none)'}  {c.sym}  "
+                f"qty {c.size:,}  executed {ex:,}")
+
+
+def unchain(chains, over) -> list:
+    """Explode the over-filled chains back into one order per attempt.
+
+    Whatever grouped them was wrong, and one order per target is what counting
+    targets would have said - defensible even when it is not ideal, and better
+    than a completion over 100% on the page.
+    """
+    bad = {c.chain_key for c, _ex in over}
+    out = [c for c in chains if c.chain_key not in bad]
+    for c in chains:
+        if c.chain_key not in bad:
+            continue
+        for a in c.attempts:
+            out.append(Chain(chain_key=(a.date, "", a.key[1], a.id_target),
+                             date=a.date, market=a.market, sym=a.sym,
+                             side=a.side, sidesign=a.sidesign, size=a.size,
+                             doclose=a.doclose, client_id=a.client_id,
+                             attempts=(a,)))
+    return sorted(out, key=lambda c: (c.attempts[0].t_start or 0,
+                                      c.attempts[0].id_target))
+
+
 def pins_by_sym(pins) -> dict:
     out = {}
     for p in pins:
@@ -528,22 +729,23 @@ def pins_by_sym(pins) -> dict:
     return out
 
 
-def touched(parents, pins) -> tuple:
-    """(parents the limit touched, {parent key: [its overlapping pins]}).
+def touched(chains, pins) -> tuple:
+    """(chains the limit touched, {chain key: [its overlapping pins]}).
 
-    Touched means a limit period on that stock overlapped the order's own live
-    window.  An order that finished before the stock went limit is not a LULD
-    order, however dramatic the stock's afternoon was.
+    Touched means a limit period on that stock overlapped the ORDER's live
+    window - which for a chain spans every attempt, first send to last end.  An
+    order that finished before the stock went limit is not a LULD order,
+    however dramatic the stock's afternoon was.
     """
     index = pins_by_sym(pins)
     keep, hits = [], {}
-    for p in parents:
-        got = [w for w in index.get((p.date, p.sym), ())
-               if overlap(p.t_start, p.t_end, w.start, w.end)]
+    for c in chains:
+        got = [w for w in index.get((c.date, c.sym), ())
+               if overlap(c.t_start, c.t_end, w.start, w.end)]
         if not got:
             continue
-        keep.append(p)
-        hits[p.key] = got
+        keep.append(c)
+        hits[c.chain_key] = got
     return keep, hits
 
 
@@ -590,7 +792,7 @@ class Totals(NamedTuple):
     completion: Optional[float]
 
 
-def by_market(parents, splits) -> list:
+def by_market(chains, splits) -> list:
     """One Row per market, always all eight, always in MARKETS order.
 
     Plain counts and plain sums over rows the query returned as they stand.
@@ -599,9 +801,9 @@ def by_market(parents, splits) -> list:
     qty = {c: 0 for c in MARKET_CODES}
     made = {c: 0 for c in MARKET_CODES}
     rej = {c: 0 for c in MARKET_CODES}
-    for p in parents:
-        orders[p.market] += 1
-        qty[p.market] += p.size
+    for c in chains:
+        orders[c.market] += 1
+        qty[c.market] += c.size
     for s in splits:
         made[s.market] += s.make
         if s.rejected:
@@ -610,19 +812,19 @@ def by_market(parents, splits) -> list:
                 made[m.code], rej[m.code]) for m in MARKETS]
 
 
-def by_day(parents, splits) -> list:
+def by_day(chains, splits) -> list:
     """One DayRow per date that carried LULD flow, in date order."""
     days = {}
 
     def slot(d):
         return days.setdefault(d, [0, 0, 0, 0])
 
-    for p in parents:
-        if p.date is None:
+    for c in chains:
+        if c.date is None:
             continue
-        e = slot(p.date)
+        e = slot(c.date)
         e[0] += 1
-        e[1] += p.size
+        e[1] += c.size
     for s in splits:
         if s.date is None:
             continue
@@ -655,12 +857,13 @@ def totals(rows) -> Totals:
 # =============================================================================
 
 class Missed(NamedTuple):
-    parent: Parent
+    parent: Chain              # the ORDER, all its attempts pooled
     pin: Pin
     window: tuple              # (start, end) of the overlap, ms
     executed: int
     splits_total: int
     windows_qualifying: int
+    attempts: int              # how many times the order was sent
 
     @property
     def unfilled(self) -> int:
@@ -693,20 +896,24 @@ def split_active(s: Split, w0: int, w1: int) -> bool:
     return overlap(s.on_market, s.off_market, w0, w1) is not None
 
 
-def missed_opportunities(parents, splits, hits, min_mins=MIN_PIN_MINS) -> list:
+def missed_opportunities(chains, splits, hits, min_mins=MIN_PIN_MINS) -> list:
     """Orders where the limit was on our side and nothing was on the book.
+
+    SPLITS ARE POOLED ACROSS THE CHAIN.  Asking this of a single attempt gives a
+    false positive whenever a SIBLING attempt was the one resting on the book -
+    a finding pointing at nothing, which is worse than no finding.
 
     One row per ORDER, taking its longest qualifying limit period - an order
     that missed three windows is one conversation, not three, and the count of
     the others rides along on the row.
     """
-    by_parent = {}
+    by_key = {}
     for s in splits:
-        by_parent.setdefault(s.key, []).append(s)
+        by_key.setdefault(s.key, []).append(s)
 
     out = []
-    for p in parents:
-        kids = by_parent.get(p.key, ())
+    for p in chains:
+        kids = [s for k in p.keys for s in by_key.get(k, ())]
         executed = sum(s.make for s in kids)
         unfilled = p.size - executed
         if unfilled <= 0:
@@ -718,7 +925,7 @@ def missed_opportunities(parents, splits, hits, min_mins=MIN_PIN_MINS) -> list:
             continue
 
         qualifying = []
-        for w in hits.get(p.key, ()):
+        for w in hits.get(p.chain_key, ()):
             if not is_favourable(p.sidesign, w.side):
                 continue
             ov = overlap(p.t_start, p.t_end, w.start, w.end)
@@ -732,7 +939,8 @@ def missed_opportunities(parents, splits, hits, min_mins=MIN_PIN_MINS) -> list:
         w, ov = max(qualifying, key=lambda q: q[1][1] - q[1][0])
         out.append(Missed(parent=p, pin=w, window=ov, executed=executed,
                           splits_total=len(kids),
-                          windows_qualifying=len(qualifying)))
+                          windows_qualifying=len(qualifying),
+                          attempts=p.n))
     # biggest missed quantity first - the page is read from the top.  Unfilled
     # is no longer a column, but it is order qty times one minus completion, so
     # the order is still readable off the two that are.
@@ -1060,35 +1268,49 @@ def run(args) -> int:
     oh = connect(pl.order_server)
     qh = connect(pl.qatt_server)
 
-    parents, splits, missed, traded, seen = [], [], [], 0, 0
-    no_pin_days = 0
+    chains, splits, missed, traded, seen = [], [], [], 0, 0
+    all_attempts, no_pin_days = [], 0
     for d in pl.dates:
         if not args.quiet and d is not None:
             log(f"  {d} ...")
         pr, wr = fetch_orders(oh, pl.hist, d)
-        ps = to_parents(pr)
-        if not ps:
+        att = to_attempts(pr)
+        if not att:
             continue
-        seen += len(ps)
-        syms = sorted({p.sym for p in ps})
+        seen += len(att)
+        all_attempts.extend(att)
+        #  the splits come first: "asked" reads the chain's quantity off them
+        ws_all = to_splits(wr, att)
+        chs = to_chains(att, args.chain_qty, ws_all)
+
+        syms = sorted({c.sym for c in chs})
         pins = to_pins(fetch_pins(qh, pl.hist, d, syms), d)
         if not pins:
-            #  a day of short sell flow with NO limit period anywhere is
-            #  possible, but a run of them means the quote query is matching
-            #  nothing rather than the market being calm
+            #  a day with NO limit period anywhere is possible, but a run of
+            #  them means the quote query is matching nothing rather than the
+            #  market being calm
             no_pin_days += 1
-        kept, hits = touched(ps, pins)
+        kept, hits = touched(chs, pins)
         if not kept:
             continue
         traded += 1
-        ws = to_splits(wr, kept)
-        parents.extend(kept)
+        keys = {k for c in kept for k in c.keys}
+        ws = [x for x in ws_all if x.key in keys]
+        chains.extend(kept)
         splits.extend(ws)
         missed.extend(missed_opportunities(kept, ws, hits, args.min_mins))
 
-    rows = by_market(parents, splits)
+    st = chain_stats(all_attempts, chains, splits)
+    if st.over and not args.keep_over:
+        chains = unchain(chains, st.over)
+        missed = [m for m in missed
+                  if m.parent.chain_key not in {c.chain_key
+                                                for c, _e in st.over}]
+    report_chains(st)
+
+    rows = by_market(chains, splits)
     tot = totals(rows)
-    days = by_day(parents, splits) if pl.monthly else None
+    days = by_day(chains, splits) if pl.monthly else None
     missed.sort(key=lambda m: (m.unfilled, m.minutes), reverse=True)
 
     log(f"  {seen:,} orders in scope, {tot.orders:,} of them touched a limit, "
@@ -1128,14 +1350,30 @@ DEMO_STAMP = "SAMPLE - synthetic data, not from kdb"
 
 
 def _p(idt, market, size, sidesign=-1, d=None, srv=1, sym=None,
-       t_start=9 * 3_600_000 + 1_800_000, t_end=15 * 3_600_000, doclose=0):
+       t_start=9 * 3_600_000 + 1_800_000, t_end=15 * 3_600_000, doclose=0,
+       cid=None, basket="B1", algo="vwap"):
+    """One TARGET row - one SEND.  cid goes into fixmsg as tag 9604 the way the
+    client really sends it, so the fixture exercises the parse too.  Default is
+    an id of its own, i.e. an order sent once."""
     sfx = dict((m.code, m.suffixes[0]) for m in MARKETS).get(market,
                                                              "." + market)
+    cid = f"CLI-{idt}" if cid is None else cid
+    fix = "8=FIX.4.2;35=D;9012=274=1^275=1;"
+    if cid:
+        fix += f"{CLIENT_ID_TAG}={cid};"
     return {"date": d, "id_server": srv, "id_target": idt,
             "sym": sym or f"{1000 + idt}{sfx}",
             "side": "sell" if sidesign < 0 else "buy", "sidesign": sidesign,
             "size": size, "t_start": dt.timedelta(milliseconds=t_start),
-            "t_end": dt.timedelta(milliseconds=t_end), "doclose": doclose}
+            "t_end": dt.timedelta(milliseconds=t_end), "doclose": doclose,
+            "fixmsg": fix + "59=0", "basket": basket, "algo": algo,
+            "time": dt.timedelta(milliseconds=t_start)}
+
+
+def _chain(records, splits=()):
+    """attempts -> chains, the way run() does it."""
+    att = to_attempts(records)
+    return att, to_chains(att, CHAIN_QTY, splits)
 
 
 def _w(idw, idt, make, state, on=None, off=None, d=None, srv=1):
@@ -1183,22 +1421,37 @@ def demo_session(d=None):
             for j in range(rejects if i < rejects else 0):
                 wr.append(_w(500_000 + k * 4 + j, k, 0, "rejected",
                              on=start, off=start + 1000, d=d))
-    parents = to_parents(pr)
-    kept, hits = touched(parents, to_pins(pins, d))
-    splits = to_splits(wr, kept)
+    #  a Japanese order sent three times under ONE client id, rejected twice
+    #  and cancelled - what the chaining is for
+    for k, idt in enumerate((90_001, 90_002, 90_003)):
+        pr.append(_p(idt, "JP", 40_000, sidesign=-1, cid="CLI-REPLACED", d=d,
+                     t_start=10 * H + k * 600_000, t_end=15 * H))
+        wr.append(_w(idt, idt, 0, "rejected" if k < 2 else "cxl",
+                     on=None, off=None, d=d))
+    pins.append(_pin(pr[-1]["sym"], 12 * H, 13 * H, price=1234.0, d=d))
+
+    attempts = to_attempts(pr)
+    ws_all = to_splits(wr, attempts)
+    chs = to_chains(attempts, CHAIN_QTY, ws_all)
+    kept, hits = touched(chs, to_pins(pins, d))
+    keys = {k for c in kept for k in c.keys}
+    splits = [x for x in ws_all if x.key in keys]
     return kept, splits, hits, missed_opportunities(kept, splits, hits)
 
 
 def demo_month(year=2026, month=7):
-    parents, splits, missed = [], [], []
+    chains, splits, missed = [], [], []
     for i, d in enumerate(month_dates(year, month)):
         p, w, _h, m = demo_session(d)
-        take = 4 + (i * 5) % 30
-        parents.extend(p[:take])
-        keys = {x.key for x in p[:take]}
-        splits.extend([s for s in w if s.key in keys])
-        missed.extend([x for x in m if x.parent.key in keys])
-    return parents, splits, missed
+        keep = p[:4 + (i * 5) % 30]
+        #  two different keys are in play and mixing them silently loses every
+        #  finding: splits belong to an ATTEMPT, a finding to a CHAIN
+        att_keys = {k for c in keep for k in c.keys}
+        chain_keys = {c.chain_key for c in keep}
+        chains.extend(keep)
+        splits.extend([s for s in w if s.key in att_keys])
+        missed.extend([x for x in m if x.parent.chain_key in chain_keys])
+    return chains, splits, missed
 
 
 def demo(out_dir) -> int:
@@ -1353,22 +1606,67 @@ def self_test() -> int:
           split_active(_split(on=None, off=None), w0, w1), False)
 
     print("\nwhich orders the limit touched")
-    p1 = to_parents([_p(1, "JP", 1000, t_start=9 * H, t_end=15 * H),
-                     _p(2, "JP", 1000, t_start=9 * H, t_end=10 * H)])
+    p1 = to_chains(to_attempts(
+        [_p(1, "JP", 1000, t_start=9 * H, t_end=15 * H),
+         _p(2, "JP", 1000, t_start=9 * H, t_end=10 * H)]))
     pins = to_pins([_pin(p1[0].sym, 11 * H, 12 * H),
                     _pin(p1[1].sym, 11 * H, 12 * H)])
     kept, hits = touched(p1, pins)
     check("an order live through the limit is in",
-          [p.key[2] for p in kept], [1])
+          [c.attempts[0].id_target for c in kept], [1])
     check("one that finished before it is not", len(kept), 1)
-    check("and the window is carried with it", len(hits[kept[0].key]), 1)
+    check("and the window is carried with it",
+          len(hits[kept[0].chain_key]), 1)
     check("a stock with no limit period at all brings nothing",
           len(touched(p1, [])[0]), 0)
 
+    print("\nchaining a replaced order")
+    #  one order, sent three times under one client id, live 09:00-15:00
+    rep_recs = [_p(i, "JP", 1000, cid="CLI-R", t_start=(9 + i) * H,
+                   t_end=15 * H) for i in (1, 2, 3)]
+    ra = to_attempts(rep_recs)
+    rc = to_chains(ra, "asked", [])
+    check("three targets", len(ra), 3)
+    check("one order", len(rc), 1)
+    check("counted once, not three times", rc[0].size, 1000)
+    check("its window spans every attempt",
+          (rc[0].t_start, rc[0].t_end), (10 * H, 15 * H))
+    check("counting targets would have said 3 orders and 3000",
+          (len(ra), sum(a.size for a in ra)), (3, 3000))
+    check("a target with no 9604 stands alone",
+          len(to_chains(to_attempts(
+              [_p(1, "JP", 100, cid=""), _p(2, "JP", 100, cid="")]))), 2)
+
+    print("\nsplits are pooled across the chain")
+    #  THE FALSE POSITIVE THIS PREVENTS.  The order is re-sent during a limit;
+    #  the SECOND attempt rests on the book through it.  Looking at attempt one
+    #  alone, nothing of ours was there - which is not true of the ORDER.
+    #  the SAME sym on both sends - a replaced order keeps its stock, and a
+    #  chain whose attempts disagree on sym would be flagged as mixed
+    fp = [_p(1, "JP", 1000, sidesign=-1, cid="CLI-F", sym="6103.JP",
+             t_start=9 * H, t_end=11 * H + 600_000),
+          _p(2, "JP", 1000, sidesign=-1, cid="CLI-F", sym="6103.JP",
+             t_start=11 * H + 600_000, t_end=15 * H)]
+    fa = to_attempts(fp)
+    fsp = to_splits([_w(9, 2, 400, "filled", on=11 * H, off=13 * H)], fa)
+    fc = to_chains(fa, "asked", fsp)
+    fk, fh = touched(fc, to_pins([_pin(fa[0].sym, 11 * H, 12 * H)]))
+    check("the order is one chain", len(fc), 1)
+    check("its attempts agree on everything", fc[0].disagrees_on(), [])
+    check("and the limit touched it", len(fk), 1)
+    check("nothing is reported: a SIBLING attempt was on the book",
+          len(missed_opportunities(fk, fsp, fh)), 0)
+    #  the same data, un-chained, is the false positive
+    ua = to_chains(fa, "asked", fsp)
+    ua = unchain(ua, [(ua[0], 0)])
+    uk, uh = touched(ua, to_pins([_pin(fa[0].sym, 11 * H, 12 * H)]))
+    check("un-chained, the first send looks like it sent nothing",
+          len(missed_opportunities(uk, fsp, uh)), 1)
+
     print("\nfavourable, no split")
     #  one seller, stock limit UP 11:00-12:00, order live all day, 1000 to do
-    par = to_parents([_p(1, "JP", 1000, sidesign=-1, t_start=9 * H,
-                         t_end=15 * H)])
+    par = to_chains(to_attempts([_p(1, "JP", 1000, sidesign=-1,
+                                    t_start=9 * H, t_end=15 * H)]))
     pin = to_pins([_pin(par[0].sym, 11 * H, 12 * H, price=2500.0)])
     kept, hits = touched(par, pin)
 
@@ -1414,8 +1712,9 @@ def self_test() -> int:
           len(missed_opportunities(k3, [], h3, min_mins=0.5)), 1)
 
     #  close-only
-    co = to_parents([_p(1, "JP", 1000, sidesign=-1, t_start=14 * H,
-                        t_end=14 * H + 600_000, doclose=1)])
+    co = to_chains(to_attempts([_p(1, "JP", 1000, sidesign=-1,
+                                   t_start=14 * H, t_end=14 * H + 600_000,
+                                   doclose=1)]))
     cp = to_pins([_pin(co[0].sym, 14 * H, 14 * H + 600_000)])
     k4, h4 = touched(co, cp)
     check("a short close-only order is doing what it was told",
@@ -1430,6 +1729,34 @@ def self_test() -> int:
     check("one row per order, not per window", len(m5), 1)
     check("and it is the longest window", round(m5[0].minutes), 120)
     check("with the others counted", m5[0].windows_qualifying, 3)
+
+    print("\nthe chain diagnostics")
+    dsp = to_splits([_w(1, 1, 0, "rejected")], ra)
+    st = chain_stats(ra, rc, dsp)
+    check("it counts the sends and the orders", (st.attempts, st.chains), (3, 1))
+    check("and how many collapsed", st.multi, 1)
+    check("nothing untagged in this fixture", st.no_id, 0)
+    ua2 = to_attempts([_p(1, "JP", 100, cid=""), _p(2, "TH", 100, cid="")])
+    check("untagged targets are counted per market",
+          chain_stats(ua2, to_chains(ua2), []).no_id_by_market,
+          {"JP": 1, "TH": 1})
+    mx = to_attempts([_p(1, "JP", 100, cid="CLI-M", algo="vwap"),
+                      _p(2, "JP", 100, cid="CLI-M", algo="twap")])
+    check("one id over two algos is REPORTED, not absorbed",
+          len(chain_stats(mx, to_chains(mx), []).mixed), 1)
+    ov = to_attempts([_p(1, "JP", 100, cid="CLI-O", t_start=9 * H),
+                      _p(2, "JP", 100, cid="CLI-O", t_start=10 * H)])
+    ovsp = to_splits([_w(1, 1, 80, "filled"), _w(2, 2, 80, "filled")], ov)
+    ovc = to_chains(ov, "max", ovsp)
+    ovst = chain_stats(ov, ovc, ovsp)
+    check("a chain filling more than it asked for is caught",
+          len(ovst.over), 1)
+    check("and un-chaining puts it back to one order per target",
+          len(unchain(ovc, ovst.over)), 2)
+    check("after which nothing over fills",
+          len(chain_stats(ov, unchain(ovc, ovst.over), ovsp).over), 0)
+    check("asked would not have over filled in the first place",
+          len(chain_stats(ov, to_chains(ov, "asked", ovsp), ovsp).over), 0)
 
     print("\nrollups")
     rows = by_market(kept, to_splits([_w(1, 1, 400, "filled"),
@@ -1514,6 +1841,10 @@ def self_test() -> int:
     check("page one renders", buf.getvalue()[:5], b"%PDF-")
 
     mp, msp, mm = demo_month()
+    check("the monthly demo keeps its findings - the two key kinds are not "
+          "mixed", len(mm) > 0, True)
+    check("and every one belongs to a chain that was kept",
+          {x.parent.chain_key for x in mm} <= {c.chain_key for c in mp}, True)
     figs_m = pages_for(by_market(mp, msp), totals(by_market(mp, msp)), mm,
                        "x", "y", by_day(mp, msp))
     check("the monthly report adds the day charts page", len(figs_m) >= 3, True)
@@ -1608,6 +1939,12 @@ def main(argv=None) -> int:
     p.add_argument("--min-mins", type=float, default=MIN_PIN_MINS,
                    help="how long a favourable limit must overlap an order "
                         "before not trading into it is worth reporting")
+    p.add_argument("--chain-qty", choices=QTY_CHOICES, default=CHAIN_QTY,
+                   help="what quantity a chain asked for. asked reads it off "
+                        "the fills and cannot print over 100%%")
+    p.add_argument("--keep-over", action="store_true",
+                   help="do NOT un-chain the orders that execute more than "
+                        "they asked for")
     p.add_argument("--out-dir", default=str(OUT_DIR),
                    help="where the .pdf and .png are written")
     p.add_argument("--quiet", action="store_true", help="no per date progress")
