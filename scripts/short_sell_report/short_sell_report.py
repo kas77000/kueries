@@ -5,10 +5,10 @@ short_sell_report.py
 
 The Short-Sell Order Report, counting a REPLACED ORDER ONCE.
 
-  python scripts/short_sell_report_v2/short_sell_report.py
-  python scripts/short_sell_report_v2/short_sell_report.py --compare
-  python scripts/short_sell_report_v2/short_sell_report.py --chains
-  python scripts/short_sell_report_v2/short_sell_report.py --self-test
+  python scripts/short_sell_report/short_sell_report.py
+  python scripts/short_sell_report/short_sell_report.py --compare
+  python scripts/short_sell_report/short_sell_report.py --chains
+  python scripts/short_sell_report/short_sell_report.py --self-test
 
 THE PROBLEM.  When an order is rejected and re-sent, the engine writes a NEW
 id_target.  counting target rows, so one economic order becomes several and
@@ -148,7 +148,7 @@ EMAIL_SIGNATURE = "Best Regards,\n\nKhalife"
 # all the same KIND of thing:
 #
 #   a REPLACEMENT supersedes the one before it.  Three sends of 27m that never
-#     traded are one 27m order, not 81m - that is the whole reason v2 exists.
+#     traded are one 27m order, not 81m - that is the whole reason the chaining exists.
 #   a TOP UP is extra quantity on an order that already finished.  Sizes
 #     900, 1700, 2500 filling 3,600 in total are 5,100 asked for, not 2,500.
 #
@@ -793,7 +793,7 @@ def report_unchained(over, still=()) -> None:
         return
     n = sum(c.n for c, _made in over)
     log(f"  {len(over):,} chain{'' if len(over) == 1 else 's'} above have been "
-        f"UN-CHAINED into their {n:,} targets and counted the way v1 counts "
+        f"UN-CHAINED into their {n:,} targets and counted the way counting targets would "
         f"them, so the page does not read over 100%. Those are the ones to "
         f"look at with --chains")
     if still:
@@ -1015,12 +1015,14 @@ def _pct(v) -> str:
 
 
 def compare_lines(v1_rows, v2_rows) -> list:
-    """v1 beside v2, per market and in total.  One fetch, two rollups, so any
-    difference is the counting and nothing else."""
+    """The old per-TARGET counting beside the chained per-ORDER one, per
+    market and in total.  One fetch, two rollups, so any difference is the
+    counting and nothing else."""
     t1, t2 = totals(v1_rows), totals(v2_rows)
     out = [
         f"{'':<12}{'orders':>18}{'order qty':>28}{'completion':>22}",
-        f"{'':<12}{'v1':>8}{'v2':>10}{'v1':>14}{'v2':>14}{'v1':>11}{'v2':>11}",
+        f"{'counted per':<12}{'target':>8}{'order':>10}{'target':>14}"
+        f"{'order':>14}{'target':>11}{'order':>11}",
         "-" * 80,
     ]
     for a, b in zip(v1_rows, v2_rows):
@@ -1133,13 +1135,7 @@ def _sorted_pairs(rows, key):
 
 
 def draw(rows, tot, subtitle, footer, days=None):
-    """The whole page.  Pure: takes rollups, returns a figure.
-
-    short_sell_report_v2 draws on this too, and reaches the title through the
-    TITLE global rather than through an argument - this file is the one that
-    gets EDITED for the servers and the mail, so a copy of it in the wild is
-    often not the copy in git, and v2 must not need a particular signature.
-    """
+    """The whole page.  Pure: takes rollups, returns a figure."""
     monthly = days is not None
 
     fig = figure()
@@ -1213,7 +1209,13 @@ def _mailer():
     return mailer
 
 def _cfg(name, default):
-    return getattr(v1, name, default)
+    """A setting, or its default.
+
+    Reads the module globals rather than naming each constant, so a
+    local_settings.py that overrides one is picked up without this having to
+    know which.
+    """
+    return globals().get(name, default)
 
 
 def email_configured() -> bool:
@@ -1234,7 +1236,7 @@ def mail_report(when, files) -> None:
         raise SystemExit("nothing to attach: no PDF was written")
 
     msg = m.build_message(m.Mail(
-        subject=f"{TITLE} v2 - {when}", sender=sender,
+        subject=f"{TITLE} - {when}", sender=sender,
         to=_cfg("EMAIL_TO", []), cc=_cfg("EMAIL_CC", []),
         bcc=_cfg("EMAIL_BCC", []),
         text=_cfg("EMAIL_SIGNATURE", "Best Regards,"),
@@ -1331,7 +1333,7 @@ def plan(monthly=None, date=None, now=None) -> Plan:
 def run(args) -> int:
     pl = plan(args.monthly, args.date)
     _check_server(pl.endpoint, pl.endpoint_name)
-    log(f"short_sell_report_v2  {'historical' if pl.hist else 'realtime'}  "
+    log(f"short_sell_report  {'historical' if pl.hist else 'realtime'}  "
         f"{pl.endpoint}")
     h = connect(pl.endpoint)
 
@@ -1387,8 +1389,7 @@ def run(args) -> int:
         foot += f"  ·  {dropped:,} restricted JP excluded"
 
     fig = draw(rows, tot, subtitle, foot, days)
-    files = save(fig, Path(args.out_dir), pl.stem.replace(
-        "short_sell_report", "short_sell_report_v2"))
+    files = save(fig, Path(args.out_dir), pl.stem)
     if email_configured():
         mail_report(pl.when, files)
     return 0
@@ -1633,7 +1634,7 @@ def self_test() -> int:
     check("two untagged targets do NOT become one order", len(bc), 3)
     check("each keeps its own quantity",
           sorted(c.size for c in bc), [100, 300, 700])
-    check("which is exactly what v1 would have said",
+    check("which is exactly what counting targets would have said",
           sum(c.size for c in bc), 1100)
 
     print("\nwhich attempt sets the quantity")
@@ -1685,7 +1686,7 @@ def self_test() -> int:
     rsp = to_splits([], rep)
     check("asked counts a rejected-and-replaced order ONCE",
           to_chains(rep, "asked", rsp)[0].size, 27_000_000)
-    check("sum puts it straight back to v1's 81m",
+    check("sum puts it straight back to the un-chained 81m",
           to_chains(rep, "sum", rsp)[0].size, 81_000_000)
     check("max is right here", to_chains(rep, "max", rsp)[0].size, 27_000_000)
     check("so only asked is right in BOTH",
@@ -1763,7 +1764,7 @@ def self_test() -> int:
     check("un-chaining turns it back into its targets", len(un), 2)
     check("each with its own size", sorted(c.size for c in un), [100, 100])
     check("and nothing reads over 100% any more", over_filled(un, osp), [])
-    check("which is exactly what v1 would have said",
+    check("which is exactly what counting targets would have said",
           sum(c.size for c in un), sum(a.size for a in odd))
     check("a chain that is fine is left alone",
           len(unchain(to_chains(top, "asked", tsp), [])), 1)
@@ -1944,7 +1945,7 @@ def self_test() -> int:
 
     v1_rows = by_market_targets(att2, sp)
     v1_th = [r for r in v1_rows if r.code == "TH"][0]
-    check("v1 over the same data still says three orders", v1_th.orders, 3)
+    check("counting targets over the same data still says three orders", v1_th.orders, 3)
     check("and 81m", v1_th.order_qty, 81_000_000)
     check("with the same rejections - that is the whole point",
           v1_th.rejections, th.rejections)
@@ -2037,9 +2038,10 @@ def self_test() -> int:
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
-        description="Short-Sell Order Report v2 - the same report, counting a "
-                    "rejected-and-replaced order once. Servers and email are "
-                    "configured in short_sell_report.py, which this imports.",
+        description="Short-Sell Order Report - completion and rejections by "
+                    "market, counting a rejected-and-replaced order ONCE. "
+                    "Servers and email are configured in the blocks at the top "
+                    "of this file, or in a local_settings.py beside it.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--monthly", metavar="YYYY-MM")
     p.add_argument("--date", type=dt.date.fromisoformat, metavar="YYYY-MM-DD")
@@ -2053,8 +2055,9 @@ def main(argv=None) -> int:
                         "than they asked for - leave them chained, and let the "
                         "page read over 100%%")
     p.add_argument("--compare", action="store_true",
-                   help="print v1 and v2 side by side over ONE fetch and exit, "
-                        "so any difference is the counting and nothing else")
+                   help="print the old per-TARGET counting beside the "
+                        "chained per-ORDER one over ONE fetch and exit, so any "
+                        "difference is the counting and nothing else")
     p.add_argument("--chains", action="store_true",
                    help="list the chained orders and their attempts, and exit "
                         "- the way to check tag 9604 against the engine")
