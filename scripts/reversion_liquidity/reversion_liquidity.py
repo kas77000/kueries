@@ -167,6 +167,7 @@ VENUE_GROUPS = {
     # the published pie labels this slice Ctrpnt; the sheet says CentrePt
     # and the sheet is what we follow
     ("AU", "CENTREPOINT_CITI_DARK"): ("Centrepoint", "CentrePt"),
+    ("AU", "CENTREPOINT_RBC_DARK"): ("Centrepoint", "CentrePt"),
     ("AU", "CENTREPOINT_DARK"):      ("Centrepoint", "CentrePt"),
     ("AU", "CLSA_DARK"):             ("CLSA",        "CLSA"),
     ("AU", "JPMAP_MF_DARK"):         ("JPMX",        "JPMX"),
@@ -178,7 +179,7 @@ VENUE_GROUPS = {
     ("AU", "ITGBD_DARKFRM"):         ("VIRTU Cond",  "VIRTU Cond"),
     ("AU", "LNAL_DARK"):             ("LNAL",        "Liqnet"),
     ("AU", "LIQH_DARK"):             ("LNAL Cond",   "Liqnet Cond"),
-    ("AU", "LIQUID_DRKFRM"):         ("LNAL Cond",   "Liqnet Cond"),
+    ("AU", "LIQUID_DARKFRM"):         ("LNAL Cond",   "Liqnet Cond"),
     ("AU", "CBOE_RBC_DARK"):         ("CBOE",        "CBOE"),
     ("AU", "CRAIGS_NZX_DARK"):       ("CRAIGS",      "CRAIGS"),
 }

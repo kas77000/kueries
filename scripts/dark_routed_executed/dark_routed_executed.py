@@ -150,6 +150,7 @@ VENUE_GROUPS = {
     # the published pie labels this slice Ctrpnt; the sheet says CentrePt
     # and the sheet is what we follow
     ("AU", "CENTREPOINT_CITI_DARK"): ("Centrepoint", "CentrePt"),
+    ("AU", "CENTREPOINT_RBC_DARK"): ("Centrepoint", "CentrePt"),
     ("AU", "CENTREPOINT_DARK"):      ("Centrepoint", "CentrePt"),
     ("AU", "CLSA_DARK"):             ("CLSA",        "CLSA"),
     ("AU", "JPMAP_MF_DARK"):         ("JPMX",        "JPMX"),
@@ -161,7 +162,7 @@ VENUE_GROUPS = {
     ("AU", "ITGBD_DARKFRM"):         ("VIRTU Cond",  "VIRTU Cond"),
     ("AU", "LNAL_DARK"):             ("LNAL",        "Liqnet"),
     ("AU", "LIQH_DARK"):             ("LNAL Cond",   "Liqnet Cond"),
-    ("AU", "LIQUID_DRKFRM"):         ("LNAL Cond",   "Liqnet Cond"),
+    ("AU", "LIQUID_DARKFRM"):         ("LNAL Cond",   "Liqnet Cond"),
     # CBOE_RBC_DARK came over TWICE: as Centrepoint up with the ASX pools,
     # and as CBOE here.  A dict literal keeps the LAST of a repeated key and
     # says nothing about it, so a run of that sheet was already using CBOE -
