@@ -41,7 +41,8 @@ python scripts/reversion_liquidity/reversion_liquidity.py --start 2026-04-01 --e
 licence and no `QHOME` are needed locally.
 
 ```
---country      target_stock country, e.g. AU. Blank for all.
+--country      market, matched against the SYM SUFFIX: AU for *.AU, JP for
+               *.JP. Case insensitive. Blank for all.
 --min-fills    minimum usable fills before a venue is TIERED (default 1000)
 --tiers        'auto' (silhouette) or an integer k
 --half-spread  normalise reversion by half the spread instead of the full spread
@@ -69,18 +70,20 @@ question is *which filter emptied it*. Re-run the same command with
   workorder_rows        482,913
   dark_venue_rows        30,514     6.3% of previous
   of_those_filled        28,880    94.6% of previous
-  stock_rows              1,044     3.6% of previous
   after_country               0     0.0% of previous   <- everything dropped here
+  stock_rows_found            0
 
-  countries on 2026-04-01, by dark parent orders:
+  markets on 2026-04-01, by dark child orders - the SYM SUFFIX, which is what
+  --country matches:
     JP    610      HK    240      SG     74
 
   --country AU is not among them, which is why the range came back empty.
+  It is matched against the end of the sym - 7203.JP is JP - and nothing else.
 ```
 
-It reads `target_stock.country`. If that column is sparse, or spells markets
-differently from the exchange suffix on `sym`, `--country` matches nothing and
-every date is silently empty — the diagnostic is what tells you so.
+`after_country` is the only filter that can empty a market. `stock_rows_found`
+is last and cannot: `target_stock` is left-joined, so a parent it does not
+carry costs you `adv` and `fxlast` on those rows and nothing else.
 
 ## The venue sheet
 
@@ -101,9 +104,13 @@ one row rather than two half-sized ones.
 
 The key is a **pair** because the sheet is keyed that way: `JPMAP_DARK` is JPMX
 in JP and in HK, while in AU the same pool is reached as `JPMAP_MF_DARK`. A
-venue-name-only table could not say that. `country` therefore travels out of
-`target_stock` alongside `adv` and `fxlast` instead of being dropped after the
-join, and `Q_CHILD` aggregates `by country,venue`.
+venue-name-only table could not say that.
+
+The country in that key is the **sym suffix** — `7203.JP` is JP, `BHP.AU` is AU
+— derived in the q from the `sym` already on the row, and carried through to
+Python so `Q_CHILD` can aggregate `by country,venue`. It is **not**
+`target_stock.country`; see [Which market a row belongs
+to](#which-market-a-row-belongs-to).
 
 The second name is a pie label and is unused here; it belongs to
 [`scripts/dark_routed_executed`](../dark_routed_executed/README.md), which
@@ -215,11 +222,20 @@ anything joins to it. If it already holds one row per child order that grouping
 costs nothing; if it ever holds a row per state change, it is the difference
 between a correct fill count and a silently multiplied one.
 
-Those child orders are inner-joined to `target_stock` on
-`date,id_server,id_target` to pick up `adv`, `fxlast` and `country` — the inner
-join is also what applies `--country`, since a stock outside the filter simply
-has no row to match. `country` is **kept**, not dropped after the join: the
-venue sheet is keyed on `(country, venue)`, so it has to reach Python.
+The market is then taken off the **sym suffix** and `--country` is applied
+there, on `workorder`'s own rows, before anything is joined:
+
+```q
+w:$[count w; update country:`$upper {last "." vs x} each string sym from w;
+             update country:`symbol$() from w];
+w:$[0=count ctry; w; select from w where country=`$upper ctry];
+```
+
+Those child orders are then **left**-joined to `target_stock` on
+`date,id_server,id_target` for `adv` and `fxlast`. `lj`, not `ij`: the market is
+already decided, so the stock table is a source of two numbers and not a vote on
+which rows exist. `country` reaches Python because the venue sheet is keyed on
+`(country, venue)`.
 
 Finally `execution` is pulled for those `id_work` values with `fillsize>0`, and
 joined back to get `venue`, `adv` and `fxlast` onto each fill. The fill
@@ -234,6 +250,25 @@ the OMS, which would smear the +1s lookup by the OMS latency.
 
 **Returns:** `date sym tm venue country fillprice fillsize sidesign adv fxlast
 bidprice askprice`, one row per fill, sorted by `sym,tm`.
+
+#### Which market a row belongs to
+
+**The sym suffix, and nothing else.** `7203.JP` is JP, `0005.HK` is HK, `BHP.AU`
+is AU. `queries/market_stats/market_stats.q` names a market the same way.
+
+`target_stock` has a `country` column and this script does not read it. It was
+read, once: `--country JP` returned nothing for a whole quarter while the JP
+dark fills sat in `workorder` the entire time, and the same range came back
+correct for AU. A column that is right for one market and blank or different for
+the next cannot decide which rows a report contains.
+
+Three tests hold the line — `test_the_market_is_the_sym_suffix` (all four
+lambdas derive it identically), `test_no_query_reads_target_stock_country` (no
+`select ... from target_stock` pulls that column), and
+`test_target_stock_cannot_delete_a_fill` (the join stays `lj`).
+
+Matching is case-insensitive on both sides, so `--country jp` is `--country JP`
+rather than a silently empty report.
 
 ### Step 2 — the child order roll (`Q_CHILD`, order server)
 
@@ -491,12 +526,23 @@ were the part worth matching.
 python scripts/reversion_liquidity/reversion_liquidity.py --self-test
 ```
 
-23 tests. Everything except the three q constants is pure Python and covered
+27 tests. Everything except the q itself is pure Python and covered
 offline — the clustering against brute force, the chunking equivalence, the two
 separate fill populations, the weighted-mean denominators, the venue grouping,
 and the Score arithmetic against the three published Bernstein rows. No kdb
 connection required, which matters because this is written on a machine that
 has none.
+
+Four hold the market rule, and they fail on the version of this script that
+read `target_stock.country` — that is what they are for:
+
+- `test_the_market_is_the_sym_suffix` — all four lambdas derive the market from
+  `sym` with the same line
+- `test_no_query_reads_target_stock_country` — no `select ... from target_stock`
+  anywhere pulls that column
+- `test_target_stock_cannot_delete_a_fill` — the stock join is `lj`, never `ij`
+- `test_country_is_normalised_before_it_reaches_q` — `jp` and `JP` are one
+  request
 
 The five that cover the venue sheet:
 
