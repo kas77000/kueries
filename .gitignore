@@ -13,3 +13,7 @@ scripts/*/out/
 
 # local, untracked settings: servers, recipients - see scripts/lib/README.md
 scripts/*/local_settings.py
+
+# launcher output: the run logs, and this machine's python/log settings
+launchers/logs/
+launchers/local_settings.cmd

@@ -1,0 +1,4 @@
+# Batch files are read by cmd.exe, which wants CRLF: an LF-only .cmd can lose a
+# label or run a line twice.  Checked out CRLF on every platform, always.
+*.cmd text eol=crlf
+*.cmd.example text eol=crlf

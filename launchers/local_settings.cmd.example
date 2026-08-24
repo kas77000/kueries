@@ -1,0 +1,27 @@
+@echo off
+rem =============================================================================
+rem  Copy this to local_settings.cmd - WITHOUT the .example - and edit it.
+rem  git ignores local_settings.cmd, so what is in here survives every pull and
+rem  the tracked .cmd files never have to be touched.  Same idea as the
+rem  local_settings.py beside each script.
+rem
+rem  Every line below is optional; delete what you do not need.
+rem =============================================================================
+
+rem  WHICH PYTHON.  Left unset, the launcher uses `py -3`, or `python` on a
+rem  machine with no py launcher.  Set it when the reports need a particular
+rem  interpreter - a venv, or one of several installs.
+rem
+rem  Quote it INSIDE the value if the path has spaces, exactly like this:
+rem      set PYTHON="C:\Program Files\Python312\python.exe"
+
+rem set "PYTHON=C:\venvs\kdb\Scripts\python.exe"
+
+rem  WHERE THE LOGS GO.  Default is the logs\ folder beside the launchers.
+rem  Point it at a share if somebody other than this machine has to read them.
+
+rem set "LOG_DIR=\fileserver\reports\logs"
+
+rem  HOW LONG THEY STAY.  Days.  Default 30.
+
+rem set "KEEP_LOG_DAYS=90"
