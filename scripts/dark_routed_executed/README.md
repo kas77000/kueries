@@ -318,7 +318,7 @@ python pie_slide.py out/routed.csv out/executed.csv --titles "Routed %" "Execute
 python scripts/dark_routed_executed/dark_routed_executed.py --self-test
 ```
 
-21 tests, no kdb connection needed — this script is written on a machine with
+22 tests, no kdb connection needed — this script is written on a machine with
 no kdb access, so everything except the q itself is pure Python and is checked
 here. Run it before shipping a change.
 
@@ -350,8 +350,10 @@ The ones worth knowing about:
   the whole accumulator design rests on
 - `test_venues_in_one_group_become_one_row` — both Centrepoint symbols land in
   one row carrying both notionals
-- `test_the_sheet_is_keyed_on_country` — `JPMAP_DARK` maps in JP and HK but not
-  in AU, and `JPMAP_MF_DARK` the other way round
+- `test_the_sheet_is_keyed_on_country` — `JPMAP_MF_DARK` is JPMX in AU and is
+  not a venue at all in JP or HK; `NOM_DARK` is Nomura in Japan and nowhere else
+- `test_the_sheet_has_no_duplicate_keys` — reads the **source**, because a dict
+  literal keeps the last of a repeated key and says nothing about it
 - `test_pie_csv_matches_the_latex_pie_format` — the CSVs read back through the
   same parser `pie_slide.py` uses
 - `test_unmapped_venue_is_not_exempt_from_other` — a thin unmapped venue rolls

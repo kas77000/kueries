@@ -112,6 +112,11 @@ Python so `Q_CHILD` can aggregate `by country,venue`. It is **not**
 `target_stock.country`; see [Which market a row belongs
 to](#which-market-a-row-belongs-to).
 
+The sheet carries **41 routes** across the three markets — several per pool,
+because a pool is reached under more than one kdb name (`CITI_DARK` and
+`CITI_DARK_PASS` in HK are both Citi) and because the same name means different
+things in different markets.
+
 The second name is a pie label and is unused here; it belongs to
 [`scripts/dark_routed_executed`](../dark_routed_executed/README.md), which
 carries **its own copy of this same sheet**. Each script folder stands on its
@@ -526,7 +531,7 @@ were the part worth matching.
 python scripts/reversion_liquidity/reversion_liquidity.py --self-test
 ```
 
-29 tests. Everything except the q itself is pure Python and covered
+30 tests. Everything except the q itself is pure Python and covered
 offline — the clustering against brute force, the chunking equivalence, the two
 separate fill populations, the weighted-mean denominators, the venue grouping,
 and the Score arithmetic against the three published Bernstein rows. No kdb
@@ -555,10 +560,13 @@ read `target_stock.country` — that is what they are for:
 - `test_country_is_normalised_before_it_reaches_q` — `jp` and `JP` are one
   request
 
-The five that cover the venue sheet:
+The six that cover the venue sheet:
 
 - `test_venue_sheet_is_consistent` — one short code per name, every venue
   actually dark, every country a bare upper-case code
+- `test_the_sheet_has_no_duplicate_keys` — reads the **source**, because a dict
+  literal keeps the last of a repeated key and says nothing; the losing line is
+  gone before any test built on `VENUE_GROUPS` could see it
 - `test_venues_in_one_group_become_one_row` — both Centrepoint symbols land in
   one row whose notional is the sum of both
 - `test_the_sheet_is_keyed_on_country` — `JPMAP_DARK` maps in JP and HK but not

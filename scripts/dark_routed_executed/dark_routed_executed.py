@@ -118,6 +118,7 @@ _PLACEHOLDER = "CHANGEME"
 # -----------------------------------------------------------------------------
 
 VENUE_GROUPS = {
+    # Japan
     ("JP", "CITI_DARK"):             ("Citi",        "Citi"),
     ("JP", "DAIWA_DARK"):            ("Daiwa",       "DAIWA"),
     ("JP", "JPMAP_DARK"):            ("JPMX",        "JPMX"),
@@ -125,22 +126,49 @@ VENUE_GROUPS = {
     ("JP", "MS_DARK"):               ("MS Pool",     "MSPL"),
     ("JP", "NOM_DARK"):              ("Nomura",      "Nomura"),
     ("JP", "POSITNOW_DARK"):         ("Posit",       "Posit"),
-
+    ("JP", "CLSA_DARK"):             ("CLSA",        "CLSA"),
+    ("JP", "ITGBD_DARKFRM"):         ("VIRTU Cond",  "VIRTU Cond"),
+    ("JP", "LIQH_DARK"):             ("LNAL Cond",   "Liqnet Cond"),
+    ("JP", "LIQUID_DARKFRM"):        ("LNAL Cond",   "Liqnet Cond"),
+    ("JP", "ML_DARK"):               ("BAML",        "BAML"),
+    # Hong Kong
     ("HK", "CITI_DARK"):             ("Citi",        "Citi"),
+    ("HK", "CITI_DARK_PASS"):        ("Citi",        "Citi"),
     ("HK", "CLSA_DARK"):             ("CLSA",        "CLSA"),
     ("HK", "INSTINET_DARK"):         ("Instinet",    "Instnet"),
+    ("HK", "INSTINET_DARK_PASS"):    ("Instinet",    "Instnet"),
+    ("HK", "ITGBD_DARKFRM"):         ("VIRTU Cond",  "VIRTU Cond"),
     ("HK", "JPMAP_DARK"):            ("JPMX",        "JPMX"),
+    ("HK", "JPMAP_DARK_PASS"):       ("JPMX",        "JPMX"),
     ("HK", "MS_DARK"):               ("MS Pool",     "MSPL"),
     ("HK", "POSITNOW_DARK"):         ("Posit",       "Posit"),
-
-    # the published pie labels this slice Ctrpnt; the sheet says CentrePt and
-    # the sheet is what we follow
+    ("HK", "POSITNOW_DARK_PASS"):    ("Posit",       "Posit"),
+    ("HK", "LIQH_DARK"):             ("LNAL Cond",   "Liqnet Cond"),
+    ("HK", "LIQUID_DARKFRM"):        ("LNAL Cond",   "Liqnet Cond"),
+    ("HK", "LNAL_DARK"):             ("LNAL",        "Liqnet"),
+    # Australia
+    # the published pie labels this slice Ctrpnt; the sheet says CentrePt
+    # and the sheet is what we follow
     ("AU", "CENTREPOINT_CITI_DARK"): ("Centrepoint", "CentrePt"),
     ("AU", "CENTREPOINT_DARK"):      ("Centrepoint", "CentrePt"),
     ("AU", "CLSA_DARK"):             ("CLSA",        "CLSA"),
     ("AU", "JPMAP_MF_DARK"):         ("JPMX",        "JPMX"),
+    ("AU", "JPMAP_DARK"):            ("JPMX",        "JPMX"),
     ("AU", "MS_DARK"):               ("MS Pool",     "MSPL"),
     ("AU", "POSITNOW_DARK"):         ("Posit",       "Posit"),
+    ("AU", "CITI_DARK"):             ("Citi",        "Citi"),
+    ("AU", "INSTINET_DARK"):         ("Instinet",    "Instnet"),
+    ("AU", "ITGBD_DARKFRM"):         ("VIRTU Cond",  "VIRTU Cond"),
+    ("AU", "LNAL_DARK"):             ("LNAL",        "Liqnet"),
+    ("AU", "LIQH_DARK"):             ("LNAL Cond",   "Liqnet Cond"),
+    ("AU", "LIQUID_DRKFRM"):         ("LNAL Cond",   "Liqnet Cond"),
+    # CBOE_RBC_DARK came over TWICE: as Centrepoint up with the ASX pools,
+    # and as CBOE here.  A dict literal keeps the LAST of a repeated key and
+    # says nothing about it, so a run of that sheet was already using CBOE -
+    # which is why that is what is written here.  They are different pools;
+    # say so if the other one was meant.
+    ("AU", "CBOE_RBC_DARK"):         ("CBOE",        "CBOE"),
+    ("AU", "CRAIGS_NZX_DARK"):       ("CRAIGS",      "CRAIGS"),
 }
 
 # -----------------------------------------------------------------------------
@@ -961,20 +989,48 @@ def test_venues_in_one_group_become_one_row():
     assert abs(table.loc["Centrepoint", "Routed %"] - 100.0) < 1e-12
 
 
+def test_the_sheet_has_no_duplicate_keys():
+    """The same (country, venue) must not be written twice in VENUE_GROUPS.
+
+    A dict literal keeps the LAST of a repeated key and says nothing about it,
+    so the losing line is not recoverable from VENUE_GROUPS at runtime and no
+    test built on the dict can see it.  This one reads the SOURCE.
+
+    It is not hypothetical: the completed sheet had ("AU", "CBOE_RBC_DARK")
+    against Centrepoint on one line and against CBOE on another, which are
+    different pools, and the dict quietly kept CBOE."""
+    src = Path(__file__).read_text(encoding="utf-8")
+    block = src[src.index("VENUE_GROUPS = {"):]
+    block = block[:block.index("\n}")]
+    keys = [ln.split("):")[0].strip() for ln in block.splitlines()
+            if ln.strip().startswith('("')]
+    dupes = sorted({k for k in keys if keys.count(k) > 1})
+    assert not dupes, f"written more than once in VENUE_GROUPS: {dupes}"
+    assert len(keys) == len(VENUE_GROUPS), (
+        f"{len(keys)} lines in the source, {len(VENUE_GROUPS)} keys in the dict")
+
+
 def test_the_sheet_is_keyed_on_country():
-    """JPMAP_DARK is JPMX in JP and HK; in AU the same pool is JPMAP_MF_DARK.
-    Neither spelling maps in the other's country, which is why the key is a
-    pair rather than a venue name."""
+    """The same kdb symbol is not the same pool in every market.
+
+    JPMAP_DARK is JPMX in all three now, and the sheet still needs the country:
+    JPMAP_MF_DARK is JPMX in AU and is not a venue at all in JP or HK, and
+    NOM_DARK is Nomura in Japan and nowhere else.  A venue-name-only sheet
+    could say neither of those.
+
+    (AU, JPMAP_DARK) was the example here until the desk completed the sheet
+    and it turned out to be a real AU venue.  The property is the same; the
+    pair that demonstrates it had to move.)"""
     roll = pd.concat([_synth_roll(["JPMAP_DARK"], country="JP"),
                       _synth_roll(["JPMAP_DARK"], country="HK"),
                       _synth_roll(["JPMAP_MF_DARK"], country="AU")],
                      ignore_index=True)
     assert list(aggregate(roll).index) == ["JPMX"]
-    crossed = pd.DataFrame({"country": ["JP", "AU"],
-                            "venue": ["JPMAP_MF_DARK", "JPMAP_DARK"]})
-    assert list(venue_labels(crossed)) == ["JPMAP_MF_DARK", "JPMAP_DARK"]
+    crossed = pd.DataFrame({"country": ["JP", "HK"],
+                            "venue": ["JPMAP_MF_DARK", "NOM_DARK"]})
+    assert list(venue_labels(crossed)) == ["JPMAP_MF_DARK", "NOM_DARK"]
     assert unmapped_venues(crossed) == {("JP", "JPMAP_MF_DARK"),
-                                        ("AU", "JPMAP_DARK")}
+                                        ("HK", "NOM_DARK")}
 
 
 def test_unmapped_venue_keeps_its_kdb_name():
