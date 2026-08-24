@@ -44,7 +44,8 @@ licence and no `QHOME` are needed locally. `matplotlib` is only needed to draw;
 `--no-pies` writes the CSVs without it.
 
 ```
---country       target_stock country, e.g. AU. Blank for all.
+--country       market, matched against the SYM SUFFIX: AU for *.AU, JP for
+                *.JP. Case insensitive. Blank for all.
 --other-below   pie slices under this % roll into one Other slice (default 3.0);
                 0 keeps every venue as its own slice
 --out-dir       write the table, routed.csv, executed.csv and pies.png/.pdf here
@@ -63,9 +64,13 @@ report goes to stdout, so `> out.txt` keeps the two apart.
 `no dark child orders across N dates` means every date came back empty, and the
 useful question is *which filter emptied it*. Re-run with `--diagnose` and the
 same arguments: it queries the first date only and prints the funnel —
-`workorder_rows`, `dark_venue_rows`, `of_those_filled`, `stock_rows`,
-`after_country` — plus the countries that date actually held, so a `--country`
+`workorder_rows`, `dark_venue_rows`, `of_those_filled`, `after_country`,
+`stock_rows_found` — plus the markets that date actually held, so a `--country`
 that matched nothing is obvious rather than mysterious.
+
+`after_country` is the only stage that can empty a market. `stock_rows_found` is
+last and cannot: `target_stock` is left-joined, so a parent it does not carry
+costs those rows their `fxlast` — both notionals — and nothing else.
 
 ## The venue sheet
 
@@ -90,6 +95,11 @@ is what labels it — `CentrePt,46.6`. The first name is what the table prints.
 The key is a **pair** because the sheet is keyed that way: `JPMAP_DARK` is JPMX
 in JP and in HK, while in AU the same pool is reached as `JPMAP_MF_DARK`. A
 venue-name-only table could not say that.
+
+That country is the **sym suffix** — `7203.JP` is JP, `BHP.AU` is AU — derived
+in the q from the `sym` already on the row. It is **not**
+`target_stock.country`; see [Which market a row belongs
+to](#which-market-a-row-belongs-to).
 
 > The published pie labels the Centrepoint slice `Ctrpnt`; the sheet says
 > `CentrePt`, and the sheet is what this follows. Change that one line if you
@@ -167,11 +177,11 @@ not a setting: naming it is one of those errors.
 This is `queries/dark_summary/dark_routed_executed.q` run per date, with three
 changes:
 
-- a **country filter**, so a range can be cut the way the report cuts it
+- a **market filter**, so a range can be cut the way the report cuts it. It is
+  applied to `workorder`'s own rows, off the sym suffix, before anything is
+  joined
 - grouped **`by country,venue`**, because the venue sheet is keyed on the pair
-- an **`ij`** rather than an `lj` onto `target_stock`, so a child order whose
-  parent is in another country is dropped rather than kept with a null fx that
-  would silently zero its notional. With no `--country` the two joins agree.
+- the same **`lj`** onto `target_stock` the `.q` uses, for `fxlast`
 
 A venue is **dark** when its name contains `DARK` or `DRK`, case insensitively
 — identical to `dark_summary.q`, `dark_routed_executed.q` and
@@ -199,6 +209,35 @@ carries `limit_target`, `limit_candidate`, `transmit_bidprice` and
 the only place that decides.
 
 Executed notional is `make * avg_fill_price * fxlast`.
+
+#### Which market a row belongs to
+
+**The sym suffix, and nothing else.** `7203.JP` is JP, `0005.HK` is HK, `BHP.AU`
+is AU:
+
+```q
+w:$[count w; update country:`$upper {last "." vs x} each string sym from w;
+             update country:`symbol$() from w];
+w:$[0=count ctry; w; select from w where country=`$upper ctry];
+```
+
+`queries/market_stats/market_stats.q` and `scripts/reversion_liquidity` name a
+market the same way.
+
+`target_stock` has a `country` column and this script does not read it. It was
+read, once, and in `reversion_liquidity` the same filter returned nothing for a
+whole quarter of Japan while the JP dark rows sat in `workorder` the entire
+time — the AU range beside it was correct. A column that is right for one
+market and blank or different for the next cannot decide which rows a report
+contains.
+
+That is also why the stock join is now `lj`: the `ij` existed only to make
+`--country` exclude, and `--country` no longer passes through that table at all.
+A parent with no stock row nulls `fxlast`, which empties that row's two
+notionals but leaves the order and share counts standing.
+
+Matching is case-insensitive on both sides, so `--country jp` is `--country JP`
+rather than a silently empty report.
 
 ### Step 2 — accumulate (`aggregate`, `fold`)
 
@@ -279,9 +318,21 @@ python pie_slide.py out/routed.csv out/executed.csv --titles "Routed %" "Execute
 python scripts/dark_routed_executed/dark_routed_executed.py --self-test
 ```
 
-16 tests, no kdb connection needed — this script is written on a machine with
-no kdb access, so everything except the three q constants is pure Python and is
-checked here. Run it before shipping a change.
+20 tests, no kdb connection needed — this script is written on a machine with
+no kdb access, so everything except the q itself is pure Python and is checked
+here. Run it before shipping a change.
+
+Four hold the market rule, and they fail on the version of this script that read
+`target_stock.country` — that is what they are for:
+
+- `test_the_market_is_the_sym_suffix` — all three lambdas derive the market from
+  `sym` with the same line
+- `test_no_query_reads_target_stock_country` — no `select ... from target_stock`
+  anywhere pulls that column
+- `test_target_stock_cannot_delete_a_child_order` — the stock join is `lj`,
+  never `ij`
+- `test_country_is_normalised_before_it_reaches_q` — `jp` and `JP` are one
+  request
 
 The ones worth knowing about:
 
@@ -313,8 +364,9 @@ placeholder; that is not a failure.
    place that decides.
 2. **No `make>0` filter.** The unfilled children are the entire difference
    between the two pies.
-3. **`ij`, not `lj`, onto `target_stock`** — so `--country` actually excludes
-   rather than nulls.
+3. **The market is the sym suffix**, and `target_stock` is joined with `lj`,
+   the same join the `.q` uses. Its `country` column is not read: it emptied
+   Japan once and was right for Australia at the same time.
 4. **Fill Rate is money weighted**; the order-weighted version sits beside it.
 5. **Percentages divide accumulated totals**, once, at the end.
 6. **`--other-below` defaults to 3.0** because that is what reproduces the

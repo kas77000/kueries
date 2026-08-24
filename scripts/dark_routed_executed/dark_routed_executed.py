@@ -41,6 +41,13 @@ RELATION TO THE OTHER TWO
       not to the bit.  The report shows Centrepoint at 88.6 in table 3.1 and
       88.5 in the Executed pie for exactly that reason.
 
+A MARKET IS THE SYM SUFFIX: 7203.JP is JP, 0005.HK is HK, BHP.AU is AU.  Not
+target_stock's country column, which is blank or wrong often enough that
+--country JP came back empty while the JP dark children sat in workorder the
+whole time.  The suffix rides on every row this script already reads, so the
+market is decided before any join and cannot be lost in one.  Same rule as
+scripts/reversion_liquidity and queries/market_stats/market_stats.q.
+
 PERCENTAGES ARE COMPUTED ONCE, AT THE END, from accumulated notionals.  A mean
 of daily percentages is a different and wrong number - it weights a quiet
 Tuesday the same as a heavy Thursday.  See test_percentages_come_from_totals().
@@ -91,7 +98,9 @@ _PLACEHOLDER = "CHANGEME"
 # CENTREPOINT_CITI_DARK for another.
 #
 # Keyed on the country too, because the sheet is: JPMAP_DARK is JPMX in JP and
-# HK, while in AU the same pool is reached as JPMAP_MF_DARK.
+# HK, while in AU the same pool is reached as JPMAP_MF_DARK.  That country is
+# the SYM SUFFIX, which is where the q gets it from; target_stock's country
+# column is not read anywhere in this script.
 #
 # The SECOND name is what labels a pie slice, because a slice has no room for
 # "Centrepoint".  The first is what the table prints.  Keep this table in step
@@ -180,19 +189,32 @@ OTHER = "Other"
 Q_ROUTED_EXECUTED = """
 {[d;ctry]
   dk:("*DARK*";"*DRK*");
-  w:select date,id_server,id_work,id_target,venue,size,price,make,
+  w:select date,id_server,id_work,id_target,sym,venue,size,price,make,
       avg_fill_price,transmit_lastprice
     from workorder
     where date=d, any (upper venue) like/: dk;
-  w:0!select last id_target, last venue, last size, last price, last make,
-      last avg_fill_price, last transmit_lastprice
+  / THE MARKET IS THE SYM SUFFIX.  7203.JP is JP, BHP.AU is AU.  target_stock
+  / carries a country column and it is NOT dependable: filtering on it returned
+  / nothing for Japan while the rows sat in workorder all along.  The suffix is
+  / already on the row we have, and it needs no join to be right.
+  / A date with no dark rows has no syms to split, and an untyped empty column
+  / would break the compare or the group that follows it, so the empty case is
+  / spelled out rather than left to fall out of the cast.
+  w:$[count w; update country:`$upper {last "." vs x} each string sym from w;
+               update country:`symbol$() from w];
+  w:$[0=count ctry; w; select from w where country=`$upper ctry];
+  / country is KEPT, and grouped on below, so the sheet can be applied to it
+  w:0!select last id_target, last venue, last country, last size, last price,
+      last make, last avg_fill_price, last transmit_lastprice
     by date,id_server,id_work from w;
   ids:exec distinct id_target from w;
-  x:select date,id_server,id_target,fxlast,country
+  x:`date`id_server`id_target xkey select date,id_server,id_target,fxlast
     from target_stock where date=d, id_target in ids;
-  x:$[0=count ctry; x; select from x where country=`$ctry];
-  x:`date`id_server`id_target xkey x;
-  w:w ij x;
+  / lj, NOT ij: the market is decided above, off the sym, so target_stock is
+  / here for fxlast alone and must not get a vote on which rows exist.  The ij
+  / was only ever there to make --country exclude, and --country no longer
+  / passes through this table at all.
+  w:w lj x;
   / an order that never filled has no fill price, so ROUTED is valued at the
   / price the child was sent with, falling back to the last trade at transmit
   / time for market and pegged orders that carry no usable limit
@@ -219,29 +241,47 @@ Q_DIAG = """
 {[d;ctry]
   dk:("*DARK*";"*DRK*");
   a:count select from workorder where date=d;
-  w:select date,id_server,id_work,id_target,venue,make
+  w:select date,id_server,id_work,id_target,sym,venue,make
     from workorder where date=d, any (upper venue) like/: dk;
   b:count w;
   c:count select from w where make>0;
+  / THE MARKET IS THE SYM SUFFIX.  7203.JP is JP, BHP.AU is AU.  target_stock
+  / carries a country column and it is NOT dependable: filtering on it returned
+  / nothing for Japan while the rows sat in workorder all along.  The suffix is
+  / already on the row we have, and it needs no join to be right.
+  / A date with no dark rows has no syms to split, and an untyped empty column
+  / would break the compare or the group that follows it, so the empty case is
+  / spelled out rather than left to fall out of the cast.
+  w:$[count w; update country:`$upper {last "." vs x} each string sym from w;
+               update country:`symbol$() from w];
+  w:$[0=count ctry; w; select from w where country=`$upper ctry];
+  e:count w;
   ids:exec distinct id_target from w;
-  x:select date,id_server,id_target,country from target_stock
-    where date=d, id_target in ids;
-  e:count x;
-  f:$[0=count ctry; e; count select from x where country=`$ctry];
-  ([] stage:`workorder_rows`dark_venue_rows`of_those_filled`stock_rows`after_country;
+  / LAST, and no longer able to empty anything: the roll lj's onto this, so a
+  / row it does not have nulls fxlast instead of deleting the child order.
+  f:count select from target_stock where date=d, id_target in ids;
+  ([] stage:`workorder_rows`dark_venue_rows`of_those_filled`after_country`stock_rows_found;
       n:(a;b;c;e;f))
  }
 """
 
-# The country values actually present, so a filter that matched nothing can be
-# compared against what was there to match.
+# The markets actually in the dark flow, so a filter that matched nothing can
+# be compared against what was there to match.  Read off workorder's own syms:
+# the table the rows come from, with no join to lose them in.
 Q_COUNTRIES = """
 {[d]
-  w:select date,id_server,id_target from workorder
+  w:select sym from workorder
     where date=d, any (upper venue) like/: ("*DARK*";"*DRK*");
-  ids:exec distinct id_target from w;
-  `n xdesc 0!select n:count i by country from target_stock
-    where date=d, id_target in ids
+  / THE MARKET IS THE SYM SUFFIX.  7203.JP is JP, BHP.AU is AU.  target_stock
+  / carries a country column and it is NOT dependable: filtering on it returned
+  / nothing for Japan while the rows sat in workorder all along.  The suffix is
+  / already on the row we have, and it needs no join to be right.
+  / A date with no dark rows has no syms to split, and an untyped empty column
+  / would break the compare or the group that follows it, so the empty case is
+  / spelled out rather than left to fall out of the cast.
+  w:$[count w; update country:`$upper {last "." vs x} each string sym from w;
+               update country:`symbol$() from w];
+  `n xdesc 0!select n:count i by country from w
  }
 """
 
@@ -288,6 +328,17 @@ def connect(hostport):
         )
     host, port = parse_hostport(hostport)
     return pykx.SyncQConnection(host=host, port=port)
+
+
+def normalise_country(s):
+    """--country as both sides want it: stripped, upper case, "" for all of them.
+
+    Upper because the suffix is upper on the feed, and `--country jp` should be
+    the same request as `--country JP` rather than a silently empty report.  The
+    q uppers it too - neither side is the only thing standing between a lower
+    case argument and no rows at all - but it is normalised HERE so that the
+    heading over the table says what was actually filtered on."""
+    return (s or "").strip().upper()
 
 
 def _to_pandas(tbl):
@@ -630,13 +681,30 @@ def diagnose(ho, day, ctry, country_label):
     funnel = _to_pandas(ho(Q_DIAG, day, ctry))
     width = max(len(str(s)) for s in funnel["stage"])
     prev = None
+    stock_missing = False
     for _, r in funnel.iterrows():
-        n = int(r["n"])
-        share = "" if not prev else f"   {100.0 * n / prev:5.1f}% of previous"
-        gone = "   <- everything dropped here" if n == 0 and prev else ""
-        print(f"  {str(r['stage']):<{width}}  {n:>12,}{share}{gone}")
+        stage, n = str(r["stage"]), int(r["n"])
+        # no share on the last line: it counts PARENT orders where everything
+        # above it counts children, and "3.6% of previous" off two grains reads
+        # like a collapse when it is just the fan-out
+        share = ("" if not prev or stage == "stock_rows_found"
+                 else f"   {100.0 * n / prev:5.1f}% of previous")
+        # only the stages that FILTER can empty the report.  stock_rows_found is
+        # joined with lj, so a zero there costs fxlast and nothing else - calling
+        # that "everything dropped here" would send the next person to the wrong
+        # table
+        gone = ("   <- everything dropped here"
+                if n == 0 and prev and stage != "stock_rows_found" else "")
+        if stage == "stock_rows_found" and n == 0:
+            stock_missing = True
+        print(f"  {stage:<{width}}  {n:>12,}{share}{gone}")
         prev = n
     print()
+    if stock_missing:
+        print("  no target_stock rows for those parents.  The children still "
+              "come through - the\n  join is an lj - but fxlast is null, so "
+              "both notionals are empty and only\n  the share counts survive."
+              "\n")
     if int(funnel["n"].iloc[0]) == 0:
         print(f"  no workorder rows at all on {day} - a non-trading date, or a "
               f"date the HDB does not hold.\n  Re-run --diagnose with a --start "
@@ -644,16 +712,19 @@ def diagnose(ho, day, ctry, country_label):
         return 0
     ctry_rows = _to_pandas(ho(Q_COUNTRIES, day))
     if len(ctry_rows) == 0:
-        print("  no stock rows for that date, so no countries to compare against")
+        print("  no dark child orders on that date, so no markets to compare "
+              "against")
     else:
-        print(f"  countries on {day}, by dark parent orders:")
+        print(f"  markets on {day}, by dark child orders - the SYM SUFFIX, "
+              f"which is what --country matches:")
         for _, r in ctry_rows.head(20).iterrows():
             got = str(r["country"])
             mine = "   <- your --country" if country_label and got == country_label else ""
             print(f"    {got:<12} {int(r['n']):>8,}{mine}")
         if country_label and country_label not in [str(v) for v in ctry_rows["country"]]:
             print(f"\n  --country {country_label} is not among them, which is why "
-                  f"the range came back empty.")
+                  f"the range came back empty.\n  It is matched against the end "
+                  f"of the sym - 7203.JP is JP - and nothing else.")
     return 0
 
 
@@ -665,15 +736,16 @@ def run(args):
     global QUIET
     QUIET = args.quiet
 
+    args.country = normalise_country(args.country)
     days = list(daterange(args.start, args.end))
     log(f"dark_routed_executed  {args.start} to {args.end}  ({len(days)} dates)"
-        + (f", country {args.country}" if args.country else ", all countries"))
+        + (f", market {args.country}" if args.country else ", all markets"))
     log(f"  order server  {ORDER_SERVER} ...")
     ho = connect(ORDER_SERVER)
     # BYTES, not str: PyKX sends a python str as a q symbol, and the q casts
     # with `$, which is a 'type error on a symbol.  b"" is an empty char
-    # vector, so `0=count ctry` still selects every country.
-    country = (args.country or "").encode()
+    # vector, so `0=count ctry` still selects every market.
+    country = args.country.encode()
 
     if args.diagnose:
         return diagnose(ho, days[0], country, args.country)
@@ -708,7 +780,8 @@ def run(args):
     if acc is None or len(acc) == 0:
         raise SystemExit(
             f"\nno dark child orders across {len(days)} dates"
-            + (f" for country {args.country}" if args.country else "")
+            + (f" for market {args.country} - the sym suffix, e.g. 7203.JP "
+               f"is JP" if args.country else "")
             + (f", and {n_failed} date(s) errored - see above" if n_failed else "")
             + "\nrun the same command with --diagnose to see which filter empties it.")
 
@@ -759,7 +832,9 @@ def main(argv=None):
     )
     p.add_argument("--start", type=dt.date.fromisoformat)
     p.add_argument("--end", type=dt.date.fromisoformat)
-    p.add_argument("--country", default="", help="target_stock country, e.g. AU; blank for all")
+    p.add_argument("--country", default="",
+                   help="market, matched against the sym suffix: AU for *.AU, "
+                        "JP for *.JP. Case insensitive; blank for all")
     p.add_argument("--other-below", type=float, default=3.0,
                    help="pie slices under this percentage roll into one Other "
                         "slice; 0 keeps every venue as its own slice")
@@ -1032,6 +1107,57 @@ def test_table_formats_like_the_report():
     assert format_table(t, TABLE_FMT)["Fill Rate"].iloc[0] == ""
 
 
+def test_the_market_is_the_sym_suffix():
+    """Every q that decides a market decides it the same way, off the sym.
+
+    This is the bug that produced the rule: the market used to come from
+    target_stock's country column, --country JP returned nothing, and the JP
+    dark children were in workorder the entire time.  Three lambdas ask the
+    question and all three have to answer it identically - one of them drifting
+    back to a join is how a market goes quietly missing again.
+    scripts/reversion_liquidity pins the same line."""
+    line = ('  w:$[count w; update country:`$upper {last "." vs x} '
+            'each string sym from w;')
+    for name, q in (("Q_ROUTED_EXECUTED", Q_ROUTED_EXECUTED),
+                    ("Q_DIAG", Q_DIAG), ("Q_COUNTRIES", Q_COUNTRIES)):
+        assert line in q, f"{name} does not take the market off the sym suffix"
+
+
+def test_no_query_reads_target_stock_country():
+    """target_stock's country column is not consulted anywhere.
+
+    It exists, and it is wrong or blank often enough that nothing here is
+    allowed to depend on it.  Checks the columns of every
+    `select ... from target_stock`, so re-adding it is a failing test rather
+    than a pie that is empty for one market and right for another."""
+    for name, q in (("Q_ROUTED_EXECUTED", Q_ROUTED_EXECUTED),
+                    ("Q_DIAG", Q_DIAG), ("Q_COUNTRIES", Q_COUNTRIES)):
+        for piece in q.split("from target_stock")[:-1]:
+            cols = piece[piece.rfind("select") + len("select"):]
+            assert "country" not in cols, (
+                f"{name} selects country from target_stock: {cols.strip()!r}")
+
+
+def test_target_stock_cannot_delete_a_child_order():
+    """The stock join is lj - the same join dark_routed_executed.q uses.
+
+    It was an ij, because --country was applied to the stock rows and an inner
+    join was what made it exclude.  The filter is on the sym now, so the only
+    thing an ij could still do is drop a child order whose parent has no stock
+    row - one that was in workorder, was dark, and vanished on the way to a
+    pie.  A missing fxlast nulls the notionals instead, and the counts stand."""
+    assert "w lj x" in Q_ROUTED_EXECUTED, "no longer left-joins target_stock"
+    assert " ij x" not in Q_ROUTED_EXECUTED, "inner-joins target_stock again"
+
+
+def test_country_is_normalised_before_it_reaches_q():
+    """--country jp is --country JP, and blank still means every market."""
+    assert normalise_country(" jp ") == "JP"
+    assert normalise_country("Au") == "AU"
+    assert normalise_country("") == ""
+    assert normalise_country(None) == ""
+
+
 def test_country_reaches_q_as_chars():
     """The country filter must arrive as a char vector, never a str.
 
@@ -1114,10 +1240,13 @@ if __name__ == "__main__":
 #    routed differ from executed; filtering them would collapse the two pies
 #    onto each other and make Fill Rate 100% everywhere.
 #
-# 3. AN ij ONTO target_stock, not the lj the .q uses.  With --country set, a
-#    child whose parent is in another country has to be dropped, not kept with
-#    a null fx that silently zeroes its notional.  With no --country the two
-#    joins are the same.
+# 3. THE MARKET IS THE SYM SUFFIX, and target_stock is joined with lj - the
+#    same join the .q uses.  This script read target_stock.country once and
+#    --country JP returned nothing for a quarter while the JP children sat in
+#    workorder; a column that is right for one market and blank for the next
+#    cannot decide which rows a report contains.  --country is applied to
+#    workorder's own rows now, so the other markets are gone before the join
+#    and the join has nothing left to exclude.
 #
 # 4. FILL RATE IS MONEY WEIGHTED - executed notional over routed notional.
 #    orders_filled/orders_routed is the order weighted version and is in the
