@@ -427,16 +427,57 @@ def normalise_country(s):
     return (s or "").strip().upper()
 
 
+def _plain_numeric(s):
+    """A q numeric column that CONTAINS A NULL, as plain float64 with NaN.
+
+    PyKX types a column by whether a null is in it.  `adv` with none is an
+    int32 ndarray; the same column with one is a numpy MASKED array, and a
+    masked array can reach pandas' own notna() and come back out as
+
+        TypeError: bad operand type for unary ~: 'float'
+
+    eight frames down in pandas internals, naming nothing that appears in this
+    file.  That is one null ADV on one Japanese name, and it took the whole
+    range down on the date it turned up.
+
+    So the null is turned into a NaN HERE, at the one boundary, rather than
+    surviving as a representation every line downstream would have to know
+    about.  NaN is what the report already means by "no adv": adv_ok in
+    fill_metrics is a notna() test that was written for exactly this row.
+    """
+    values = getattr(s, "values", s)
+    if isinstance(values, np.ma.MaskedArray):
+        # .filled needs somewhere to put NaN, so widen ints first
+        return pd.Series(values.astype("float64").filled(np.nan),
+                         index=s.index, name=s.name)
+    return pd.Series(s.to_numpy(dtype="float64", na_value=np.nan),
+                     index=s.index, name=s.name)
+
+
 def _to_pandas(tbl):
     """PyKX table -> DataFrame, with symbol columns normalised to str.
 
     PyKX hands symbols back as bytes in some versions and str in others.  Left
     alone that difference turns up much later as a groupby that splits one
-    venue into two, so it is flattened here at the boundary."""
+    venue into two, so it is flattened here at the boundary.
+
+    Numeric columns are flattened for the same reason: a q null makes PyKX
+    return a masked array where the same column without one is a plain
+    ndarray, and only the first of those survives contact with pandas.  See
+    _plain_numeric.  Times and dates are left alone - a masked timedelta is
+    still a timedelta, and turning one into a float would break the quote
+    join far more quietly than it would fix anything."""
     df = tbl.pd()
     for c in df.columns:
-        if df[c].dtype == object:
-            df[c] = df[c].map(lambda v: v.decode() if isinstance(v, bytes) else v)
+        s = df[c]
+        if s.dtype == object:
+            df[c] = s.map(lambda v: v.decode() if isinstance(v, bytes) else v)
+        elif (isinstance(getattr(s, "values", None), np.ma.MaskedArray)
+                and s.values.dtype.kind in "iuf"):
+            df[c] = _plain_numeric(s)
+        elif not isinstance(s.dtype, np.dtype) and pd.api.types.is_numeric_dtype(s.dtype):
+            # a nullable extension dtype - Int32, Float64 - for the same reason
+            df[c] = _plain_numeric(s)
     return df
 
 
@@ -1673,6 +1714,64 @@ def test_country_is_normalised_before_it_reaches_q():
     assert normalise_country("Au") == "AU"
     assert normalise_country("") == ""
     assert normalise_country(None) == ""
+
+
+def test_a_null_number_arrives_as_nan():
+    """A q null in a numeric column reaches pandas as NaN, not as a mask.
+
+    PyKX returns a MASKED array for a column that contains a null and a plain
+    ndarray for the same column without one.  A masked array reaching
+    fill_metrics is `TypeError: bad operand type for unary ~: 'float'` out of
+    pandas internals - which is what one null ADV on one Japanese name did to
+    a whole quarter, on the date it first turned up.
+
+    The contract is that nothing downstream of _to_pandas ever sees a mask."""
+    masked = np.ma.array([1_000_000, 0, 3_000_000], mask=[False, True, False],
+                         dtype=np.int32)
+
+    class Result:
+        def pd(self):
+            df = pd.DataFrame({
+                "fxlast": pd.array([1.0, None, 1.5], dtype="Float64"),
+                "venue": [b"MS_DARK", b"MS_DARK", b"MS_DARK"],
+                "tm": pd.to_timedelta(["1h", "2h", "3h"]),
+            })
+            # ASSIGNED, not passed to the constructor: the constructor quietly
+            # re-blocks a masked array into a plain one, and a mask surviving
+            # into the frame is the whole of what this is about
+            df["adv"] = pd.Series(masked)
+            return df
+
+    df = _to_pandas(Result())
+
+    assert not isinstance(df["adv"].values, np.ma.MaskedArray), "adv is still masked"
+    assert df["adv"].dtype == np.float64, df["adv"].dtype
+    assert isinstance(df["fxlast"].dtype, np.dtype), "fxlast is still an extension type"
+    assert df["adv"].notna().tolist() == [True, False, True]
+    assert df["fxlast"].notna().tolist() == [True, False, True]
+    assert df["adv"].iloc[0] == 1_000_000.0 and np.isnan(df["adv"].iloc[1])
+    # the symbol column still decodes, and the time column is left as a time
+    assert df["venue"].tolist() == ["MS_DARK"] * 3
+    assert df["tm"].dtype.kind == "m", df["tm"].dtype
+
+
+def test_a_null_adv_is_dropped_from_adv_not_from_the_row():
+    """A fill on a name with no ADV still counts for %Notional.
+
+    It cannot count for Adv or Fill%adv - there is nothing to divide by - but
+    dropping the row entirely would take its notional out of the venue's share
+    too, which is a different and wrong number.  fill_metrics carries NaN in
+    the two adv columns and the row everywhere else."""
+    rng = np.random.default_rng(7)
+    df = _synth_fills(rng, 4, ["MS_DARK"], country="JP")
+    df.loc[df.index[0], "adv"] = np.nan
+
+    m = fill_metrics(df)
+
+    assert np.isnan(m["adv_m"].iloc[0]), "a null adv must not become a number"
+    assert np.isnan(m["filladv"].iloc[0])
+    assert m["notional"].notna().all(), "the row itself stays, notional and all"
+    assert m["adv_m"].iloc[1:].notna().all(), "the other rows are untouched"
 
 
 def test_decomposition_adds_up():

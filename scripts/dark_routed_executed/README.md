@@ -318,9 +318,15 @@ python pie_slide.py out/routed.csv out/executed.csv --titles "Routed %" "Execute
 python scripts/dark_routed_executed/dark_routed_executed.py --self-test
 ```
 
-20 tests, no kdb connection needed — this script is written on a machine with
+21 tests, no kdb connection needed — this script is written on a machine with
 no kdb access, so everything except the q itself is pure Python and is checked
 here. Run it before shipping a change.
+
+`test_a_null_number_arrives_as_nan` holds what a **null number** must do: a q
+null makes PyKX return a masked array where the same column without one is a
+plain ndarray, and a mask reaching pandas is `TypeError: bad operand type for
+unary ~: 'float'` from inside its internals. Nothing downstream of `_to_pandas`
+ever sees one.
 
 Four hold the market rule, and they fail on the version of this script that read
 `target_stock.country` — that is what they are for:

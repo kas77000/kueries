@@ -526,12 +526,23 @@ were the part worth matching.
 python scripts/reversion_liquidity/reversion_liquidity.py --self-test
 ```
 
-27 tests. Everything except the q itself is pure Python and covered
+29 tests. Everything except the q itself is pure Python and covered
 offline — the clustering against brute force, the chunking equivalence, the two
 separate fill populations, the weighted-mean denominators, the venue grouping,
 and the Score arithmetic against the three published Bernstein rows. No kdb
 connection required, which matters because this is written on a machine that
 has none.
+
+Two hold what a **null number** must do — a q null makes PyKX return a masked
+array where the same column without one is a plain ndarray, and a mask reaching
+`fill_metrics` is `TypeError: bad operand type for unary ~: 'float'` out of
+pandas internals:
+
+- `test_a_null_number_arrives_as_nan` — nothing downstream of `_to_pandas` ever
+  sees a mask or a nullable extension dtype
+- `test_a_null_adv_is_dropped_from_adv_not_from_the_row` — a fill on a name with
+  no ADV still counts for `%Notional`; it just cannot count for `Adv` or
+  `Fill%adv`
 
 Four hold the market rule, and they fail on the version of this script that
 read `target_stock.country` — that is what they are for:
