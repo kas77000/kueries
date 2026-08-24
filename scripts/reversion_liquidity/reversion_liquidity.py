@@ -66,14 +66,25 @@ import datetime as dt
 import sys
 import time
 from itertools import combinations
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+# scripts/lib holds local_config, which reads the settings file beside this
+# script.  Added to the path rather than installed, so this still runs as
+# `python scripts/reversion_liquidity/reversion_liquidity.py` from the repo
+# root.  Copy scripts/lib alongside this folder if you move it.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from lib.local_config import apply_local                        # noqa: E402
+
 # -----------------------------------------------------------------------------
-# CONNECTIONS.  Edit these.  Both are the HISTORICAL processes, not the
-# realtime ones - qatt in particular exists in both flavours and only the
-# historical one carries a date column.
+# CONNECTIONS.  Edit these, or put them in a local_settings.py beside this
+# script - see scripts/lib/README.md.
+#
+# Both are the HISTORICAL processes, not the realtime ones - qatt in particular
+# exists in both flavours and only the historical one carries a date column.
 #
 # Both are open processes, so host and port is the whole of it - connect() takes
 # no credentials.
@@ -137,6 +148,17 @@ VENUE_GROUPS = {
     ("AU", "MS_DARK"):               ("MS Pool",     "MSPL"),
     ("AU", "POSITNOW_DARK"):         ("Posit",       "Posit"),
 }
+
+# -----------------------------------------------------------------------------
+# Anything above can be overridden from a local_settings.py beside this script,
+# which git ignores - so the servers survive a pull and this file never has to
+# be edited.  See scripts/lib/README.md.
+#
+# It sits here, above everything derived from the sheet, so a locally replaced
+# VENUE_GROUPS is the one the labels and the groupings are built from.
+# -----------------------------------------------------------------------------
+
+apply_local(globals(), __file__)
 
 # the column the accumulators are grouped on, once the sheet has been applied
 GROUP_COL = "venue_group"
@@ -327,7 +349,8 @@ def connect(hostport):
     if hostport.startswith(_PLACEHOLDER):
         raise SystemExit(
             f"{hostport!r} is still the placeholder.  Set ORDER_SERVER and "
-            f"QATT_SERVER near the top of {__file__}."
+            f"QATT_SERVER in a local_settings.py beside this script, or near "
+            f"the top of {__file__}."
         )
     try:
         import pykx

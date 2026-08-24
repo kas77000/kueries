@@ -54,12 +54,22 @@ import csv
 import datetime as dt
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+# scripts/lib holds local_config, which reads the settings file beside this
+# script.  Added to the path rather than installed, so this still runs as
+# `python scripts/dark_routed_executed/dark_routed_executed.py` from the repo
+# root.  Copy scripts/lib alongside this folder if you move it.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from lib.local_config import apply_local                        # noqa: E402
+
 # -----------------------------------------------------------------------------
-# CONNECTION.  Edit this.  The HISTORICAL order server, not the realtime one.
+# CONNECTION.  Edit this, or put it in a local_settings.py beside this script -
+# see scripts/lib/README.md.  The HISTORICAL order server, not the realtime one.
 #
 # It is an open process, so host and port is the whole of it - connect() takes
 # no credentials.
@@ -123,6 +133,18 @@ VENUE_GROUPS = {
     ("AU", "MS_DARK"):               ("MS Pool",     "MSPL"),
     ("AU", "POSITNOW_DARK"):         ("Posit",       "Posit"),
 }
+
+# -----------------------------------------------------------------------------
+# Anything above can be overridden from a local_settings.py beside this script,
+# which git ignores - so the server survives a pull and this file never has to
+# be edited.  See scripts/lib/README.md.
+#
+# It sits here, ABOVE SHORT_NAMES, so a locally replaced VENUE_GROUPS is the one
+# the pie labels are built from too - a derived name below this line cannot go
+# stale against a sheet set from outside.
+# -----------------------------------------------------------------------------
+
+apply_local(globals(), __file__)
 
 # display name -> pie label.  Built from the sheet, so the two can never drift.
 SHORT_NAMES = {name: short for name, short in VENUE_GROUPS.values()}
@@ -252,8 +274,9 @@ def connect(hostport):
     the pure-python half of this file stays importable without it."""
     if hostport.startswith(_PLACEHOLDER):
         raise SystemExit(
-            f"{hostport!r} is still the placeholder.  Set ORDER_SERVER near "
-            f"the top of {__file__}."
+            f"{hostport!r} is still the placeholder.  Set ORDER_SERVER in a "
+            f"local_settings.py beside this script, or near the top of "
+            f"{__file__}."
         )
     try:
         import pykx

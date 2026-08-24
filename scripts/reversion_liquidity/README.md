@@ -17,12 +17,17 @@ or typeset as a PDF (`--pdf`). See [Outputs](#outputs).
 
 ## Running it
 
-Set the two endpoints once, at the top of the script:
+Set the two endpoints once. They ship as placeholders at the top of the script:
 
 ```python
 ORDER_SERVER = "CHANGEME:5010"     # workorder, execution, target_stock
 QATT_SERVER  = "CHANGEME:5011"     # qatt
 ```
+
+but the place to put the real ones is a **`local_settings.py` beside this
+script**, which git ignores — see [Local settings](#local-settings) below, and
+[`scripts/lib/README.md`](../lib/README.md). Editing the script itself means the
+file you run is never the file in git.
 
 Both are the **historical** processes, not the realtime ones — `qatt` exists in
 both flavours and only the historical one carries a `date` column. Then:
@@ -127,6 +132,43 @@ Dropping it instead would take it out of `%Notional` too, so every other row
 would quietly grow; merging it by guesswork would put someone else's fills in a
 pool they did not trade in. Under its own `ALL_CAPS` name it is visible, in the
 right total, and obviously asking to be added.
+
+## Local settings
+
+Everything above the `apply_local(globals(), __file__)` line near the top of the
+script — the two servers, and `VENUE_GROUPS` — can be overridden from an
+untracked file beside it:
+
+```python
+# scripts/reversion_liquidity/local_settings.py     (git ignores it)
+ORDER_SERVER = "prod-oms-hist:5010"
+QATT_SERVER  = "prod-qatt-hist:5011"
+```
+
+A template with everything commented out is already there. Uncomment what you
+need; anything left commented keeps the placeholder, and a placeholder server
+fails loudly on `connect()` rather than half-running.
+
+`git pull` is then always clean and the settings survive it. On startup the
+script prints **which** names it took and never the values:
+
+```
+  local_settings.py: ORDER_SERVER, QATT_SERVER
+```
+
+**Strict on purpose.** A name the script does not define is an **error**, not a
+new setting — `QATT_SERVR` with a missing letter would otherwise sit there doing
+nothing while the run went on reading the placeholder. A broken settings file
+names itself and stops.
+
+`VENUE_GROUPS` can be set here too, but normally should not be: given locally it
+**replaces the whole dict**, so a partial copy silently unmaps every venue left
+out of it, and the sheet is tracked precisely so this script and
+`dark_routed_executed` name the same pool the same way. An unmapped venue is not
+a crash — see [A venue that is not in the sheet](#a-venue-that-is-not-in-the-sheet).
+
+`apply_local` sits **above** everything derived from the sheet, so a sheet set
+here is the one the row labels and the groupings are built from.
 
 ## How the data is produced
 

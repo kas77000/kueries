@@ -21,11 +21,16 @@ Reads **one** kdb process: the historical order server (`workorder`,
 
 ## Running it
 
-Set the endpoint once, at the top of the script:
+Set the endpoint once. It ships as a placeholder at the top of the script:
 
 ```python
 ORDER_SERVER = "CHANGEME:5010"     # workorder, target_stock
 ```
+
+but the place to put the real one is a **`local_settings.py` beside this
+script**, which git ignores — see [Local settings](#local-settings) below, and
+[`scripts/lib/README.md`](../lib/README.md). Editing the script itself means the
+file you run is never the file in git.
 
 The **historical** process, not the realtime one. Then:
 
@@ -116,6 +121,44 @@ The same sheet lives in `scripts/reversion_liquidity/reversion_liquidity.py`.
 Each script folder stands on its own, so **a new venue has to be added in both**
 — `test_venue_sheet_is_consistent` in each script checks its own copy's shape,
 but nothing checks the two against each other.
+
+## Local settings
+
+Everything above the `apply_local(globals(), __file__)` line near the top of the
+script — the server, and `VENUE_GROUPS` — can be overridden from an untracked
+file beside it:
+
+```python
+# scripts/dark_routed_executed/local_settings.py     (git ignores it)
+ORDER_SERVER = "prod-oms-hist:5010"
+```
+
+A template with everything commented out is already there. Uncomment what you
+need; anything left commented keeps the placeholder, and a placeholder server
+fails loudly on `connect()` rather than half-running.
+
+`git pull` is then always clean and the settings survive it. On startup the
+script prints **which** names it took and never the values:
+
+```
+  local_settings.py: ORDER_SERVER
+```
+
+**Strict on purpose.** A name the script does not define is an **error**, not a
+new setting — `ORDER_SERVR` with a missing letter would otherwise sit there
+doing nothing while the run went on reading the placeholder. A broken settings
+file names itself and stops.
+
+`VENUE_GROUPS` can be set here too, but normally should not be: given locally it
+**replaces the whole dict**, so a partial copy silently unmaps every venue left
+out of it, and the sheet is tracked precisely so this script and
+`reversion_liquidity` name the same pool the same way. An unmapped venue is not
+a crash — it keeps its kdb symbol, is named on stdout, and still rolls into
+`Other` if it is thin.
+
+`apply_local` sits **above** `SHORT_NAMES`, which is derived from the sheet, so
+a sheet set here reaches the pie labels too. `SHORT_NAMES` itself is derived,
+not a setting: naming it is one of those errors.
 
 ## How the data is produced
 
