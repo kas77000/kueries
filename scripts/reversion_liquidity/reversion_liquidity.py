@@ -179,11 +179,6 @@ VENUE_GROUPS = {
     ("AU", "LNAL_DARK"):             ("LNAL",        "Liqnet"),
     ("AU", "LIQH_DARK"):             ("LNAL Cond",   "Liqnet Cond"),
     ("AU", "LIQUID_DRKFRM"):         ("LNAL Cond",   "Liqnet Cond"),
-    # CBOE_RBC_DARK came over TWICE: as Centrepoint up with the ASX pools,
-    # and as CBOE here.  A dict literal keeps the LAST of a repeated key and
-    # says nothing about it, so a run of that sheet was already using CBOE -
-    # which is why that is what is written here.  They are different pools;
-    # say so if the other one was meant.
     ("AU", "CBOE_RBC_DARK"):         ("CBOE",        "CBOE"),
     ("AU", "CRAIGS_NZX_DARK"):       ("CRAIGS",      "CRAIGS"),
 }
@@ -739,7 +734,15 @@ def build_liquidity(fill_acc, child_acc):
     out["Fill Rate"] = _safe_div(c["fr_wnum"], c["fr_wsum"])
     out["Duration"] = _safe_div(c["duration_sum"], c["duration_n"])
     out.index.name = "Venue"
-    return out.sort_index()
+    # BIGGEST FIRST.  The venue that moved the money is what the page is about,
+    # and fifteen pools in alphabetical order is a lookup table, not a ranking -
+    # you cannot see the shape of the flow without reading every row.
+    #
+    # sort_index() first and a stable sort second, so venues that tie - which in
+    # practice means several that traded nothing - come out in a fixed, readable
+    # order rather than in whatever order the accumulator happened to hold them.
+    return out.sort_index().sort_values("%Notional", ascending=False,
+                                        kind="stable")
 
 
 def pooled_z(fill_acc):
@@ -799,12 +802,16 @@ def build_decomposition(fill_acc):
 
 
 def build_dropped(fill_acc):
-    """Fills the quote based metrics could not use, per venue."""
+    """Fills the quote based metrics could not use, per venue.
+
+    Ordered by fill count rather than by name, for the same reason 3.1 is: the
+    venue with the most fills behind it is the one whose no-quote rate decides
+    whether the tables above are worth reading."""
     d = fill_acc[["n_fill", "no_quote", "bad_spread"]].copy()
     d["% no quote"] = 100.0 * d["no_quote"] / d["n_fill"]
     d["% crossed"] = 100.0 * d["bad_spread"] / d["n_fill"]
     d.index.name = "Venue"
-    return d
+    return d.sort_index().sort_values("n_fill", ascending=False, kind="stable")
 
 
 # -----------------------------------------------------------------------------
@@ -1691,6 +1698,37 @@ def test_country_reaches_q_as_chars():
     # and the every-country case has to stay an EMPTY char vector, so the
     # `0=count ctry` branch in the q still fires
     assert b"" == "".encode()
+
+
+def test_the_tables_are_ordered_biggest_first():
+    """3.1 by %Notional, 3.3 by Score, the decomposition by Reversion, the
+    dropped footer by fills - all descending, none of them alphabetical.
+
+    With fifteen pools on the sheet an alphabetical table is a lookup table:
+    every row has to be read before the shape of the flow is visible.  Each of
+    these four is sorted on the column it exists to show."""
+    # named so that ALPHABETICAL and BIGGEST-FIRST are opposite orders - with
+    # BIG/MID/SMALL the two agree, and the test cannot tell a sorted table from
+    # a sort_index()'d one
+    rng = np.random.default_rng(11)
+    df = pd.concat([_synth_fills(rng, 300, ["ZEBRA"]),
+                    _synth_fills(rng, 40, ["MIDDLE"]),
+                    _synth_fills(rng, 8, ["ALPHA"])], ignore_index=True)
+    df.loc[df["venue"] == "ZEBRA", "fillsize"] *= 10
+    acc = aggregate_fills(fill_metrics(df))
+
+    liq = build_liquidity(acc, pd.DataFrame(columns=CHILD_ACC, dtype=float))
+    assert list(liq.index) == ["ZEBRA", "MIDDLE", "ALPHA"], list(liq.index)
+    assert liq["%Notional"].is_monotonic_decreasing
+
+    dropped = build_dropped(acc)
+    assert list(dropped.index) == ["ZEBRA", "MIDDLE", "ALPHA"], list(dropped.index)
+
+    tier = build_tiering(acc, min_fills=1, tiers="auto")
+    assert tier["Score"].is_monotonic_decreasing, tier["Score"].tolist()
+
+    dec = build_decomposition(acc)
+    assert dec["Reversion"].is_monotonic_decreasing, dec["Reversion"].tolist()
 
 
 def test_the_market_is_the_sym_suffix():

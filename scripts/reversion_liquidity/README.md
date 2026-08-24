@@ -484,6 +484,16 @@ the sort is visible as one.
 
 ## Outputs
 
+**Row order.** Every table is sorted on the column it exists to show, biggest
+first — 3.1 by `%Notional`, 3.3 by `Score` (so the tiers come out contiguous,
+Tier 1 at the top), the decomposition by `Reversion`, and the excluded-fills
+footer by fill count. None of them is alphabetical: with fifteen pools on the
+sheet, a name-ordered table is a lookup table — every row has to be read before
+the shape of the flow is visible. Venues that tie fall back to name order, so a
+run is reproducible. `test_the_tables_are_ordered_biggest_first` pins it. The
+workbook holds numbers rather than strings, so any of it can be re-sorted in
+Excel.
+
 Everything goes to stdout by default. The two file outputs carry the same
 numbers through the same format specs, so they can only differ from the
 terminal in presentation.
@@ -531,7 +541,7 @@ were the part worth matching.
 python scripts/reversion_liquidity/reversion_liquidity.py --self-test
 ```
 
-30 tests. Everything except the q itself is pure Python and covered
+31 tests. Everything except the q itself is pure Python and covered
 offline — the clustering against brute force, the chunking equivalence, the two
 separate fill populations, the weighted-mean denominators, the venue grouping,
 and the Score arithmetic against the three published Bernstein rows. No kdb
