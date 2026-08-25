@@ -140,9 +140,26 @@ Written before the change, from the cases in the investigation:
 - a forty-second brush of a limit → ~1%, out
 - the removed `--min-mins` is gone from the parser and from `to_limits`
 
-## 6. Out of scope
+## 6. Completion, the same fix as `short_sell_report`
 
 `luld_orders` computes Completion as notional executed over notional ordered —
 the same defect fixed in `short_sell_report` (commit `46c0be4`), and it can
-print over 100% the same way. Noted here so it is not lost; it is a separate
-change with its own commit.
+print over 100% for the same reason: **ordered is theoretical** (the whole
+quantity at a price the unfilled part never traded at) and **executed is
+realised** (what the fills really paid), so their ratio is the share completion
+multiplied by a price move.
+
+The fix is the one already made there, applied identically:
+
+- Completion becomes `executed / order_qty` **in shares**, on the region row and
+  on the totals line.
+- **Both notional columns keep their current meaning.** Ordered stays
+  theoretical, executed stays real money at real prices. Executed may still
+  exceed ordered; nothing divides them any more.
+- The note under the title drops the sentence explaining the notional ratio.
+
+Unlike `short_sell_report`, this report has no `completion_usd` column in its
+CSV to replace, so nothing is removed there.
+
+This lands as its **own commit**, after the pinned-% work, so each change says
+one thing.
