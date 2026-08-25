@@ -94,7 +94,20 @@ DPI = 200
 
 # How long a run of locked or one sided quoting has to last before it is a
 # limit period rather than a print.  limit_up_down.q takes this as `lookback`.
-MIN_LIMIT_MINS = 20.0
+#  A LIMIT PERIOD HAS NO MINIMUM LENGTH.  There used to be one, of 20
+#  minutes, applied to each period on its own - and it made this report print
+#  zero orders every day on a book full of them.  Three things compound:
+#  Q_LIMITS ends a run on a single normal tick, a run is a FLOOR because a
+#  pinned stock stops quoting, and the minimum was then applied to each run
+#  separately.  So the harder a stock was pinned, the shorter its runs and the
+#  more certainly they were discarded - the filter was biased against exactly
+#  the orders this report exists to find.
+#
+#  What counts now is the share of an ORDER'S LIFE its stock spent at a limit,
+#  with the runs unioned first so the tick splitting is irrelevant.  Noise
+#  filters itself: to_limits still drops a run with no width at all, and a two
+#  tick blip is seconds against an order's hours.
+MIN_PINNED_PCT = 25.0
 
 # -----------------------------------------------------------------------------
 # EMAIL.  Edit these, or put them in local_settings.py.  No command line
@@ -712,12 +725,17 @@ def drop_dead_on_arrival(orders, states) -> tuple:
     return keep, dead
 
 
-def to_limits(records, d=None, min_mins=MIN_LIMIT_MINS) -> list:
-    """Limit periods long enough to count.
+def to_limits(records, d=None, min_mins=None) -> list:
+    """Every limit period the quotes prove, at ANY length.
 
     A period is a FLOOR: a pinned stock often stops quoting altogether, so it
     ends at the last tick that PROVED it and never later.  Under-reporting is
     the chosen direction - a window this cannot prove is not one it claims.
+
+    NO MINIMUM LENGTH.  See MIN_PINNED_PCT for why there used to be one and
+    why it was wrong.  A run with no width at all is still dropped: it cannot
+    be measured against anything.  min_mins is accepted and ignored so a
+    caller that still passes it is not an error, and is not honoured either.
     """
     out = []
     for r in records:
@@ -732,8 +750,6 @@ def to_limits(records, d=None, min_mins=MIN_LIMIT_MINS) -> list:
                     start=start, end=end, price=price,
                     ticks=_i(r.get("ticks")), noask=_i(r.get("noask")),
                     nobid=_i(r.get("nobid")), net=_f(r.get("net")))
-        if lim.minutes < min_mins:
-            continue
         out.append(lim)
     return out
 
@@ -760,22 +776,45 @@ def limits_by_sym(limits) -> dict:
     return out
 
 
-def touched(orders, limits) -> tuple:
-    """(orders a limit period overlapped, {order key: its periods}).
+def touched(orders, limits, lives=None, splits=None,
+            min_pct=MIN_PINNED_PCT) -> tuple:
+    """(orders at a limit, {key: its periods}, {key: pinned % or None}).
 
-    An order that finished before its stock went to the limit is not a LULD
-    order, however dramatic the stock's afternoon was.
+    An order counts when its stock was at a limit for at least min_pct of the
+    ORDER'S OWN LIFE - not when some single period was long enough.  The runs
+    are unioned before they are measured, so a period the feed punctuated is
+    one period and not several worthless ones.
+
+    An order that finished before its stock went to the limit is still not a
+    LULD order, however dramatic the stock's afternoon was: it contributes no
+    overlap, so its share is zero.
+
+    An order nothing can bound gets None rather than a number and is left out.
+    A share of an unknown life is not a small share, and overlap()'s
+    midnight-to-midnight stand-in - right for "did these meet at all" - would
+    make it one.
     """
     index = limits_by_sym(limits)
-    keep, hits = [], {}
+    lives = lives or {}
+    splits = splits or {}
+    keep, hits, pinned = [], {}, {}
     for o in orders:
-        got = [w for w in index.get((o.date, o.sym), ())
-               if overlap(o.t_start, o.t_end, w.start, w.end)]
-        if not got:
+        got = sorted(index.get((o.date, o.sym), ()), key=lambda w: w.start)
+        win = order_window(o, splits.get(o.key, Splits()), lives.get(o.key))
+        if win is None:
+            pinned[o.key] = None
+            continue
+        pct = 100.0 * pinned_ms(win, got) / (win[1] - win[0])
+        pinned[o.key] = pct
+        #  NO OVERLAP IS NEVER IN, whatever min_pct is set to.  An order that
+        #  finished before its stock went to the limit is not a LULD order,
+        #  however dramatic the stock's afternoon was, and a gate of 0 asks
+        #  for "any overlap at all" rather than for everything.
+        if pct <= 0.0 or pct < min_pct:
             continue
         keep.append(o)
         hits[o.key] = got
-    return keep, hits
+    return keep, hits, pinned
 
 
 # =============================================================================
@@ -1573,7 +1612,8 @@ def run(args) -> int:
     qh = connect(pl.qatt_server)
 
     orders, executed, hits = [], {}, {}
-    seen, cancelled, no_limit_days = 0, 0, 0
+    seen, cancelled, no_limit_days, unbounded = 0, 0, 0, 0
+    pinned = {}
     for d in pl.dates:
         if not args.quiet and d is not None:
             log(f"  {d} ...")
@@ -1587,19 +1627,26 @@ def run(args) -> int:
         if not day:
             continue
         syms = sorted({o.sym for o in day})
-        lims = to_limits(fetch_limits(qh, pl.hist, d, syms), d, args.min_mins)
+        lims = to_limits(fetch_limits(qh, pl.hist, d, syms), d)
         if not lims:
             #  a day with no limit period anywhere is possible; a run of them
             #  means the quote query is matching nothing rather than the market
             #  being calm
             no_limit_days += 1
             continue
-        kept, day_hits = touched(day, lims)
+        #  the splits are built BEFORE the gate, because the order's window
+        #  falls back to its children when nothing else bounds it
+        day_splits = splits_by_order(wr, day)
+        kept, day_hits, day_pinned = touched(
+            day, lims, life_by_order(sr, day), day_splits,
+            args.min_pinned_pct)
+        unbounded += sum(1 for v in day_pinned.values() if v is None)
         if not kept:
             continue
         orders.extend(kept)
         hits.update(day_hits)
-        executed.update(splits_by_order(wr, kept))
+        pinned.update({k: v for k, v in day_pinned.items() if v is not None})
+        executed.update({o.key: day_splits.get(o.key, Splits()) for o in kept})
 
     lines = to_lines(orders, executed, hits)
     rows = by_region(lines)
@@ -1615,9 +1662,14 @@ def run(args) -> int:
     log(f"  {seen - cancelled:,} orders in scope, {tot.orders:,} of them were "
         f"live while their stock was at a limit")
     if seen and not tot.orders:
-        log(f"  WARNING: {seen:,} orders were in scope and NOT ONE was live "
-            f"through a limit period. Check {pl.qatt_server} has the syms, and "
-            f"that --min-mins {args.min_mins:g} is not filtering them all out.")
+        log(f"  WARNING: {seen:,} orders were in scope and NOT ONE spent "
+            f"{args.min_pinned_pct:g}% of its life at a limit. Check that "
+            f"{pl.qatt_server} has the syms, and "
+            f"try --min-pinned-pct lower than {args.min_pinned_pct:g}.")
+    if unbounded:
+        log(f"  {unbounded:,} order(s) had no target_state row, no t_start or "
+            f"t_end and no children, so nothing bounds their life and they "
+            f"have no pinned %")
     if no_limit_days:
         log(f"  {no_limit_days} of {len(pl.dates)} days had no limit period at "
             f"all")
@@ -1743,8 +1795,12 @@ def demo_session(d=None):
                          limit_price=px if otype == "limit" else 0.0,
                          adjclose=px * 0.9, fxlast=FX.get(region, 1.0)))
             sym = tr[-1]["sym"]
-            start = 11 * H + (k % 90) * 60_000
-            end = start + (25 + (k % 40)) * 60_000     # all over --min-mins
+            start = 10 * H + (k % 60) * 60_000
+            #  100 to 180 minutes inside a 330 minute order: 30% to 54%, so
+            #  all of them clear MIN_PINNED_PCT.  The gate is a SHARE now, so
+            #  a period long in absolute terms is not the same as one that
+            #  filled an order's life - which is the whole point of the change
+            end = start + (100 + (k % 80)) * 60_000
             #  a spread of directions, including LOCKED runs the book cannot
             #  call from the sides alone - all stay in scope, which is the point
             lims.append(_lim(sym, start, end, price=px, d=d, noask=up,
@@ -1764,20 +1820,22 @@ def demo_session(d=None):
     k += 1
     tr.append(_t(k, "JP", 500_000, d=d, t_gen=9 * H, t_start=10 * H))
     sr.append(_ts(k, 9 * H + 60_000, "cancelled", d=d))
-    lims.append(_lim(tr[-1]["sym"], 11 * H, 12 * H, d=d))
+    lims.append(_lim(tr[-1]["sym"], 11 * H, 13 * H, d=d))
     #  an order that sat through a limit and NEVER SENT A CHILD.  0 splits,
     #  no times, and the case this is all being built towards
     k += 1
     tr.append(_t(k, "TW", 75_000, d=d))
-    lims.append(_lim(tr[-1]["sym"], 11 * H, 12 * H, d=d))
+    lims.append(_lim(tr[-1]["sym"], 11 * H, 13 * H, d=d))
     #  a LOCKED stock with no close on file, which stays unknown
     #  in scope anyway - unknown is an answer, not a reason to drop an order
     k += 1
     tr.append(_t(k, "JP", 120_000, d=d, adjclose=None, orgclose=None))
-    lims.append(_lim(tr[-1]["sym"], 11 * H, 12 * H, d=d, noask=0, nobid=0,
+    lims.append(_lim(tr[-1]["sym"], 11 * H, 13 * H, d=d, noask=0, nobid=0,
                      net=0.0))
     wr.append(_wo(k, k, 60_000, d=d, gen=11 * H + 60_000, off=12 * H))
-    #  one stock that only blipped: under the minimum, so its order is out
+    #  one stock that only blipped.  Two minutes of a 330 minute order is
+    #  0.6%, so it is out on the SHARE - no minimum on the period is needed
+    #  to exclude it, which is what let the flickering stocks back in
     k += 1
     tr.append(_t(k, "JP", 99_000, d=d))
     lims.append(_lim(tr[-1]["sym"], 12 * H, 12 * H + 120_000, d=d))
@@ -1791,7 +1849,9 @@ def demo_session(d=None):
     orders = to_orders(tr)
     orders, _dead = drop_dead_on_arrival(orders,
                                          last_state_by_order(sr, orders))
-    kept, hits = touched(orders, to_limits(lims, d))
+    #  the real default, so the sample page shows what a real run shows
+    kept, hits, _pin = touched(orders, to_limits(lims, d),
+                               life_by_order(sr, orders), {}, MIN_PINNED_PCT)
     ex = splits_by_order(wr, kept)
     lines = to_lines(kept, ex, hits)
     rows = by_region(lines)
@@ -1827,6 +1887,7 @@ def self_test() -> int:
               + ("" if good else f"   got {got!r}, want {want!r}"))
 
     H = 3_600_000
+    M = 60_000
     print("luld_orders --self-test\n")
 
     print("the q, without a q")
@@ -1855,23 +1916,64 @@ def self_test() -> int:
     check("the q patterns come from the same table",
           sorted(SYM_PATTERNS)[:3], ["*.C1", "*.C2", "*.CH"])
 
-    print("\na limit period has to last")
+    print("\na limit period has no minimum length")
+    #  IT USED TO NEED TWENTY MINUTES, and that made this report read zero.
+    #  The minimum was applied to each period on its own, while a pinned stock
+    #  produces many SHORT runs - Q_LIMITS ends one on a single normal tick,
+    #  and a run is a floor because a pinned stock stops quoting.  See
+    #  MIN_PINNED_PCT.
     lims = to_limits([_lim("7203.JP", 11 * H, 11 * H + 1_200_000),
-                      _lim("6103.JP", 11 * H, 11 * H + 60_000)],
-                     min_mins=20.0)
-    check("twenty minutes counts", [w.sym for w in lims], ["7203.JP"])
-    check("one minute is a print, not a period", len(lims), 1)
-    check("and the minimum is a setting, not a constant",
-          len(to_limits([_lim("6103.JP", 11 * H, 11 * H + 60_000)],
-                        min_mins=0.5)), 1)
-    check("a period with no width at all is not one",
-          len(to_limits([_lim("6103.JP", 11 * H, 11 * H)], min_mins=0.0)), 0)
+                      _lim("6103.JP", 11 * H, 11 * H + 60_000)])
+    check("a one minute run is kept beside a twenty minute one",
+          sorted(w.sym for w in lims), ["6103.JP", "7203.JP"])
+    check("a period with no width at all is still not one",
+          len(to_limits([_lim("6103.JP", 11 * H, 11 * H)])), 0)
     check("minutes are the window, not the tick count",
-          to_limits([_lim("7203.JP", 11 * H, 11 * H + 1_800_000)],
-                    min_mins=20.0)[0].minutes, 30.0)
+          to_limits([_lim("7203.JP", 11 * H, 11 * H + 1_800_000)])[0].minutes,
+          30.0)
+    check("min_mins is accepted and ignored, never honoured",
+          len(to_limits([_lim("a", 11 * H, 11 * H + 60_000)], min_mins=20.0)),
+          1)
+
+    print("\nthe gate is a share of the order's life")
+    g_ord = to_orders([_t(1, "JP", 1000, t_start=11 * H, t_end=12 * H)])
+    g_key = g_ord[0].key
+    g_life = life_by_order([_ts(1, 11 * H), _ts(1, 12 * H)], g_ord)
+
+    def _gate(runs, pct):
+        return touched(g_ord, to_limits(runs), g_life, {}, pct)
+
+    #  the case from the investigation: twelve four minute runs over the hour
+    flick = [_lim("1001.JP", 11 * H + i * 5 * M, 11 * H + i * 5 * M + 4 * M)
+             for i in range(12)]
+    g_kept, _gh, g_pin = _gate(flick, 25.0)
+    check("the flickering stock is counted now", len(g_kept), 1)
+    check("at 80% of the order's life", round(g_pin[g_key], 1), 80.0)
+    check("it clears a 50% gate too", len(_gate(flick, 50.0)[0]), 1)
+    check("but not a 90% one", len(_gate(flick, 90.0)[0]), 0)
+    check("exactly the threshold counts - the gate is >=",
+          len(_gate([_lim("1001.JP", 11 * H, 11 * H + 15 * M)], 25.0)[0]), 1)
+    #  a stock brushing its band once is what the old minimum was for, and the
+    #  share does that job without discarding the flicker
+    check("a forty second brush does not",
+          len(_gate([_lim("1001.JP", 11 * H, 11 * H + 40_000)], 25.0)[0]), 0)
+    check("a period the order was never live for counts for nothing",
+          round(_gate([_lim("1001.JP", 9 * H, 10 * H)], 25.0)[2][g_key], 1),
+          0.0)
+    #  an order nothing can bound has no life to take a share of
+    u_ord = to_orders([_t(2, "JP", 1000, t_start=None, t_end=None)])
+    u_kept, _uh, u_pin = touched(u_ord, to_limits(
+        [_lim(u_ord[0].sym, 11 * H, 12 * H)]), {}, {}, 25.0)
+    check("an order nothing bounds gets no percentage",
+          u_pin[u_ord[0].key], None)
+    check("and is not counted", len(u_kept), 0)
+
+    check("--min-mins is gone from the parser",
+          "--min-mins" in build_parser().format_help(), False)
+    check("--min-pinned-pct replaced it, defaulting to 25",
+          build_parser().parse_args([]).min_pinned_pct, 25.0)
 
     print("\nunioning the runs")
-    M = 60_000
     #  ONE NORMAL TICK SPLITS A RUN.  Q_LIMITS groups on `differ lim`, so a
     #  stock that flickers at its band comes back as many short runs rather
     #  than one long one.  Unioning first is what makes that irrelevant.
@@ -1977,13 +2079,13 @@ def self_test() -> int:
                       _t(2, "JP", 1000, t_start=9 * H, t_end=10 * H)])
     ws = to_limits([_lim(ords[0].sym, 11 * H, 12 * H),
                     _lim(ords[1].sym, 11 * H, 12 * H)])
-    kept, hits = touched(ords, ws)
+    kept, hits, _p2 = touched(ords, ws, {}, {}, 0.0)
     check("an order live through the limit is in",
           [o.id_target for o in kept], [1])
     check("one that finished before it is not", len(kept), 1)
     check("and the period is carried with it", len(hits[kept[0].key]), 1)
     check("a stock with no limit period brings nothing",
-          len(touched(ords, [])[0]), 0)
+          len(touched(ords, [], {}, {}, 0.0)[0]), 0)
     check("an order still open cannot be ruled out by its missing end",
           overlap(9 * H, None, 13 * H, 14 * H), True)
     check("nor one with no start", overlap(None, 15 * H, 9 * H, 10 * H), True)
@@ -1998,7 +2100,7 @@ def self_test() -> int:
     tw = to_limits([_lim(two[0].sym, 11 * H, 12 * H),
                     _lim(two[1].sym, 11 * H, 12 * H)])
     check("a seller and a buyer are both in scope, whatever the band was",
-          len(touched(two, tw)[0]), 2)
+          len(touched(two, tw, {}, {}, 0.0)[0]), 2)
 
     print("\nthe rollup")
     ro = to_orders([_t(1, "JP", 1000), _t(2, "JP", 3000), _t(3, "KR", 2000)])
@@ -2154,7 +2256,7 @@ def self_test() -> int:
     unk = to_orders([_t(1, "JP", 1000, t_start=9 * H, t_end=15 * H)])
     ul = to_limits([_lim(unk[0].sym, 11 * H, 12 * H, noask=0, nobid=0)])
     check("a period the book cannot call still puts its order in scope",
-          len(touched(unk, ul)[0]), 1)
+          len(touched(unk, ul, {}, {}, 0.0)[0]), 1)
     check("one line, several periods, one answer",
           line_direction(to_limits([_lim("a", 10 * H, 11 * H, noask=9),
                                     _lim("a", 12 * H, 13 * H, noask=9)])), UP)
@@ -2185,7 +2287,8 @@ def self_test() -> int:
           len(touched(to_orders([_t(1, "JP", 100, otype="market"),
                                  _t(2, "JP", 100, otype="limit")]),
                       to_limits([_lim("1001.JP", 11 * H, 12 * H),
-                                 _lim("1002.JP", 11 * H, 12 * H)]))[0]), 2)
+                                 _lim("1002.JP", 11 * H, 12 * H)]),
+                      {}, {}, 0.0)[0]), 2)
 
     print("\nthe children, counted and timed")
     sp = splits_by_order(
@@ -2283,7 +2386,7 @@ def self_test() -> int:
     ro = to_orders([_t(1, "JP", 1000, t_start=11 * H + 1_800_000,
                        t_end=15 * H)])
     rw = to_limits([_lim(ro[0].sym, 11 * H, 12 * H)], min_mins=0.0)
-    rk, rh = touched(ro, rw)
+    rk, rh, _rp = touched(ro, rw, {}, {}, 0.0)
     one = raw_rows(to_lines(rk, splits_by_order([_wo(9, 1, 250)], rk),
                             rh))[0]
     check("the limit period is 60 minutes",
@@ -2380,7 +2483,10 @@ def self_test() -> int:
 # CLI
 # =============================================================================
 
-def main(argv=None) -> int:
+def build_parser():
+    """Built here rather than inline in main() so a test can read
+    a default without running anything - see the --min-pinned-pct
+    checks in self_test()."""
     p = argparse.ArgumentParser(
         description="Orders at a Limit - order quantity, executed and "
                     "completion by region, for orders whose stock was limit "
@@ -2392,10 +2498,10 @@ def main(argv=None) -> int:
                    help="a whole month off the HISTORICAL servers")
     p.add_argument("--date", type=dt.date.fromisoformat, metavar="YYYY-MM-DD",
                    help="one past session off the HISTORICAL servers")
-    p.add_argument("--min-mins", type=float, default=MIN_LIMIT_MINS,
+    p.add_argument("--min-pinned-pct", type=float, default=MIN_PINNED_PCT,
                    metavar="N",
-                   help="how long a run of locked or one sided quoting has to "
-                        "last to count as a limit period")
+                   help="an order counts when its stock was at a limit for at "
+                        "least this %% of the order's own life")
     p.add_argument("--csv", action="store_true",
                    help="also write the table as CSV beside the PDF")
     p.add_argument("--raw", action="store_true",
@@ -2411,6 +2517,11 @@ def main(argv=None) -> int:
                    help="write the report but do not send it, whatever "
                         "EMAIL_TO says")
     p.add_argument("--quiet", action="store_true")
+    return p
+
+
+def main(argv=None) -> int:
+    p = build_parser()
     args = p.parse_args(argv)
 
     if args.self_test:
