@@ -633,6 +633,57 @@ def last_state_by_order(records, orders) -> dict:
     return out
 
 
+def life_by_order(records, orders) -> dict:
+    """{order key: (first, last)} from target_state's TIMED rows.
+
+    The order's REAL lifecycle, which is what a share of its life has to be
+    measured against - t_start and t_end are what the target row intended,
+    a different question and a worse answer to this one.
+
+    Same shape as last_state_by_order and for the same reason: decided here
+    rather than in q, where the self test can prove it.
+
+    A row with no time is skipped at BOTH ends.  It cannot be ordered, so it
+    can be neither the first nor the last, and taking it as midnight would
+    make it the first.
+    """
+    known = {o.key for o in orders}
+    out = {}
+    for r in records:
+        key = (_d(r.get("date")), _i(r.get("id_server")),
+               _i(r.get("id_target")))
+        if key not in known:
+            continue
+        at = _ms(r.get("time"))
+        if at is None:
+            continue
+        got = out.get(key)
+        out[key] = ((at, at) if got is None
+                    else (min(got[0], at), max(got[1], at)))
+    return out
+
+
+def order_window(o, sp, life) -> Optional[tuple]:
+    """(start, end) in ms, or None when nothing can bound the order.
+
+    Three sources, best first: target_state's first and last rows, then the
+    target row's own t_start/t_end, then the children.
+
+    EACH SOURCE IS TRIED AS A PAIR.  A start from one and an end from another
+    straddle two different notions of when the order lived, and the
+    denominator of a percentage is the wrong place to be approximately right.
+
+    A source giving a window with no width - one state row, say - is not a
+    window to take a share OF, so it falls through to the next rather than
+    ending the search.
+    """
+    for lo, hi in (life or (None, None), (o.t_start, o.t_end),
+                   (sp.first_gen, sp.last_off)):
+        if lo is not None and hi is not None and hi > lo:
+            return lo, hi
+    return None
+
+
 def died_before_starting(o, last) -> bool:
     """Was this order over before its own start time?
 
@@ -1855,6 +1906,38 @@ def self_test() -> int:
                     to_limits([_lim("a", 9 * H, 10 * H)], min_mins=0.0)), 0)
     check("no periods at all is zero, not undefined",
           pinned_ms((11 * H, 12 * H), []), 0)
+
+    print("\nthe order's live window")
+    #  target_state is the order's REAL lifecycle.  t_start and t_end are what
+    #  the target row INTENDED, which is a different question and a worse
+    #  answer to this one.
+    w_ord = to_orders([_t(1, "JP", 1000, t_start=10 * H, t_end=15 * H)])
+    w_key = w_ord[0].key
+    life = life_by_order([_ts(1, 11 * H), _ts(1, 13 * H), _ts(1, 12 * H)],
+                         w_ord)
+    check("first and last TIMED state rows, whatever order they arrive in",
+          life[w_key], (11 * H, 13 * H))
+    check("and target_state wins over the target row's own times",
+          order_window(w_ord[0], Splits(), life[w_key]), (11 * H, 13 * H))
+    check("a row with no time cannot bound anything",
+          life_by_order([_ts(1, None)], w_ord), {})
+    check("a row for another order is not this order's life",
+          life_by_order([_ts(2, 11 * H)], w_ord), {})
+    check("with no state rows at all it falls back to the target row",
+          order_window(w_ord[0], Splits(), None), (10 * H, 15 * H))
+    #  a single state row is a zero length life, which is not a window to take
+    #  a share OF - so it falls through rather than ending the search
+    check("one state row is not a window, so the next source is used",
+          order_window(w_ord[0], Splits(), (11 * H, 11 * H)), (10 * H, 15 * H))
+    #  the children are the last resort
+    no_t = to_orders([_t(2, "JP", 1000, t_start=None, t_end=None)])[0]
+    check("with no state rows and no target times, the children bound it",
+          order_window(no_t, Splits(n=1, first_gen=10 * H, last_off=14 * H),
+                       None), (10 * H, 14 * H))
+    check("and with nothing at all there is no window",
+          order_window(no_t, Splits(), None), None)
+    check("nor when a source runs backwards",
+          order_window(no_t, Splits(), (13 * H, 11 * H)), None)
 
     print("\nover before it began")
     #  an order cancelled before its own t_start never worked, so counting
