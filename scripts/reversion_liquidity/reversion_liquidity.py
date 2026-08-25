@@ -13,6 +13,18 @@ data, for DARK executions only.
   Table 3.3  Venue tiering / ranking on 1s reversion and quote stability
              venue, Reversion, Stability, Score, Tier
 
+TWO SEPARATE CUTS DECIDE WHICH VENUES GET A ROW, and they are not the same one:
+
+  --min-venue-fills 2000   a venue thinner than this gets no row in 3.1, and
+                           its notional leaves %Notional, so the column sums to
+                           100.  The report makes this cut - see thin_venues()
+                           for what it was calibrated against.
+  --min-fills 1000         of the venues 3.1 kept, those without enough QUOTED
+                           fills to score are left out of 3.3 only.
+
+Neither is hidden: both print the venues they took out, and the excluded-fills
+table at the foot still reports every venue we saw.
+
 --decompose adds a third table splitting Reversion into the two effects it is
 made of - Capture, where in the touch the fill happened, and Drift, where the
 mid went in the second after.  --out-dir writes the tables to report.xlsx, and
@@ -719,10 +731,47 @@ def _safe_div(a, b):
                      index=b.index)
 
 
-def build_liquidity(fill_acc, child_acc):
+def thin_venues(fill_acc, min_venue_fills):
+    """Venues the report does not publish a row for, by fill count.
+
+    The report's tables carry fewer venues than we accumulate, and the cut is
+    on SIZE, not on which venue it is - JP publishes LNAL at 5.3% of notional
+    while HK, where the same pool is thinner, leaves it out entirely.  So this
+    cannot be a fixed exclusion list, and it is not %Notional either: HK needs
+    a cut above 3.0% to lose LNAL, JP needs one at or below 2.1% to keep Posit,
+    and no single number is both.
+
+    Fill COUNT is what separates them, and one threshold covers all three
+    markets.  Against our own numbers for 2026-04-01..06-30, the biggest venue
+    the report drops and the smallest it keeps are:
+
+        JP   LNAL Cond     89  <  T <=   3,108  LNAL
+        AU   CBOE         334  <  T <=   5,228  MS Pool
+        HK   LNAL       1,639  <  T <=  15,683  CLSA
+
+    which leaves 1,639 < T <= 3,108 for all three at once.  The 2000 default
+    sits inside it with room on both sides.
+
+    A count is also the sturdier thing to threshold on while our notionals and
+    theirs still disagree - see the README - because it is a count of fills
+    rather than a money weighted figure, so it does not move with whatever is
+    making %Notional differ.
+    """
+    if fill_acc is None or len(fill_acc) == 0:
+        return []
+    thin = fill_acc.index[fill_acc["n_fill"] < min_venue_fills]
+    return sorted(thin)
+
+
+def build_liquidity(fill_acc, child_acc, drop=()):
     """Table 3.1.  Four columns are per fill, two are per child order; they are
-    accumulated separately and only meet here, on venue."""
-    f = fill_acc
+    accumulated separately and only meet here, on venue.
+
+    Venues in `drop` are removed BEFORE the total is taken, so %Notional
+    renormalises over the rows actually shown and the column sums to 100 - the
+    way the report's does.  build_dropped() still reports every venue, so what
+    was filtered out stays visible one table further down."""
+    f = fill_acc.drop(index=[v for v in drop if v in fill_acc.index])
     c = child_acc if child_acc is not None else pd.DataFrame(columns=CHILD_ACC)
     c = c.reindex(f.index)
 
@@ -937,11 +986,20 @@ def assign_tiers(scores, k):
     return np.array([remap[u] for u in labels], dtype=int)
 
 
-def build_tiering(fill_acc, min_fills, tiers):
-    """Table 3.3.  min_fills applies to the TIERING ONLY - table 3.1 keeps
-    every venue.  That is why the report shows fewer venues in 3.3 than in 3.1:
-    CLSA and Posit, the two smallest, are absent there."""
+def build_tiering(fill_acc, min_fills, tiers, drop=()):
+    """Table 3.3.  TWO filters narrow this table, and they are different:
+
+      drop        venues thin enough that 3.1 does not carry them either.  A
+                  venue with no row in 3.1 cannot have one in 3.3.
+      min_fills   on top of that, venues without enough QUOTED fills to score.
+                  This is why the report shows fewer venues in 3.3 than in 3.1
+                  - AU publishes five venues in 3.1 and tiers only three.
+
+    The z scores are pooled over the FULL accumulator, before either filter, so
+    a venue's score never depends on which other venues happened to survive.
+    See note 5 at the foot of this file."""
     z = pooled_z(fill_acc)
+    z = z.drop(index=[v for v in drop if v in z.index])
     keep = z[(z["n_rev"] >= min_fills) & (z["n_stable"] >= min_fills)].copy()
     keep = keep[keep["Score"].notna()]
     if len(keep) == 0:
@@ -1367,8 +1425,9 @@ def run(args):
             + (f", and {n_failed} date(s) errored - see above" if n_failed else "")
             + "\nrun the same command with --diagnose to see which filter empties it.")
 
-    liquidity = build_liquidity(fill_acc, child_acc)
-    tiering = build_tiering(fill_acc, args.min_fills, args.tiers)
+    thin = thin_venues(fill_acc, args.min_venue_fills)
+    liquidity = build_liquidity(fill_acc, child_acc, drop=thin)
+    tiering = build_tiering(fill_acc, args.min_fills, args.tiers, drop=thin)
     dropped = build_dropped(fill_acc)
     decomposition = build_decomposition(fill_acc) if args.decompose else None
     # build_tiering returns a frame with no Tier column when nothing cleared
@@ -1385,7 +1444,16 @@ def run(args):
         for c, v in sorted(unmapped):
             print(f'    ("{c}", "{v}"):')
     print("\nTable 3.1: Liquidity\n")
-    print(render_liquidity(liquidity))
+    if len(liquidity) == 0:
+        print(f"  every venue is below --min-venue-fills {args.min_venue_fills:,}"
+              f" - rerun with a lower one, or 0 to keep them all")
+    else:
+        print(render_liquidity(liquidity))
+        if thin:
+            print(f"\n  below --min-venue-fills {args.min_venue_fills:,}, not shown: "
+                  + ", ".join(thin)
+                  + "\n  their notional is out of %Notional too, so the column above "
+                    "sums to 100")
     print("\nTable 3.3: Venue tiering on 1s reversion and quote stability\n")
     if not tiered:
         print(f"  no venue reached --min-fills {args.min_fills}")
@@ -1433,7 +1501,10 @@ def run(args):
         print(f"\nwritten to {args.pdf}")
 
 
-def main(argv=None):
+def build_parser():
+    """Built here rather than inline in main() so a test can read a default
+    without running anything - see test_thin_cut_reproduces_the_published_venue_lists,
+    which pins --min-venue-fills against the three published venue lists."""
     p = argparse.ArgumentParser(
         description="Dark venue liquidity and reversion tiering",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -1443,8 +1514,14 @@ def main(argv=None):
     p.add_argument("--country", default="",
                    help="market, matched against the sym suffix: AU for *.AU, "
                         "JP for *.JP. Case insensitive; blank for all")
+    p.add_argument("--min-venue-fills", type=int, default=2000,
+                   help="a venue with fewer fills than this gets no row in "
+                        "table 3.1 at all, and its notional leaves %%Notional, "
+                        "so the column sums to 100 - which is the cut the "
+                        "report makes.  0 keeps every venue")
     p.add_argument("--min-fills", type=int, default=1000,
-                   help="minimum usable fills for a venue to be TIERED")
+                   help="minimum QUOTED fills for a venue already in table 3.1 "
+                        "to also be tiered in 3.3; does not affect 3.1")
     p.add_argument("--tiers", default="auto", help="'auto' (silhouette) or an integer k")
     p.add_argument("--half-spread", action="store_true",
                    help="normalise reversion by half the spread instead of the full spread")
@@ -1466,6 +1543,11 @@ def main(argv=None):
                    help=argparse.SUPPRESS)   # progress is on by default now
     p.add_argument("--self-test", action="store_true",
                    help="run the built-in tests; needs no kdb connection")
+    return p
+
+
+def main(argv=None):
+    p = build_parser()
     args = p.parse_args(argv)
 
     if args.self_test:
@@ -1638,8 +1720,81 @@ def test_min_fills_only_affects_tiering():
                                                            ignore_index=True))))
     liq = build_liquidity(acc, pd.DataFrame(columns=CHILD_ACC, dtype=float))
     tier = build_tiering(acc, min_fills=50, tiers="auto")
-    assert "SMALL" in liq.index, "3.1 must keep every venue"
+    assert "SMALL" in liq.index, "--min-fills alone must not touch 3.1"
     assert "SMALL" not in tier.index, "3.3 must drop the thin venue"
+
+
+def test_thin_venue_leaves_both_tables():
+    """--min-venue-fills is the other cut, and it takes the venue out of BOTH
+    tables - a venue with no row in 3.1 cannot have one in 3.3."""
+    rng = np.random.default_rng(4)
+    df = pd.concat([_synth_fills(rng, 300, ["BIG"]),
+                    _synth_fills(rng, 12, ["THIN"])], ignore_index=True)
+    acc = fold(None, aggregate_fills(fill_metrics(df)))
+    thin = thin_venues(acc, 100)
+    assert thin == ["THIN"], thin
+    liq = build_liquidity(acc, pd.DataFrame(columns=CHILD_ACC, dtype=float),
+                          drop=thin)
+    tier = build_tiering(acc, min_fills=1, tiers="auto", drop=thin)
+    assert "THIN" not in liq.index, "3.1 must drop the thin venue"
+    assert "THIN" not in tier.index, "3.3 must drop it too"
+    # and it is still visible in the excluded table, which reports every venue
+    assert "THIN" in build_dropped(acc).index
+
+
+def test_thin_venue_notional_leaves_pct_notional():
+    """The dropped venue's notional goes out of the denominator, so the column
+    sums to 100 over the rows shown - the way the report's does."""
+    acc = pd.DataFrame(
+        {"n_fill": [5000.0, 5000.0, 10.0], "notional": [600.0, 300.0, 100.0]},
+        index=["A", "B", "THIN"])
+    for c in FILL_ACC:
+        if c not in acc.columns:
+            acc[c] = 0.0
+    liq = build_liquidity(acc, pd.DataFrame(columns=CHILD_ACC, dtype=float),
+                          drop=thin_venues(acc, 2000))
+    assert list(liq.index) == ["A", "B"], list(liq.index)
+    # 600/900 and 300/900, NOT 600/1000 and 300/1000
+    assert abs(liq.loc["A", "%Notional"] - 200.0 / 3) < 1e-9, liq.loc["A", "%Notional"]
+    assert abs(liq["%Notional"].sum() - 100.0) < 1e-9
+
+
+def test_thin_cut_does_not_move_the_z_base():
+    """Pooling happens before the cut, so a venue's Score is the same whether
+    or not some other venue was thin enough to be filtered out.  Otherwise the
+    tiers would depend on the threshold, which is note 5 at the foot of this
+    file."""
+    rng = np.random.default_rng(5)
+    df = pd.concat([_synth_fills(rng, 200, ["A"]),
+                    _synth_fills(rng, 200, ["B"]),
+                    _synth_fills(rng, 8, ["THIN"])], ignore_index=True)
+    acc = fold(None, aggregate_fills(fill_metrics(df)))
+    full = build_tiering(acc, min_fills=1, tiers=2)
+    cut = build_tiering(acc, min_fills=1, tiers=2, drop=thin_venues(acc, 100))
+    for v in ("A", "B"):
+        assert abs(full.loc[v, "Score"] - cut.loc[v, "Score"]) < 1e-12, v
+
+
+def test_thin_cut_reproduces_the_published_venue_lists():
+    """The 2000 default is calibrated, so pin what it was calibrated ON.
+
+    Per market: the fill counts our own run gives for the venues the report
+    drops, and for the smallest venue it keeps.  The default has to put every
+    dropped venue out and every kept venue in, in all three at once.  If a
+    later change to what counts as a fill moves these counts, this fails here
+    rather than silently in a published table."""
+    published = {                     # market: (dropped, smallest kept)
+        "JP": ({"LNAL Cond": 89, "VIRTU Cond": 18, "BAML": 17}, 3108),
+        "AU": ({"CBOE": 334, "LNAL": 206, "LNAL Cond": 7, "VIRTU Cond": 2}, 5228),
+        "HK": ({"LNAL": 1639, "LNAL Cond": 17, "VIRTU Cond": 10}, 15683),
+    }
+    default = build_parser().parse_args([]).min_venue_fills
+    for market, (out, smallest_kept) in published.items():
+        acc = pd.DataFrame({"n_fill": list(out.values()) + [smallest_kept]},
+                           index=list(out) + ["KEPT"], dtype=float)
+        thin = thin_venues(acc, default)
+        assert set(thin) == set(out), f"{market}: {thin} != {sorted(out)}"
+        assert "KEPT" not in thin, f"{market}: cut also takes the smallest kept venue"
 
 
 def test_server_constants():
@@ -2181,10 +2336,16 @@ if __name__ == "__main__":
 #    it, and the tier numbering follows automatically.
 #
 # 5. THE Z BASE IS EVERY DARK FILL IN THE RANGE, including fills in venues that
-#    --min-fills later excludes from the tiering.  They are still dark fills, and
-#    a thin venue contributes few of them, so its influence on the pooled mean is
-#    small.  Excluding them instead would make each venue's z score depend on
-#    which other venues cleared the threshold, which is worse.
+#    --min-venue-fills or --min-fills later excludes from the tables.  They are
+#    still dark fills, and a thin venue contributes few of them, so its influence
+#    on the pooled mean is small.  Excluding them instead would make each venue's
+#    z score depend on which other venues cleared the thresholds, which is worse
+#    - the tiers would move when you moved a threshold.  Pinned by
+#    test_thin_cut_does_not_move_the_z_base.
+#
+#    %Notional is the deliberate exception: it DOES renormalise over the rows
+#    3.1 shows, because it is a share of a table rather than a score, and the
+#    report's column sums to 100.  A z score is not a share of anything.
 #
 # 6. A VENUE ROUTED TO BUT NEVER FILLED does not appear in table 3.1 at all,
 #    because every row of it is keyed off executed notional.  That is right for

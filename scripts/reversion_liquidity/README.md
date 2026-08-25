@@ -43,7 +43,12 @@ licence and no `QHOME` are needed locally.
 ```
 --country      market, matched against the SYM SUFFIX: AU for *.AU, JP for
                *.JP. Case insensitive. Blank for all.
---min-fills    minimum usable fills before a venue is TIERED (default 1000)
+--min-venue-fills
+               a venue with fewer fills than this gets no row in table 3.1 at
+               all, and its notional leaves %Notional (default 2000). 0 keeps
+               every venue.
+--min-fills    minimum QUOTED fills before a venue already in 3.1 is also
+               TIERED in 3.3 (default 1000). Does not affect 3.1.
 --tiers        'auto' (silhouette) or an integer k
 --half-spread  normalise reversion by half the spread instead of the full spread
 --decompose    also show Reversion split into Capture and Drift
@@ -140,10 +145,10 @@ the tables, so `--quiet` cannot hide it:
     ("HK", "ANOTHER_DRK"):
 ```
 
-Dropping it instead would take it out of `%Notional` too, so every other row
-would quietly grow; merging it by guesswork would put someone else's fills in a
-pool they did not trade in. Under its own `ALL_CAPS` name it is visible, in the
-right total, and obviously asking to be added.
+Dropping it instead would merge it by guesswork or hide it; under its own
+`ALL_CAPS` name it is visible, in the right total, and obviously asking to be
+added. It is **not exempt from `--min-venue-fills`** — a stray venue thin enough
+to be under the cut is filtered like any other, and named there instead.
 
 ## Local settings
 
@@ -383,12 +388,57 @@ child order — finally meet, on the pool.
 
 | Column | From |
 | --- | --- |
-| `%Notional` | `100 * notional / notional.sum()` |
+| `%Notional` | `100 * notional / notional.sum()`, **over the rows shown** |
 | `Spread` | `w_spread / wsum_spread` |
 | `Adv` | `w_adv / wsum_adv` |
 | `Fill%adv` | `w_filladv / wsum_filladv` |
 | `Fill Rate` | `fr_wnum / fr_wsum` (child order) |
 | `Duration` | `duration_sum / duration_n` (child order) |
+
+### Which venues get a row (`thin_venues`, `--min-venue-fills`)
+
+The report's tables carry fewer venues than we accumulate, and the cut it makes
+is on **size**, not on which venue it is: JP publishes LNAL at 5.3% of notional
+while HK, where the same pool is thinner, leaves it out entirely. So it is not
+a fixed exclusion list.
+
+It is not `%Notional` either, and JP is what rules that out. HK needs a cut
+**above 3.0%** to lose LNAL; JP needs one **at or below 2.1%** to keep Posit.
+No single number is both.
+
+**Fill count** separates them, and one threshold covers all three markets. Per
+market, the biggest venue the report drops against the smallest one it keeps,
+in our own fill counts for 2026-04-01..06-30:
+
+| Market | Biggest dropped | Smallest kept | Threshold must be in |
+| --- | --- | --- | --- |
+| JP | LNAL Cond, 89 | LNAL, 3,108 | 89 < T ≤ 3,108 |
+| AU | CBOE, 334 | MS Pool, 5,228 | 334 < T ≤ 5,228 |
+| HK | LNAL, 1,639 | CLSA, 15,683 | 1,639 < T ≤ 15,683 |
+
+All three intersect at **1,639 < T ≤ 3,108**, and the `2000` default sits
+inside it with room on both sides. It reproduces every published venue list
+exactly — 7 venues in JP, 5 in AU, 6 in HK.
+`test_thin_cut_reproduces_the_published_venue_lists` pins those counts, so if a
+later change to what counts as a fill moves them, it fails there rather than
+silently in a table someone sends out.
+
+A count is also the sturdier thing to threshold on **while our notionals and
+theirs still disagree** — HK Posit is 10.3% for us against their 17.2% — because
+it is a count of fills rather than a money-weighted figure, so it does not move
+with whatever is causing that gap. Closing the gap itself is a separate problem
+and this cut does not address it.
+
+Two consequences worth knowing:
+
+- The dropped venue's notional **leaves the denominator**, so `%Notional` over
+  the rows shown sums to 100, as the report's does. Pass `--min-venue-fills 0`
+  to keep every venue and get a share of all dark flow instead.
+- A venue with no row in 3.1 gets none in 3.3 either. That is a different cut
+  from `--min-fills`, which narrows 3.3 alone.
+
+Both are printed, and the excluded-fills footer still reports **every** venue,
+so nothing disappears without saying so.
 
 ### Step 7 — the z-scores (`pooled_z`)
 
@@ -415,8 +465,11 @@ does not do.
 
 ### Step 8 — tiering (`build_tiering`)
 
-Venues below `--min-fills` are dropped **from the tiering only** — 3.1 keeps
-every venue. That is why the report shows fewer venues in 3.3 than in 3.1.
+Venues below `--min-fills` are dropped **from the tiering only** — a venue 3.1
+carries can still be too thinly *quoted* to score. That is why the report shows
+fewer venues in 3.3 than in 3.1: AU publishes five venues in 3.1 and tiers only
+three. This is a different cut from `--min-venue-fills`, which decides what 3.1
+carries in the first place — see below.
 
 Tiers come from **exact 1-D k-means by dynamic programming**, not Lloyd's
 algorithm. Optimal clusters on a line are contiguous in sorted order, so the
