@@ -8,7 +8,7 @@ Scheduler something to call at 19:00. One `.cmd` per report; they all go through
 launchers/
   run_luld_orders.cmd          the LULD order report, today
   run_short_sell_report.cmd    the short sell report, today
-  run_all.cmd                  both, one after the other
+  run_all.cmd                  both, one after the other, one prompt
   _run.cmd                     the shared launcher.  Not for double clicking
   local_settings.cmd.example   copy to local_settings.cmd and edit
   logs/                        written on the first scheduled run
@@ -44,6 +44,11 @@ The window stays open. Output is on screen as it happens, and at the end it
 says `done.` or `FAILED - exit code N` and waits, so a traceback can be read
 rather than glimpsed.
 
+`run_all.cmd` waits **once, at the end**, not after each report. Both run
+straight through and the prompt comes after the second, under a line saying
+whether either failed. The first report's output has not gone anywhere — scroll
+back for it.
+
 Arguments still work, from a prompt or from a shortcut:
 
 ```bat
@@ -64,6 +69,26 @@ instead, does not pause, and **passes the script's exit code back** — that is
 what the scheduler records as *Last Run Result*, and it is the difference
 between a task that failed and a task that looks fine forever. Anything after
 that first word is still handed to the script.
+
+## The `nopause` word
+
+The same idea, one step smaller: run interactively, output on screen as usual,
+but **do not wait at the end**.
+
+```bat
+run_luld_orders.cmd nopause
+```
+
+This is what `run_all.cmd` passes to each report so the prompt happens once
+rather than twice. On its own it is rarely what you want from a double click —
+the window closes the instant the report ends and takes the traceback with it —
+but it is the right thing when something else is doing the waiting, or when a
+report is one step of a longer script.
+
+Like `scheduled`, the word can sit anywhere on the line and is **not** handed to
+the python script. `scheduled` implies it: nothing waits under Task Scheduler,
+where there is no console and nobody to press the key, and a pause there is a
+task that hangs until it is killed.
 
 ## Task Scheduler, 19:00 Monday to Friday
 

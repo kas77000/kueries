@@ -3,7 +3,7 @@ rem ============================================================================
 rem  _run.cmd - the one launcher.  Every run_*.cmd beside it sets SCRIPT and
 rem  calls this; nothing else here knows which report it is running.
 rem
-rem  TWO MODES, picked by the first word of the command line:
+rem  TWO MODES, picked by a word anywhere on the command line:
 rem
 rem    (nothing)   DOUBLE CLICKED.  The output stays on screen and the window
 rem                waits at the end, so a traceback can actually be read.
@@ -11,6 +11,15 @@ rem    scheduled   TASK SCHEDULER.  There is no console to print to, so
 rem                everything goes to logs\<script>_<stamp>.log and the exit
 rem                code is passed back - that is what the scheduler shows as
 rem                Last Run Result.
+rem
+rem  AND ONE MODIFIER:
+rem
+rem    nopause     interactive as usual, output on screen, but do NOT wait at
+rem                the end.  run_all.cmd passes this to each report so the
+rem                prompt comes once, after both, instead of after each one.
+rem                On its own it is rarely what you want: a double clicked
+rem                window then closes the instant the report ends and takes
+rem                the traceback with it.
 rem
 rem  Anything else on the line is handed to the python script untouched:
 rem
@@ -52,13 +61,20 @@ if not defined PYTHON (
 rem --- the first word decides the mode; the rest is forwarded.  Built by hand
 rem     rather than with %*, because %* does not notice `shift`.
 set "MODE=interactive"
+set "HOLD=1"
 set "ARGS="
 :collect
 if "%~1"=="" goto collected
-if /i "%~1"=="scheduled" (set "MODE=scheduled") else (set "ARGS=%ARGS% %1")
+if /i "%~1"=="scheduled" (set "MODE=scheduled") else if /i "%~1"=="nopause" (set "HOLD=") else (set "ARGS=%ARGS% %1")
 shift
 goto collect
 :collected
+
+rem --- nothing waits under the scheduler.  There is no console and nobody to
+rem     press the key, so a pause there is a task that hangs until it is
+rem     killed - which is why this is cleared here rather than trusted to the
+rem     caller remembering both words.
+if /i "%MODE%"=="scheduled" set "HOLD="
 
 rem --- python writes UTF-8 and does not sit on its output.  Without the first
 rem     an em dash in a table is a UnicodeEncodeError; without the second the
@@ -71,7 +87,7 @@ if not exist "%PY_FILE%" (
     echo   cannot find %PY_FILE%
     echo   Is this folder still beside the repo it was copied out of?
     echo(
-    if /i not "%MODE%"=="scheduled" pause
+    if defined HOLD pause
     exit /b 2
 )
 
@@ -101,7 +117,7 @@ if "%RC%"=="0" (
     echo   FAILED - exit code %RC%.  The lines above are the whole of it.
 )
 echo(
-pause
+if defined HOLD pause
 exit /b %RC%
 
 rem -----------------------------------------------------------------------------
