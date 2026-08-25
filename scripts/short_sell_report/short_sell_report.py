@@ -55,18 +55,29 @@ WHAT CHANGES, AND WHAT DOES NOT
   Order qty    the chain's size, taken once                            CHANGED
   Executed     sum of `make` over every attempt's workorders        unchanged
   Rejections   every workorder row in state `rejected, all attempts  unchanged
-  Completion   executed / order qty per market, mean across markets  unchanged
+  Completion   executed / order qty per market, in SHARES, summed     CHANGED
 
 --compare puts the OLD counting - one order per target - beside the chained
 numbers over a single fetch, so what the chaining did can be seen without
 running anything twice.
 
-THE CHAIN'S QUANTITY is the LARGEST any attempt asked for - CHAIN_QTY="max".
-A replace can come back for only the unfilled remainder, and it can also grow
-the order; "first" is wrong in the second case and "last" in the first, and
-only "max" survives both.  Both are still available.  Any chain that fills more
-than its quantity is reported whatever the setting, which is the tripwire if
-this reasoning is incomplete.
+THE CHAIN'S QUANTITY is what every attempt FILLED plus what the last one still
+had to do - CHAIN_QTY="asked".  A replace can come back for only the unfilled
+remainder, and it can also grow the order; "first" is wrong in the second case,
+"last" in the first, and "max" reads over 100% on a top up.  "asked" survives
+all three, and it is why completion cannot print over 100%: quantity minus
+executed IS the last attempt's residual, clamped at zero.  The others are still
+available.  Any chain that fills more than its quantity is reported whatever
+the setting, which is the tripwire if this reasoning is incomplete.
+
+COMPLETION IS IN SHARES, NOT IN MONEY.  It was briefly executed_usd over
+ordered_usd, and that printed 102.2% for Korea on orders that were not fully
+filled: the ordered side is THEORETICAL - the whole quantity at a price the
+unfilled part never traded at - and the executed side is REALISED, so their
+ratio is the share completion multiplied by a price move.  For a SELL that move
+is biased upward on every rung of the price ladder, so the error only ever went
+one way.  The two notional columns are still both printed, and both still mean
+what they say; they are simply not a ratio.  See the NOTIONAL block below.
 
   --compare runs BOTH rollups over one fetch and prints them side by side.
 =============================================================================
@@ -1279,9 +1290,16 @@ def dump_chains(chs, limit=40):
 #                   in one live month, so this is not a rare branch
 #
 # EXECUTED is not priced this way at all: it is the sum of make * the child's
-# own avg_fill_price, which is what those shares really cost.  So notional
-# completion is NOT the share completion - it cannot be, because the two sides
-# traded at different prices.
+# own avg_fill_price, which is what those shares really cost.  So the two
+# columns are NOT a ratio, and nothing on the page divides them.  Ordered is
+# theoretical and executed is realised; executed CAN exceed ordered, and when
+# it does that is a true fact about where the price went - a sell that filled
+# above the bid it was valued at - and not a completion over 100%.  Completion
+# is a share ratio and lives on Row.completion.
+#
+# order_details() carries avg_fill_price beside the two columns, because that
+# is the whole of why they differ.  It replaced completion_usd, which divided
+# one by the other and was the row level version of the bug.
 #
 # Everything is multiplied by target_stock.fxlast, local -> USD.  An order with
 # no fx or no price at all contributes NOTHING and is COUNTED: a notional that
@@ -1337,7 +1355,12 @@ def notional(chains, splits) -> Notional:
         priced += 1
         src[where] = src.get(where, 0) + 1
         ordered += c.size * px * fx
-        #  the fills are valued at what they actually paid, never at px
+        #  the fills are valued at what they actually paid, never at px.  The
+        #  two columns are therefore NOT a ratio: ordered is theoretical, at a
+        #  price the unfilled part never traded at, and executed is realised.
+        #  Executed can exceed ordered, and when it does that is a true fact
+        #  about where the price went, not a completion over 100%.  Completion
+        #  is a SHARE ratio and lives on Row - see Row.completion.
         executed += sum(x.make * x.fill_price * fx for x in kids
                         if x.fill_price > 0)
     return Notional(ordered, executed, priced, unpriced, src)
@@ -1369,8 +1392,9 @@ class Row(NamedTuple):
 
     order_qty and executed stay as SHARE counts - the rollups, the checks and
     --compare are all in shares - and the notional rides beside them.  The page
-    prints the notional; completion is taken off the notional too, so the
-    percentage and the two columns either side of it agree.
+    prints both notional columns AND the completion, but the percentage is not
+    the two columns divided: they measure different things on purpose, and only
+    the shares answer how much of the order got done.
     """
     code: str
     name: str
@@ -1387,11 +1411,26 @@ class Row(NamedTuple):
 
     @property
     def completion(self) -> Optional[float]:
-        return _completion(self.executed_usd, self.ordered_usd)
+        """SHARES, not notional.  Completion asks how much of the order got
+        done, which is a quantity question - so it is answered in quantity.
+
+        It used to be executed_usd over ordered_usd, and that could not be
+        capped: ordered is THEORETICAL - the whole quantity at a price the
+        unfilled part never traded at - and executed is REALISED, so the ratio
+        was the share completion multiplied by a price move.  For a sell that
+        move is biased upward on every rung of the price ladder, and the page
+        printed 102.2% for Korea on orders that were not fully filled.
+
+        Both notional columns are still printed and both still mean what they
+        say; nothing divides them.  In shares this cannot exceed 100%: under
+        CHAIN_QTY="asked" the quantity is every fill plus the last attempt's
+        residual, clamped at zero - see chain_size().  It is also the measure
+        over_filled(), over_filled_attempts() and --compare all speak."""
+        return _completion(self.executed, self.order_qty)
 
     @property
     def share_completion(self) -> Optional[float]:
-        """The old percentage, kept for --compare and for the checks."""
+        """Kept as a name: --compare and the checks both ask for it."""
         return _completion(self.executed, self.order_qty)
 
 
@@ -1406,7 +1445,7 @@ class DayRow(NamedTuple):
 
 class Totals(NamedTuple):
     """The headline figures.  completion is executed over ordered, summed, in
-    USD - the same measure the market column shows."""
+    SHARES - the same measure the market column shows."""
     orders: int
     order_qty: int
     executed: int
@@ -1429,7 +1468,7 @@ def totals(rows) -> Totals:
     ousd = sum(r.ordered_usd for r in rows)
     eusd = sum(r.executed_usd for r in rows)
     return Totals(sum(r.orders for r in rows), qty, ex,
-                  sum(r.rejections for r in rows), _completion(eusd, ousd),
+                  sum(r.rejections for r in rows), _completion(ex, qty),
                   ousd, eusd)
 
 
@@ -1574,7 +1613,7 @@ DETAIL_COLUMNS = (
     "date", "market", "sym", "client_id", "targets", "algo", "basket", "side",
     "ordered_qty", "executed_qty", "completion_qty",
     "limit_price", "prev_close", "price", "price_source", "fx",
-    "ordered_usd", "executed_usd", "completion_usd",
+    "ordered_usd", "executed_usd", "avg_fill_price",
     "marketable", "splits", "splits_rejected",
     "rejections", "rej_short_sell", "rej_open", "rej_close",
     "rej_continuous", "reject_texts")
@@ -1605,6 +1644,12 @@ def order_details(chs, splits, rejects=()) -> list:
         ordered_usd = c.size * px * fx if valued else 0.0
         executed_usd = (sum(x.make * x.fill_price * fx for x in kids
                             if x.fill_price > 0) if valued else 0.0)
+        #  the average fill price rides beside the two notional columns, because
+        #  it is the whole of why they differ.  It replaced completion_usd,
+        #  which divided the theoretical side by the realised one and was the
+        #  row level version of the bug this report used to print.
+        traded = sum(x.make * x.fill_price for x in kids if x.fill_price > 0)
+        filled = sum(x.make for x in kids if x.fill_price > 0)
         mk = chain_marketable(c)
         cats = {k: sum(1 for r in rs if r.category == k) for k in CATEGORIES}
         #  distinct texts, commonest first: one venue wording repeated 40 times
@@ -1626,7 +1671,7 @@ def order_details(chs, splits, rejects=()) -> list:
             "price": px if valued else 0.0,
             "price_source": where if valued else "none", "fx": fx,
             "ordered_usd": ordered_usd, "executed_usd": executed_usd,
-            "completion_usd": _completion(executed_usd, ordered_usd),
+            "avg_fill_price": (traded / filled) if filled else 0.0,
             "marketable": {True: "yes", False: "no", None: "unknown"}[mk],
             "splits": len(kids),
             "splits_rejected": sum(1 for x in kids if x.rejected),
@@ -2241,6 +2286,7 @@ def run(args) -> int:
             + ("historical" if pl.hist else "real-time snapshot")
             + f"  ·  {st.attempts:,} targets chained into {st.chains:,} orders"
             + (f", {st.no_id:,} untagged" if st.no_id else ""))
+    foot += "  ·  completion in shares"
     if dropped:
         foot += f"  ·  {dropped:,} restricted JP excluded"
     if mk.dead and not args.keep_unmarketable:
@@ -3231,6 +3277,75 @@ def self_test() -> int:
     check("it reports where the prices came from",
           notional(c1, s1).by_source, {"limit": 1})
 
+    #  COMPLETION IS A SHARE RATIO, AND THE TWO NOTIONAL COLUMNS ARE NOT ONE.
+    #  Ordered is theoretical - the whole quantity at a price the unfilled part
+    #  never traded at.  Executed is realised.  Dividing one by the other used
+    #  to be the Completion column, and it printed 102.2% for Korea, because
+    #  that ratio is the share completion multiplied by a price move - and for
+    #  a SELL every rung of the ladder biases that move upward: a limit sell
+    #  fills at the limit or better, a market sell is valued at the bid and
+    #  fills at or above it, a close-priced order fills wherever the day went.
+    def sell(size, made, fill_px, **kw):
+        """one SELL, filled `made` of `size` at fill_px"""
+        rec = _p(1, "KR", size, sidesign=-1,
+                 **{k: v for k, v in kw.items()
+                    if k in ("limit_price", "fxlast", "refpx")})
+        att, _drop = to_attempts([rec])
+        sp = to_splits([_c(1, 1, made, "filled", fill_px=fill_px,
+                           bid=kw.get("bid", 0.0), ask=kw.get("ask", 0.0))],
+                       att)
+        chs = to_chains(att, "asked", sp)
+        n = notional(chs, sp)
+        r = Row(code="KR", name="Korea", orders=1, order_qty=chs[0].size,
+                executed=made, rejections=0,
+                ordered_usd=n.ordered, executed_usd=n.executed)
+        return n, r
+
+    #  a market sell valued at the bid, filled IN FULL at the mid.  The
+    #  ordinary case, not a corner one, and the page used to read 105.3%
+    n_mid, r_mid = sell(1000, 1000, 10.0, limit_price=0.0, bid=9.5, ask=10.5)
+    check("a full fill reads 100%, not 105.3%", r_mid.completion, 100.0)
+    check("and the executed notional is still REAL money at real prices",
+          n_mid.executed, 1000 * 10.0 * 1.0)
+    check("which is allowed to exceed the theoretical ordered side",
+          n_mid.executed > n_mid.ordered, True)
+
+    #  a limit sell with price improvement - the fills really did pay more
+    _n_imp, r_imp = sell(1000, 1000, 10.2, limit_price=10.0)
+    check("price improvement is not extra completion", r_imp.completion, 100.0)
+
+    #  THE ONE THAT MATTERS: a fifth of the order never traded, and the page
+    #  was claiming over 100% anyway because the rest filled higher
+    n_part, r_part = sell(1000, 800, 12.5, limit_price=0.0, bid=9.5, ask=10.5)
+    check("a partial fill reads as partial", r_part.completion, 80.0)
+    check("even when the money says otherwise",
+          n_part.executed > n_part.ordered, True)
+
+    #  a fill with no recorded price cannot be valued, so it stays out of the
+    #  notional - but its SHARES traded, so completion still counts them.
+    #  Separating the two is exactly what stops one distorting the other.
+    n_np, r_np = sell(1000, 1000, 0.0, limit_price=10.0)
+    check("an unvalued fill contributes nothing to the notional",
+          n_np.executed, 0.0)
+    check("but the shares it traded still complete the order",
+          r_np.completion, 100.0)
+
+    #  the invariant, stated once: this is what makes over 100% impossible.
+    #  asked = every fill plus the last residual, clamped at zero, so executed
+    #  can never exceed it whatever the prices did - see chain_size()
+    for _sz, _md, _px in ((1000, 1000, 50.0), (1000, 0, 10.0),
+                          (1000, 999, 0.01), (7, 3, 1e6)):
+        _n, _r = sell(_sz, _md, _px, limit_price=10.0)
+        check(f"completion cannot exceed 100% ({_md}/{_sz} at {_px})",
+              _r.completion <= 100.0, True)
+        check("and it is the share ratio, exactly",
+              _r.completion, _r.share_completion)
+
+    #  the totals line is the same measure, not a different one
+    t_row = Row("KR", "Korea", 1, 1000, 800, 0, 9500.0, 7600.0)
+    check("the headline completion is shares too",
+          totals([t_row]).completion, 80.0)
+
     print("\nonly the orders that could have traded")
 
     def _chain(country, sym, *prices, refpx=100.0, size=1000):
@@ -3353,7 +3468,10 @@ def self_test() -> int:
           round(r0["executed_usd"], 6), round(d_row.executed_usd, 6))
     check("and the rejections", r0["rejections"], d_row.rejections)
     check("which is the whole point: a line here explains a cell up there",
-          round(r0["completion_usd"], 6), round(d_row.completion, 6))
+          round(r0["completion_qty"], 6), round(d_row.completion, 6))
+    #  and the price that makes the two notional columns differ is on the line,
+    #  so the difference can be read rather than guessed at
+    check("the average fill price is on the row", "avg_fill_price" in r0, True)
 
     #  an unpriced order is shown, not hidden - it is the one dragging the page
     np_att, _ = to_attempts([_p(950, "TH", 1000, limit_price=0.0, refpx=0.0)])
@@ -3362,8 +3480,13 @@ def self_test() -> int:
           len(np_det), 1)
     check("its notional is zero and its source says why",
           (np_det[0]["ordered_usd"], np_det[0]["price_source"]), (0.0, "none"))
-    check("and completion is a dash, not a zero",
-          np_det[0]["completion_usd"], None)
+    #  the dash moved with the column.  An order nothing could VALUE still
+    #  completed nothing, and 0% is the honest answer to that - it is the
+    #  NOTIONAL that has to go blank, because there is no price to state it in
+    check("completion is a real zero - it filled nothing",
+          np_det[0]["completion_qty"], 0.0)
+    check("while the notional stays blank rather than pretending to be zero",
+          (np_det[0]["ordered_usd"], np_det[0]["avg_fill_price"]), (0.0, 0.0))
 
     #  the order the rows come in is the order somebody reads them in
     many = order_details(to_chains(to_attempts(
@@ -3413,11 +3536,17 @@ def self_test() -> int:
         with empty.open(encoding="utf-8-sig", newline="") as fh:
             check("no orders still writes the header, not an empty file",
                   fh.readline().strip().split(",")[0], "date")
-        #  a None must land as an empty cell, never as the string "None"
-        nn = write_orders_csv(np_det, Path(td) / "nn.csv")
+        #  a None must land as an empty cell, never as the string "None".
+        #  An order of zero quantity is the row that still carries one: there
+        #  is nothing to complete, so completion is undefined rather than 0%
+        z_att, _drop = to_attempts([_p(952, "TH", 0, limit_price=10.0)])
+        z_det = order_details(to_chains(z_att), [])
+        check("a zero quantity order has no completion to state",
+              z_det[0]["completion_qty"], None)
+        nn = write_orders_csv(z_det, Path(td) / "nn.csv")
         with nn.open(encoding="utf-8-sig", newline="") as fh:
             check("a null completion is an empty cell, not the word None",
-                  list(_csv.DictReader(fh))[0]["completion_usd"], "")
+                  list(_csv.DictReader(fh))[0]["completion_qty"], "")
 
 
     print("\nthe headline is the real fill rate")

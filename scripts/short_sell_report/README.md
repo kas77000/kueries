@@ -99,9 +99,46 @@ reach, a network share included.
 | **Orders** | one per **order**, not one per `target` row. A rejected-and-replaced order writes a **new `id_target`** each time it is re-sent, so counting target rows counts one economic order several times. They are chained back together on **FIX tag 9604** — see below. |
 | **Notional Ordered (USD)** | the chain's quantity × a price × `fxlast`. The price ladder, best first: **`limit_price`** for a limit order; else **the quote on our side** — the bid for a sell, the ask for a buy, as at the moment the first child was sent; else the **reference close** (`adjclose`, then `orgclose`) for an order that never produced a child. The quantity is what the chain asked for, not `sum size`: three sends of 27m that never traded asked for **27m**, not 81m. |
 | **Notional Executed (USD)** | Σ(`make` × the child's own `avg_fill_price`) × `fxlast`, across **every** attempt. What those shares really cost. `make` counts whatever state the child ended in — a cancelled child that part-filled still contributes what it filled. |
-| **Completion** | per market, Notional Executed / Notional Ordered. **Not** the share completion — it cannot be, because the two sides are priced differently: the unfilled part at a limit or a quote, the filled part at what it actually paid. |
-| **Overall completion** | the same ratio over every market at once — summed USD executed over summed USD ordered. |
+| **Completion** | per market, **executed shares / quantity asked for**. A quantity question answered in quantity. It is *not* the two notional columns divided — see [Why completion is in shares](#why-completion-is-in-shares) — and it cannot exceed 100%. |
+| **Overall completion** | the same measure over every market at once: summed executed shares over summed quantity. Summed, not a mean of the six percentages. |
 | **Rejections** | **`REJECTTOOMANY` alerts** on the `alerts` table, across **all** attempts of the chain, split by the four categories below. One order raises several, which is why Hong Kong can show 109 orders and 239 rejections. |
+
+### Why completion is in shares
+
+The two notional columns measure **different things on purpose**, and dividing
+one by the other is not a completion:
+
+- **Ordered** is *theoretical*. The whole quantity valued at one price — and the
+  part that never filled never traded at any price.
+- **Executed** is *realised*. What the shares actually cost.
+
+Their ratio is therefore the share completion **multiplied by a price move**,
+and for a short-sell report that move is biased one way, because every order is
+a sell and every rung of the price ladder values it at or below where a sell
+realistically fills:
+
+| Priced from | Order valued at | A sell fills at | Bias |
+|---|---|---|---|
+| `limit` | the limit | the limit **or better** | ≥ 1 |
+| `quote` | the **bid** | bid, mid or ask | ≥ 1 |
+| `close` | yesterday's close | anywhere today | ≥ 1 if the market rose |
+
+So the page printed **102.2% for Korea** on orders that were not fully filled.
+It could go the other way too: a fill with no recorded price left the executed
+notional while its shares stayed in the quantity, quietly *understating*
+completion.
+
+Completion is now `executed / order_qty` **in shares**, which cannot exceed
+100%: under `CHAIN_QTY="asked"` the quantity is every fill plus the last
+attempt's residual, clamped at zero, so `quantity − executed` is that residual
+and is never negative. That is also what every check in the script has always
+measured — `over_filled`, `over_filled_attempts` and `unchain` all work in
+shares, and none of them could see a percentage that had moved onto notional.
+
+**Both notional columns are still printed and both still mean what they say.**
+Executed can still exceed ordered, and when it does that is a true fact about
+where the price went — not a completion over 100%. Nothing divides them; the
+footer says `completion in shares` so the page states which measure it is.
 
 **Rejections are alerts, not workorder states.** `workorder.state` says a child
 came back refused; a `REJECTTOOMANY` alert is the engine saying *this order has
@@ -552,10 +589,16 @@ The same rows with **every** field, one row per order, for a spreadsheet:
 date, market, sym, client_id, targets, algo, basket, side,
 ordered_qty, executed_qty, completion_qty,
 limit_price, prev_close, price, price_source, fx,
-ordered_usd, executed_usd, completion_usd,
+ordered_usd, executed_usd, avg_fill_price,
 marketable, splits, splits_rejected,
 rejections, rej_short_sell, rej_open, rej_close, rej_continuous, reject_texts
 ```
+
+`avg_fill_price` is Σ(`make` × `avg_fill_price`) / Σ`make` over the priced
+children — the whole of why `ordered_usd` and `executed_usd` differ, so the gap
+can be read off the row rather than guessed at. It replaced `completion_usd`,
+which divided the theoretical side by the realised one and was the row-level
+version of the bug described below.
 
 `limit_price` and `prev_close` are there so the **marketable** verdict can be
 checked by hand against the band, and `price`, `price_source` and `fx` so the
