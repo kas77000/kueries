@@ -1281,6 +1281,39 @@ def _hms(ms) -> str:
     return f"{ms // 3_600_000:02d}:{ms // 60_000 % 60:02d}:{ms // 1000 % 60:02d}"
 
 
+def merge_spans(spans) -> list:
+    """[(start, end)] -> the same time with overlapping and TOUCHING runs
+    joined, in order.
+
+    Q_LIMITS ends a run on a single normal tick - `grp: sums differ lim by
+    sym` - so a stock that flickers at its band comes back as many short runs
+    rather than one long one.  Summing them without merging double counts the
+    overlaps, and measuring them one at a time is what made this report read
+    zero.  Touching runs join too: a run ending at the same millisecond the
+    next begins is one period the feed happened to punctuate.
+    """
+    out = []
+    for lo, hi in sorted(spans):
+        if out and lo <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], hi))
+        else:
+            out.append((lo, hi))
+    return out
+
+
+def pinned_ms(window, periods) -> int:
+    """Milliseconds of `window` covered by any of `periods`.
+
+    window is (start, end) in ms since midnight, BOTH KNOWN - order_window()
+    is what decides that, and returns None rather than guessing at one.
+    """
+    lo, hi = window
+    total = 0
+    for a, b in merge_spans([(w.start, w.end) for w in periods]):
+        total += max(0, min(hi, b) - max(lo, a))
+    return total
+
+
 def overlap_mins(o, periods) -> float:
     """How long the order and the limit actually coexisted, in minutes.
 
@@ -1785,6 +1818,43 @@ def self_test() -> int:
     check("minutes are the window, not the tick count",
           to_limits([_lim("7203.JP", 11 * H, 11 * H + 1_800_000)],
                     min_mins=20.0)[0].minutes, 30.0)
+
+    print("\nunioning the runs")
+    M = 60_000
+    #  ONE NORMAL TICK SPLITS A RUN.  Q_LIMITS groups on `differ lim`, so a
+    #  stock that flickers at its band comes back as many short runs rather
+    #  than one long one.  Unioning first is what makes that irrelevant.
+    check("two runs that overlap become one",
+          merge_spans([(0, 10 * M), (5 * M, 20 * M)]), [(0, 20 * M)])
+    check("two runs that merely touch become one",
+          merge_spans([(0, 10 * M), (10 * M, 20 * M)]), [(0, 20 * M)])
+    check("a gap between them is kept",
+          merge_spans([(0, 10 * M), (11 * M, 20 * M)]),
+          [(0, 10 * M), (11 * M, 20 * M)])
+    check("they come back in order however they went in",
+          merge_spans([(11 * M, 20 * M), (0, 10 * M)]),
+          [(0, 10 * M), (11 * M, 20 * M)])
+    check("one inside another is absorbed, not counted twice",
+          merge_spans([(0, 20 * M), (5 * M, 6 * M)]), [(0, 20 * M)])
+    check("nothing in, nothing out", merge_spans([]), [])
+
+    #  the case from the investigation: twelve four-minute runs over an hour,
+    #  each broken by one normal tick, against an order live for that hour
+    flicker = to_limits([_lim("1001.JP", 11 * H + i * 5 * M,
+                              11 * H + i * 5 * M + 4 * M) for i in range(12)],
+                        min_mins=0.0)
+    check("twelve runs, none of them long enough on its own", len(flicker), 12)
+    check("but together they cover 48 of the 60 minutes",
+          pinned_ms((11 * H, 12 * H), flicker), 48 * M)
+    check("a period reaching past the window is clipped to it",
+          pinned_ms((11 * H, 11 * H + 10 * M),
+                    to_limits([_lim("a", 11 * H, 12 * H)], min_mins=0.0)),
+          10 * M)
+    check("a period entirely outside it contributes nothing",
+          pinned_ms((11 * H, 12 * H),
+                    to_limits([_lim("a", 9 * H, 10 * H)], min_mins=0.0)), 0)
+    check("no periods at all is zero, not undefined",
+          pinned_ms((11 * H, 12 * H), []), 0)
 
     print("\nover before it began")
     #  an order cancelled before its own t_start never worked, so counting
