@@ -24,7 +24,7 @@ bottom of this file.
 One row per region, always all eight, plus a total.
 
 ```
-Region      Orders   Notional Ordered (USD)   Notional Executed (USD)   Completion   Short, fav.   Short, adv.
+Region      Orders   Ordered (USD)   Executed (USD)   Completion   Pinned %   Short, fav.   Short, adv.
 Japan           27                   313.6k                    225.6k        71.9%            13            13
 China           22                     8.4m                      4.6m        55.0%            11            11
 ...
@@ -342,9 +342,33 @@ two periods, and a threshold would have to guess which.
  11:06  bid 1250  ask    0   LIMIT  ┐ a SECOND period, not the same one
 ```
 
-A run counts only if it lasted at least **`--min-mins` (default 20)** — that is
-`limit_up_down.q`'s `lookback` doing the job it does there, keeping a two-tick
-blip from reading as a limit period.
+A limit period has **no minimum length**. What counts is the share of an
+**order's own life** its stock spent at a limit — **`--min-pinned-pct`, default
+25** — with the periods **unioned** first.
+
+There used to be a 20-minute minimum on each period, and it made this report
+print zero orders every day on a book full of them. Three things compound, and
+each shortens the *measured* length of a period:
+
+- **One normal tick ends a run** (see the example above), so a stock flickering
+  at its band produces many short runs rather than one long one.
+- **Every window is a floor**, because a pinned stock stops quoting.
+- **The minimum was applied to each run separately.**
+
+So the harder a stock was pinned, the shorter its runs and the more certainly
+they were discarded — the filter was biased against exactly the orders this
+report exists to find. A stock at its limit for 48 of 60 minutes, as twelve
+four-minute runs, kept **zero** periods.
+
+Unioning the runs first is what makes the tick-splitting irrelevant: those
+twelve runs collapse into one 48-minute span, and against an order live for
+that hour the answer is 80%.
+
+Noise still filters itself. A run with no width at all is dropped, and a
+two-tick blip is seconds against an order's hours — 0.6% of a 5½-hour order,
+nowhere near the gate. That is the distinction the old minimum could not make:
+it could not tell a blip from a flicker, because it only ever looked at one run
+at a time.
 
 **Every window is a floor.** A pinned stock often stops quoting altogether, so
 a period ends at the last tick that *proved* it and never later. Under-reporting

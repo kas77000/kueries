@@ -23,9 +23,11 @@ queries/limit_up_down/limit_up_down.q uses:
 Contiguous runs of it are one period each.  The boundaries are the NORMAL
 ticks either side of a run, never a gap threshold: two limit periods with two
 sided quoting between them are genuinely two periods, and a threshold would
-have to guess.  A run counts only if it lasted at least --min-mins, which is
-limit_up_down.q's `lookback` doing the job it does there - keeping a two tick
-blip from reading as a limit.  Unlike that script, every period in the session
+have to guess.  A run has NO MINIMUM LENGTH: the runs are unioned and measured
+against the ORDER, not judged one at a time - --min-pinned-pct, the share of an
+order's life its stock spent at a limit, is what decides.  There used to be a
+20 minute minimum per run and it made this report read zero; see MIN_PINNED_PCT
+for why.  Unlike limit_up_down.q, every period in the session
 is found, not only the one in force at .z.T: a snapshot answers "what is
 pinned right now", and a report of a past day needs the periods that resolved
 before the bell as much as the ones that did not.
@@ -902,6 +904,7 @@ class Line(NamedTuple):
     favourable: Optional[bool]
     price: float = 0.0         # local currency, from the ladder
     price_source: str = "none"
+    pinned: Optional[float] = None   # % of this order's life at a limit
 
     @property
     def executed(self) -> int:
@@ -945,15 +948,17 @@ class Line(NamedTuple):
         return self.o.size > 0 and self.executed < self.o.size
 
 
-def to_lines(orders, splits, hits) -> list:
+def to_lines(orders, splits, hits, pinned=None) -> list:
     """One Line per order, in the order the report counted them."""
+    pinned = pinned or {}
     out = []
     for o in orders:
         got = tuple(sorted(hits.get(o.key, ()), key=lambda w: w.start))
         d = line_direction(got, o.ref)
         sp = splits.get(o.key, Splits())
         px, src = order_price(o, sp)
-        out.append(Line(o, sp, got, d, favourable_for(o.side, d), px, src))
+        out.append(Line(o, sp, got, d, favourable_for(o.side, d), px, src,
+                        pinned.get(o.key)))
     return out
 
 
@@ -977,6 +982,18 @@ class Row(NamedTuple):
     fav_short: int = 0        # favourable band, and still did not finish
     adv_short: int = 0        # adverse band, and still did not finish
     unpriced: int = 0         # no price or no fx - contribute NOTHING
+    pin_wsum: float = 0.0     # sum of pinned% * ordered_usd
+    pin_w: float = 0.0        # sum of ordered_usd over lines that HAD a %
+
+    @property
+    def pinned_pct(self) -> Optional[float]:
+        """How much of these orders' lives their stocks spent at a limit.
+
+        Notional weighted, so one tiny order pinned all day cannot outvote a
+        large one.  A line with no pinned % is out of both sums: a share of an
+        unknown life is not a small share.
+        """
+        return (self.pin_wsum / self.pin_w) if self.pin_w else None
 
     @property
     def completion(self) -> Optional[float]:
@@ -990,6 +1007,18 @@ class Totals(NamedTuple):
     fav_short: int = 0
     adv_short: int = 0
     unpriced: int = 0
+    pin_wsum: float = 0.0     # sum of pinned% * ordered_usd
+    pin_w: float = 0.0        # sum of ordered_usd over lines that HAD a %
+
+    @property
+    def pinned_pct(self) -> Optional[float]:
+        """How much of these orders' lives their stocks spent at a limit.
+
+        Notional weighted, so one tiny order pinned all day cannot outvote a
+        large one.  A line with no pinned % is out of both sums: a share of an
+        unknown life is not a small share.
+        """
+        return (self.pin_wsum / self.pin_w) if self.pin_w else None
 
     @property
     def completion(self) -> Optional[float]:
@@ -1008,11 +1037,16 @@ def by_region(lines) -> list:
     fav = {c: 0 for c in REGION_CODES}
     adv = {c: 0 for c in REGION_CODES}
     nopx = {c: 0 for c in REGION_CODES}
+    pw = {c: 0.0 for c in REGION_CODES}
+    pws = {c: 0.0 for c in REGION_CODES}
     for ln in lines:
         c = ln.o.region
         n[c] += 1
         ordered[c] += ln.ordered_usd
         made[c] += ln.executed_usd
+        if ln.pinned is not None and ln.ordered_usd > 0:
+            pw[c] += ln.ordered_usd
+            pws[c] += ln.pinned * ln.ordered_usd
         if not ln.priced:
             nopx[c] += 1
         if ln.incomplete and ln.favourable is True:
@@ -1020,7 +1054,8 @@ def by_region(lines) -> list:
         elif ln.incomplete and ln.favourable is False:
             adv[c] += 1
     return [Row(r.code, r.name, n[r.code], ordered[r.code], made[r.code],
-                fav[r.code], adv[r.code], nopx[r.code]) for r in REGIONS]
+                fav[r.code], adv[r.code], nopx[r.code],
+                pws[r.code], pw[r.code]) for r in REGIONS]
 
 
 def totals(rows) -> Totals:
@@ -1031,7 +1066,9 @@ def totals(rows) -> Totals:
                   sum(r.executed_usd for r in rows),
                   sum(r.fav_short for r in rows),
                   sum(r.adv_short for r in rows),
-                  sum(r.unpriced for r in rows))
+                  sum(r.unpriced for r in rows),
+                  sum(r.pin_wsum for r in rows),
+                  sum(r.pin_w for r in rows))
 
 
 def shared_ids(orders) -> tuple:
@@ -1066,13 +1103,16 @@ Y_RULE_BOTTOM, Y_FOOTER = 0.066, 0.048
 #  first is the one we could have traded into, the second is still a
 #  question whenever the order was marketable anyway.
 REGION_COLS = (
-    ("Region", 0.15, False),
-    ("Orders", 0.08, True),
-    ("Notional Ordered (USD)", 0.20, True),
-    ("Notional Executed (USD)", 0.21, True),
-    ("Completion", 0.12, True),
-    ("Short, fav.", 0.12, True),
-    ("Short, adv.", 0.12, True),
+    ("Region", 0.14, False),
+    ("Orders", 0.09, True),
+    #  the note above says "Notional is USD", and the order listing has said
+    #  "Ordered (USD)" all along - the long form no longer fits beside Pinned %
+    ("Ordered (USD)", 0.16, True),
+    ("Executed (USD)", 0.17, True),
+    ("Completion", 0.11, True),
+    ("Pinned %", 0.10, True),
+    ("Short, fav.", 0.115, True),
+    ("Short, adv.", 0.115, True),
 )
 
 
@@ -1082,6 +1122,7 @@ def _row_cells(r):
             (fmt_usd(r.ordered_usd), INK if r.orders else INK3, "normal"),
             (fmt_usd(r.executed_usd), INK if r.orders else INK3, "normal"),
             (fmt_pct1(r.completion), INK, "bold"),
+            (fmt_pct1(r.pinned_pct), INK if r.orders else INK3, "normal"),
             (fmt_int(r.fav_short), RED if r.fav_short else INK3,
              "bold" if r.fav_short else "normal"),
             (fmt_int(r.adv_short), INK if r.adv_short else INK3, "normal")]
@@ -1146,6 +1187,7 @@ def _total_line(fig, tot, y):
             REGION_COLS,
             ["", fmt_int(tot.orders), fmt_usd(tot.ordered_usd),
              fmt_usd(tot.executed_usd), fmt_pct1(tot.completion),
+             fmt_pct1(tot.pinned_pct),
              fmt_int(tot.fav_short), fmt_int(tot.adv_short)]):
         w = frac * (R - L)
         if text:
@@ -1218,7 +1260,7 @@ def list_order(lines) -> list:
     finish, biggest quantity missed at the top."""
     return sorted(lines,
                   key=lambda ln: (ln.incomplete and ln.favourable is True,
-                                  ln.unfilled, ln.o.size),
+                                  ln.unfilled, ln.o.size, ln.pinned or 0.0),
                   reverse=True)
 
 
@@ -1261,7 +1303,7 @@ def pages_for(rows, tot, subtitle, foot, note="", lines=()):
 # =============================================================================
 
 CSV_HEADER = ("region", "orders", "notional_ordered_usd",
-              "notional_executed_usd", "completion_pct",
+              "notional_executed_usd", "completion_pct", "pinned_pct",
               "short_favourable", "short_adverse", "unpriced_orders")
 
 
@@ -1275,6 +1317,7 @@ def csv_rows(rows, tot) -> list:
         return [name, r.orders, round(r.ordered_usd, 2),
                 round(r.executed_usd, 2),
                 "" if r.completion is None else f"{r.completion:.1f}",
+                "" if r.pinned_pct is None else f"{r.pinned_pct:.1f}",
                 r.fav_short, r.adv_short, r.unpriced]
     out = [one(r.name, r) for r in rows]
     out.append(one("Total", tot))
@@ -1322,7 +1365,7 @@ LIMIT_COLS = (
 )
 
 #  the only column that needs both, and the one the next step is about
-BOTH_COLS = ("overlap_mins",)
+BOTH_COLS = ("overlap_mins", "pinned_pct")
 
 RAW_HEADER = ORDER_COLS + LIMIT_COLS + BOTH_COLS
 
@@ -1452,6 +1495,7 @@ def raw_rows(lines) -> list:
             "yes" if got and all(w.locked for w in got) else "no",
             #  BOTH_COLS - what needed the two of them
             f"{overlap_mins(o, got):.1f}",
+            "" if ln.pinned is None else f"{ln.pinned:.1f}",
         ])
     return out
 
@@ -1648,7 +1692,7 @@ def run(args) -> int:
         pinned.update({k: v for k, v in day_pinned.items() if v is not None})
         executed.update({o.key: day_splits.get(o.key, Splits()) for o in kept})
 
-    lines = to_lines(orders, executed, hits)
+    lines = to_lines(orders, executed, hits, pinned)
     rows = by_region(lines)
     tot = totals(rows)
 
@@ -1850,10 +1894,10 @@ def demo_session(d=None):
     orders, _dead = drop_dead_on_arrival(orders,
                                          last_state_by_order(sr, orders))
     #  the real default, so the sample page shows what a real run shows
-    kept, hits, _pin = touched(orders, to_limits(lims, d),
-                               life_by_order(sr, orders), {}, MIN_PINNED_PCT)
+    kept, hits, pin = touched(orders, to_limits(lims, d),
+                              life_by_order(sr, orders), {}, MIN_PINNED_PCT)
     ex = splits_by_order(wr, kept)
-    lines = to_lines(kept, ex, hits)
+    lines = to_lines(kept, ex, hits, pin)
     rows = by_region(lines)
     return lines, rows, totals(rows)
 
@@ -1994,18 +2038,17 @@ def self_test() -> int:
     #  the case from the investigation: twelve four-minute runs over an hour,
     #  each broken by one normal tick, against an order live for that hour
     flicker = to_limits([_lim("1001.JP", 11 * H + i * 5 * M,
-                              11 * H + i * 5 * M + 4 * M) for i in range(12)],
-                        min_mins=0.0)
+                              11 * H + i * 5 * M + 4 * M) for i in range(12)])
     check("twelve runs, none of them long enough on its own", len(flicker), 12)
     check("but together they cover 48 of the 60 minutes",
           pinned_ms((11 * H, 12 * H), flicker), 48 * M)
     check("a period reaching past the window is clipped to it",
           pinned_ms((11 * H, 11 * H + 10 * M),
-                    to_limits([_lim("a", 11 * H, 12 * H)], min_mins=0.0)),
+                    to_limits([_lim("a", 11 * H, 12 * H)])),
           10 * M)
     check("a period entirely outside it contributes nothing",
           pinned_ms((11 * H, 12 * H),
-                    to_limits([_lim("a", 9 * H, 10 * H)], min_mins=0.0)), 0)
+                    to_limits([_lim("a", 9 * H, 10 * H)])), 0)
     check("no periods at all is zero, not undefined",
           pinned_ms((11 * H, 12 * H), []), 0)
 
@@ -2168,9 +2211,10 @@ def self_test() -> int:
           round(sum(c[1] for c in REGION_COLS), 6), 1.0)
     check("the page shows what was asked, what was done, and what came short",
           [c[0] for c in REGION_COLS],
-          ["Region", "Orders", "Notional Ordered (USD)",
-           "Notional Executed (USD)", "Completion", "Short, fav.",
-           "Short, adv."])
+          ["Region", "Orders", "Ordered (USD)", "Executed (USD)",
+           "Completion", "Pinned %", "Short, fav.", "Short, adv."])
+    check("and Pinned % sits beside the completion it explains",
+          [c[0] for c in REGION_COLS][4:6], ["Completion", "Pinned %"])
     check("the listing columns add up to the full width",
           round(sum(c[1] for c in ORDER_LIST_COLS), 6), 1.0)
     tid = ORDER_LIST_COLS.index(("Target id", 0.08, True))
@@ -2199,7 +2243,12 @@ def self_test() -> int:
           [drows[0].orders, round(drows[0].ordered_usd, 2),
            round(drows[0].executed_usd, 2)])
     check("and it carries the two short columns too",
-          [cr[0][5], cr[0][6]], [drows[0].fav_short, drows[0].adv_short])
+          [cr[0][CSV_HEADER.index("short_favourable")],
+           cr[0][CSV_HEADER.index("short_adverse")]],
+          [drows[0].fav_short, drows[0].adv_short])
+    check("and the pinned % the orders were selected on",
+          cr[0][CSV_HEADER.index("pinned_pct")],
+          f"{drows[0].pinned_pct:.1f}")
     check("full precision in the file, not the page's 79.2m",
           cr[0][2], round(drows[0].ordered_usd, 2))
     check("a percentage with nothing to measure is empty, not 0.0",
@@ -2290,6 +2339,34 @@ def self_test() -> int:
                                  _lim("1002.JP", 11 * H, 12 * H)]),
                       {}, {}, 0.0)[0]), 2)
 
+    print("\npinned % on the page")
+    p_ord = to_orders([_t(1, "JP", 1000, limit_price=10.0),
+                       _t(2, "JP", 4000, limit_price=10.0)])
+    p_lines = to_lines(p_ord, {}, {},
+                       {p_ord[0].key: 80.0, p_ord[1].key: 30.0})
+    check("a line carries its own pinned %", p_lines[0].pinned, 80.0)
+    #  WEIGHTED BY ORDERED NOTIONAL, so one tiny order pinned all day cannot
+    #  outvote a large one.  1000 x 10 = 10k at 80%, 4000 x 10 = 40k at 30%
+    #  ->  (10 x 80 + 40 x 30) / 50 = 40.0
+    p_row = [x for x in by_region(p_lines) if x.code == "JP"][0]
+    check("the region is the notional weighted mean, not a plain one",
+          round(p_row.pinned_pct, 1), 40.0)
+    check("and the totals line is the same measure",
+          round(totals(by_region(p_lines)).pinned_pct, 1), 40.0)
+    check("a region with no orders has no pinned % at all",
+          [x for x in by_region([]) if x.code == "JP"][0].pinned_pct, None)
+    #  an order with no pinned % is out of BOTH sums - a share of an unknown
+    #  life is not a small share, and averaging it in as one would say it was
+    check("an order with no pinned % is left out of the mean entirely",
+          round([x for x in by_region(to_lines(
+              p_ord, {}, {}, {p_ord[0].key: 80.0}))
+              if x.code == "JP"][0].pinned_pct, 1), 80.0)
+    check("a line with no ordered notional cannot be weighted, so it is out",
+          [x for x in by_region(to_lines(
+              to_orders([_t(3, "JP", 1000, limit_price=0.0, adjclose=None,
+                            orgclose=None)]), {}, {}, {}))
+           if x.code == "JP"][0].pinned_pct, None)
+
     print("\nthe children, counted and timed")
     sp = splits_by_order(
         [_wo(11, 1, 100, gen=10 * H, off=11 * H),
@@ -2332,8 +2409,9 @@ def self_test() -> int:
           [c for c in ORDER_COLS if c == "basket"], ["basket"])
     check("what the order did stays with the order",
           ORDER_COLS[-3:], ("splits", "split_first_gen", "split_last_off"))
-    check("and the only column needing both of them is the last one",
-          (BOTH_COLS, RAW_HEADER[-1]), (("overlap_mins",), "overlap_mins"))
+    check("and the columns needing both of them come last",
+          (BOTH_COLS, RAW_HEADER[-2:]),
+          (("overlap_mins", "pinned_pct"), ("overlap_mins", "pinned_pct")))
     qi = RAW_HEADER.index("ordered_usd")
     ei = RAW_HEADER.index("executed_usd")
     #  each line is rounded to the cent, the page rounds the sum, so they
@@ -2385,7 +2463,7 @@ def self_test() -> int:
     #  one order, one period, overlapping by half an hour of the period's hour
     ro = to_orders([_t(1, "JP", 1000, t_start=11 * H + 1_800_000,
                        t_end=15 * H)])
-    rw = to_limits([_lim(ro[0].sym, 11 * H, 12 * H)], min_mins=0.0)
+    rw = to_limits([_lim(ro[0].sym, 11 * H, 12 * H)])
     rk, rh, _rp = touched(ro, rw, {}, {}, 0.0)
     one = raw_rows(to_lines(rk, splits_by_order([_wo(9, 1, 250)], rk),
                             rh))[0]
