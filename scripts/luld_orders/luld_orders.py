@@ -840,9 +840,13 @@ def touched(orders, limits, lives=None, splits=None,
 #                 report exists to find
 #
 # EXECUTED is not priced this way at all: it is the sum of make * the child's
-# own avg_fill_price, which is what those shares really cost.  So notional
-# completion is NOT share completion - it cannot be, because the two sides
-# traded at different prices.
+# own avg_fill_price, which is what those shares really cost.  So the two
+# columns are NOT a ratio, and nothing on the page divides them.  Ordered is
+# theoretical and executed is realised; executed CAN exceed ordered, and when
+# it does that is a true fact about where the price went - a sell that filled
+# above the bid it was valued at - and not a completion over 100%.
+#
+# COMPLETION IS A SHARE RATIO.  See Line.completion.
 #
 # Everything is multiplied by target_stock.fxlast, local -> USD.  An order
 # with no price or no fx contributes NOTHING and is COUNTED: a notional that
@@ -926,10 +930,17 @@ class Line(NamedTuple):
 
     @property
     def completion(self) -> Optional[float]:
-        """NOTIONAL completion, so the percentage is of the columns it
-        sits beside.  Not the share completion: the two sides traded at
-        different prices, so they are not the same number."""
-        return _completion(self.executed_usd, self.ordered_usd)
+        """SHARES.  Completion asks how much of the order got done, which is
+        a quantity question, so it is answered in quantity.
+
+        It was executed_usd over ordered_usd, and that can print over 100%:
+        ordered is THEORETICAL - the whole quantity at a price the unfilled
+        part never traded at - and executed is REALISED, so the ratio is this
+        number multiplied by a price move.  Same defect and same fix as
+        short_sell_report 46c0be4.  Both notional columns still mean what they
+        say; nothing on the page divides them.
+        """
+        return _completion(self.executed, self.o.size)
 
     @property
     def share_completion(self) -> Optional[float]:
@@ -979,6 +990,8 @@ class Row(NamedTuple):
     orders: int
     ordered_usd: float
     executed_usd: float
+    order_qty: int = 0        # SHARES - what completion is taken off
+    executed: int = 0         # SHARES
     fav_short: int = 0        # favourable band, and still did not finish
     adv_short: int = 0        # adverse band, and still did not finish
     unpriced: int = 0         # no price or no fx - contribute NOTHING
@@ -997,13 +1010,16 @@ class Row(NamedTuple):
 
     @property
     def completion(self) -> Optional[float]:
-        return _completion(self.executed_usd, self.ordered_usd)
+        """SHARES - see Line.completion."""
+        return _completion(self.executed, self.order_qty)
 
 
 class Totals(NamedTuple):
     orders: int
     ordered_usd: float
     executed_usd: float
+    order_qty: int = 0        # SHARES - what completion is taken off
+    executed: int = 0         # SHARES
     fav_short: int = 0
     adv_short: int = 0
     unpriced: int = 0
@@ -1022,7 +1038,8 @@ class Totals(NamedTuple):
 
     @property
     def completion(self) -> Optional[float]:
-        return _completion(self.executed_usd, self.ordered_usd)
+        """SHARES - see Line.completion."""
+        return _completion(self.executed, self.order_qty)
 
 
 def by_region(lines) -> list:
@@ -1039,11 +1056,15 @@ def by_region(lines) -> list:
     nopx = {c: 0 for c in REGION_CODES}
     pw = {c: 0.0 for c in REGION_CODES}
     pws = {c: 0.0 for c in REGION_CODES}
+    qty = {c: 0 for c in REGION_CODES}
+    ex = {c: 0 for c in REGION_CODES}
     for ln in lines:
         c = ln.o.region
         n[c] += 1
         ordered[c] += ln.ordered_usd
         made[c] += ln.executed_usd
+        qty[c] += ln.o.size
+        ex[c] += ln.executed
         if ln.pinned is not None and ln.ordered_usd > 0:
             pw[c] += ln.ordered_usd
             pws[c] += ln.pinned * ln.ordered_usd
@@ -1054,6 +1075,7 @@ def by_region(lines) -> list:
         elif ln.incomplete and ln.favourable is False:
             adv[c] += 1
     return [Row(r.code, r.name, n[r.code], ordered[r.code], made[r.code],
+                qty[r.code], ex[r.code],
                 fav[r.code], adv[r.code], nopx[r.code],
                 pws[r.code], pw[r.code]) for r in REGIONS]
 
@@ -1064,6 +1086,8 @@ def totals(rows) -> Totals:
     return Totals(sum(r.orders for r in rows),
                   sum(r.ordered_usd for r in rows),
                   sum(r.executed_usd for r in rows),
+                  sum(r.order_qty for r in rows),
+                  sum(r.executed for r in rows),
                   sum(r.fav_short for r in rows),
                   sum(r.adv_short for r in rows),
                   sum(r.unpriced for r in rows),
@@ -1147,9 +1171,9 @@ def draw(rows, tot, subtitle, foot, note=""):
              "close.",
              fontsize=8, color=INK2, va="baseline")
     fig.text(L, 0.756,
-             "Executed is what the fills really paid, so completion is the "
-             "notional one — not the share completion, which is a different "
-             "number.",
+             "Executed is what the fills really paid, so the two notional "
+             "columns are not a ratio. Completion is shares: executed over "
+             "the quantity ordered.",
              fontsize=8, color=INK2, va="baseline")
 
     y = table(fig, REGION_COLS, [_row_cells(r) for r in rows], 0.730, 0.030,
@@ -2159,9 +2183,19 @@ def self_test() -> int:
           rows["JP"].ordered_usd, 4000 * 100.0)
     check("and so is what the fills really paid",
           rows["JP"].executed_usd, 700 * 50.0)
-    check("completion is the NOTIONAL one, off the columns beside it",
+    #  SHARES, not the two columns divided.  Ordered is theoretical - the
+    #  whole quantity at a price the unfilled part never traded at - and
+    #  executed is realised, so dividing them gives the share completion
+    #  times a price move, and that can print over 100%.
+    check("completion is the SHARE one, not the two columns divided",
           round(rows["JP"].completion, 4),
-          round(100.0 * (700 * 50.0) / (4000 * 100.0), 4))
+          round(100.0 * rows["JP"].executed / rows["JP"].order_qty, 4))
+    check("and the shares behind it are on the row",
+          (rows["JP"].order_qty, rows["JP"].executed), (4000, 700))
+    check("which is a different number from the notional ratio",
+          round(rows["JP"].completion, 4)
+          == round(100.0 * rows["JP"].executed_usd
+                   / rows["JP"].ordered_usd, 4), False)
     check("a region with no order shows no percentage, not 0%",
           rows["TH"].completion, None)
     check("all eight regions are always there", len(by_region(rol)), 8)
@@ -2170,9 +2204,9 @@ def self_test() -> int:
     tot = totals(by_region(rol))
     check("the total is the sum of the rows", (tot.orders, tot.ordered_usd),
           (3, 6000 * 100.0))
-    check("and its completion is notional weighted, not a mean of the rows",
+    check("and its completion is summed shares, not a mean of the rows",
           round(tot.completion, 4),
-          round(100.0 * tot.executed_usd / tot.ordered_usd, 4))
+          round(100.0 * tot.executed / tot.order_qty, 4))
 
     print("\nfills cannot land in a region with no order")
     #  the fault that made the old report print Korea 161.9%: quantity counted
@@ -2366,6 +2400,33 @@ def self_test() -> int:
               to_orders([_t(3, "JP", 1000, limit_price=0.0, adjclose=None,
                             orgclose=None)]), {}, {}, {}))
            if x.code == "JP"][0].pinned_pct, None)
+
+    print("\ncompletion is a share ratio here too")
+    #  the same defect fixed in short_sell_report 46c0be4: ordered is
+    #  THEORETICAL - the whole quantity at a price the unfilled part never
+    #  traded at - and executed is REALISED, so their ratio is the share
+    #  completion multiplied by a price move.  It can print over 100%.
+    c_ord = to_orders([_t(1, "JP", 1000, limit_price=10.0)])
+    c_key = c_ord[0].key
+    c_ln = to_lines(c_ord, {c_key: Splits(n=1, made=1000,
+                                          filled_local=10_500.0)}, {}, {})
+    check("a full fill reads 100%, not 105%", c_ln[0].completion, 100.0)
+    check("while the executed notional stays REAL money at real prices",
+          c_ln[0].executed_usd, 10_500.0)
+    check("which may exceed the theoretical ordered side",
+          c_ln[0].executed_usd > c_ln[0].ordered_usd, True)
+    c_row = [x for x in by_region(c_ln) if x.code == "JP"][0]
+    check("the region row is shares too", c_row.completion, 100.0)
+    check("and so is the headline",
+          totals(by_region(c_ln)).completion, 100.0)
+    #  the case that used to lie: a partial fill into a rising market
+    h_ln = to_lines(c_ord, {c_key: Splits(n=1, made=800,
+                                          filled_local=10_400.0)}, {}, {})
+    check("a partial fill reads as partial", h_ln[0].completion, 80.0)
+    check("even when the money says otherwise",
+          h_ln[0].executed_usd > h_ln[0].ordered_usd, True)
+    check("and it cannot exceed 100% whatever the prices did",
+          [x.completion <= 100.0 for x in (c_ln[0], h_ln[0])], [True, True])
 
     print("\nthe children, counted and timed")
     sp = splits_by_order(

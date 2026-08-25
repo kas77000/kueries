@@ -31,7 +31,7 @@ China           22                     8.4m                      4.6m        55.
 Total          105                    23.3m                      8.5m        36.6%            52            52
 ```
 
-### Notional, and why completion is not the share completion
+### Notional, and why completion is in shares
 
 `size` is a **share count**, so putting an order in USD needs a price — and the
 **unfilled** part of an order never traded at one. The ladder is
@@ -44,9 +44,20 @@ Total          105                    23.3m                      8.5m        36.
 | **the close** | `adjclose`, else `orgclose`. The fallback for an order that never produced a child at all — on *this* page not a rare branch, because an order that sent nothing is the thing the report exists to find |
 
 **Executed is not priced that way at all.** It is `make × the child's own
-avg_fill_price` — what those shares really cost. So **notional completion is
-not share completion**: the two sides traded at different prices, and they
-cannot be the same number.
+avg_fill_price` — what those shares really cost.
+
+So **the two notional columns are not a ratio, and nothing on the page divides
+them.** Ordered is *theoretical* — the whole quantity at a price the unfilled
+part never traded at. Executed is *realised*. Executed can exceed ordered, and
+when it does that is a true fact about where the price went — a sell that
+filled above the bid it was valued at — not a completion over 100%.
+
+**Completion is `executed / order_qty`, in shares.** How much of the order got
+done is a quantity question, so it is answered in quantity, and it cannot
+exceed 100%. This is the same defect, and the same fix, as
+[`short_sell_report`](../short_sell_report/README.md#why-completion-is-in-shares) —
+see that section for the full argument, including why the bias only ever ran
+one way on a page of sells.
 
 Everything is multiplied by `target_stock.fxlast`, local → USD.
 
