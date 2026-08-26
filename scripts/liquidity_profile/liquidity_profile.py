@@ -111,6 +111,10 @@ def fetch(sym: str, day: dt.date, mins: int) -> pd.DataFrame:
     #  too, but this way the conversion is visible rather than left to pykx.
     bkt = h('{"t"$x*00:01:00.000}', mins)
     t0 = time.perf_counter()
+    #  .encode() sends bytes, which pykx hands to q as a CHAR VECTOR, not a
+    #  symbol.  qatt`sym is a symbol column, so .lp.profile coerces it with
+    #  .lp.sym; without that, `sym=s` compares N rows against 7 characters and
+    #  q answers 'length, naming neither the column nor the argument.
     df = h(".lp.profile", sym.encode(), day, bkt).pd()
     log(f"  {len(df):>4,} buckets   {time.perf_counter() - t0:5.1f}s")
     return df
@@ -313,6 +317,11 @@ def self_test() -> int:
     check("no q reserved word is used as a name", q_lint.reserved_used(src), [])
     check("the profile function is there", ".lp.profile:" in src, True)
     check("the bucket is cast, not used raw", '"t"$x' in src, True)
+    #  this pair is what fetch() depends on: it sends the sym as bytes, which
+    #  reaches q as a char vector, and `sym=s` against a symbol column is a
+    #  bare 'length unless the query coerces it first
+    check("the sym is coerced to a symbol", ".lp.sym:" in src, True)
+    check("and profile actually calls it", "s:.lp.sym s" in src, True)
 
     print("\nreading a frame")
     df = _fake()

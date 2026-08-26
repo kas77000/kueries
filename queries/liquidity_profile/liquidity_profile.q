@@ -27,6 +27,14 @@
 / `00:10 xbar time` buckets by ten MILLISECONDS.  The cast removes the trap.
 .lp.bkt:{"t"$x};
 
+/ THE SYM IS COERCED.  qatt`sym is a symbol column, so `sym=s` needs s to be a
+/ symbol: hand it the char vector "0700.HK" instead and q compares a column of
+/ N rows against a list of 7 characters and answers 'length, naming nothing.
+/ A client sending a string is the normal case, not a mistake - pykx maps
+/ python bytes to a char vector, which is what market_stats.q's `like` wants -
+/ so take either and convert here.
+.lp.sym:{$[-11h=type x; x; `$x]};
+
 / what a day with no prints comes back as - typed, so the caller charts an
 / empty day rather than handling a special case
 .lp.empty:([] bkt:0#0Nt; trades:0#0j; shares:0#0j; turnover:0#0n;
@@ -36,6 +44,7 @@
 / day - the counts then total across the dates, the percentages do not.
 .lp.profile:{[s;dt;bkt]
   b:.lp.bkt bkt;
+  s:.lp.sym s;
   / price>0 and size>0 is the whole test for "this row is a print": every qatt
   / row is a transaction carrying the quote that stood at the time, so there
   / are no quote-only rows to exclude.  See market_stats.q note 8.
