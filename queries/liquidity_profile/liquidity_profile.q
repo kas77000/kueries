@@ -91,6 +91,67 @@
   update pct:100*shares%tot, cum_pct:100*(sums shares)%tot from r
  };
 
+/ =============================================================================
+/ THE QUOTE CURVE.  Every print's quote, at full resolution - NOT a bucket
+/ average.  qatt has no quote-only rows, so this is the quote as it stood at
+/ each transaction, which on a liquid name is a hundred thousand points or
+/ more; the caller draws them as a line, not as marks, and says how many.
+/
+/ Rows with a side missing are dropped.  A trade print or a pre-open gap can
+/ carry a zero or a null on one side, and one zero drags the curve to the
+/ floor - the same rows limit_up_down.q has to exclude for the same reason.
+/ =============================================================================
+
+.lp.quotes:{[s;dt]
+  sy:.lp.sym s;
+  select time,qbid,qask from qatt
+    where date in dt, sym=sy, qbid>0, qask>0
+ };
+
+/ =============================================================================
+/ THE ORDER SIDE.  These three read the ORDER server, not the quote server -
+/ load this file onto both and call each function on the handle that has its
+/ tables, the way market_stats.q's fxOn is called on the order server.
+/
+/ id_target is an int in all three tables, so it is cast rather than trusted:
+/ a python int arrives as a long, and a long against an int column is one more
+/ way to earn a `type that names nothing.
+/ =============================================================================
+
+.lp.tid:{"i"$x};
+
+/ every fill of the target, unaggregated: the price we actually traded at, with
+/ a time on it.  execution is the ONLY place a fill carries a time -
+/ workorder`make is the child's total with no time - so both the stacked bars
+/ and the fill marks come from here, off ONE read, which is why this returns
+/ the rows rather than a per-bucket sum: two reads could disagree.
+/
+/ fillsize>0 drops the execution rows that are state changes rather than fills.
+/ id_work links each fill back to the child order that made it.
+.lp.execs:{[dt;idt]
+  i:.lp.tid idt;
+  select date,id_server,id_work,id_target,time,fillprice,fillsize
+    from execution where date in dt, id_target=i, fillsize>0
+ };
+
+/ every child order of the target, with the price it showed and what became of
+/ it.  state AND request both come back: the caller decides what a cancel looks
+/ like, and cannot do that without seeing the vocabulary this server uses.
+.lp.orders:{[dt;idt]
+  i:.lp.tid idt;
+  select date,id_server,id_work,id_target,time,t_transmit,t_on_market,
+      sym,side,size,make,price,state,request
+    from workorder where date in dt, id_target=i
+ };
+
+/ the parent, for the sym and the side - so --id-target alone is enough to
+/ name the stock, and giving both is checked rather than assumed
+.lp.tgt:{[dt;idt]
+  i:.lp.tid idt;
+  select date,id_server,id_target,sym,side,size,limit_price
+    from target where date in dt, id_target=i
+ };
+
 / Same table with a bar drawn from pct and scaled to the busiest bucket, which
 / is a full bar whatever it is worth: read the bars for the shape of the day
 / and pct for what it was actually worth.
