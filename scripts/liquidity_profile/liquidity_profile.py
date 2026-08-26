@@ -105,11 +105,9 @@ def fetch(sym: str, day: dt.date, mins: int) -> pd.DataFrame:
     h = connect(QATT_SERVER)
     log(f"  loading {QUERY_FILE.name} onto the quote server")
     h(QUERY_FILE.read_text(encoding="utf-8"))
-    #  the bucket is built ON THE SERVER from a plain integer of minutes:
-    #  int * 00:01:00.000 is a time in milliseconds, which is the one unit
-    #  .lp.profile can bucket against.  Handing q a python timedelta would work
-    #  too, but this way the conversion is visible rather than left to pykx.
-    bkt = h('{"t"$x*00:01:00.000}', mins)
+    #  the bucket is built ON THE SERVER from a plain integer of minutes, so
+    #  the conversion is visible here rather than left to pykx
+    bkt = _bkt(h, mins)
     t0 = time.perf_counter()
     #  .encode() sends bytes, which pykx hands to q as a CHAR VECTOR, not a
     #  symbol.  qatt`sym is a symbol column, so .lp.profile coerces it with
@@ -118,6 +116,46 @@ def fetch(sym: str, day: dt.date, mins: int) -> pd.DataFrame:
     df = h(".lp.profile", sym.encode(), day, bkt).pd()
     log(f"  {len(df):>4,} buckets   {time.perf_counter() - t0:5.1f}s")
     return df
+
+
+def probe(sym: str, day: dt.date, mins: int) -> int:
+    """Walk the query in stages and name the one that breaks.
+
+    q answers a mismatched argument with `type or `length and names nothing -
+    not the column, not the argument, not the line.  Each stage below is its
+    own IPC call, so the traceback is replaced by the NAME of the stage that
+    failed, and the stages before it print what they saw."""
+    log(f"liquidity_profile --probe  {sym}  {day}  {mins} minute buckets")
+    h = connect(QATT_SERVER)
+    h(QUERY_FILE.read_text(encoding="utf-8"))
+    raw = sym.encode()
+
+    stages = [
+        ("what q was handed", lambda: h(".lp.types", raw, day, _bkt(h, mins))),
+        ("what qatt is made of", lambda: h(".lp.cols")),
+        ("the sym coercion", lambda: h(".lp.sym", raw)),
+        ("the bucket cast", lambda: h(".lp.bkt", _bkt(h, mins))),
+        ("the where clause", lambda: h(".lp.rows", raw, day)),
+        ("the bucketing", lambda: h("{count .lp.buckets[x;y;z]}", raw, day,
+                                    _bkt(h, mins))),
+        ("the full profile", lambda: h("{count .lp.profile[x;y;z]}", raw, day,
+                                       _bkt(h, mins))),
+    ]
+    for name, fn in stages:
+        try:
+            log(f"  ok    {name}: {fn()}")
+        except Exception as e:                    # noqa: BLE001 - report it
+            log(f"  FAIL  {name}: {type(e).__name__}: {e}")
+            log(f"\n  ^ that stage is the one to fix.  Everything above it ran.")
+            return 1
+    log("\n  every stage ran - the query is fine against this server")
+    return 0
+
+
+def _bkt(h, mins: int):
+    """The bucket as a q time.  int * 00:01:00.000 is a time in milliseconds,
+    which is the one unit the query buckets against."""
+    return h('{"t"$x*00:01:00.000}', mins)
 
 
 # =============================================================================
@@ -321,7 +359,16 @@ def self_test() -> int:
     #  reaches q as a char vector, and `sym=s` against a symbol column is a
     #  bare 'length unless the query coerces it first
     check("the sym is coerced to a symbol", ".lp.sym:" in src, True)
-    check("and profile actually calls it", "s:.lp.sym s" in src, True)
+    check("and the read actually calls it", "sy:.lp.sym s" in src, True)
+    #  xbar against a temporal is the trap .lp.bkt's comment describes: its two
+    #  arguments have to already agree, and a minute against a time does not.
+    #  The bucketing is done in milliseconds instead, so no xbar should survive
+    #  in the CODE - the comments discuss it at length, which is why this looks
+    #  at `code` rather than at `src`.
+    check("nothing buckets with xbar", "xbar" in code, False)
+    check("the stages for --probe are there",
+          all(f".lp.{n}:" in src for n in ("types", "cols", "rows", "buckets")),
+          True)
 
     print("\nreading a frame")
     df = _fake()
@@ -378,6 +425,8 @@ def main(argv=None) -> int:
     p.add_argument("--mins", type=int, default=MINS,
                    help=f"bucket width in minutes (default {MINS})")
     p.add_argument("--theme", choices=("dark", "light"), default=THEME)
+    p.add_argument("--probe", action="store_true",
+                   help="walk the query in stages and name the one that breaks")
     p.add_argument("--self-test", action="store_true",
                    help="run the offline checks; needs no server and no kdb")
     a = p.parse_args(argv)
@@ -394,6 +443,9 @@ def main(argv=None) -> int:
         day = dt.date.fromisoformat(a.date)
     except ValueError:
         p.error(f"--date must be YYYY-MM-DD, not {a.date!r}")
+
+    if a.probe:
+        return probe(a.sym, day, a.mins)
 
     df = fetch(a.sym, day, a.mins)
     if not len(df):

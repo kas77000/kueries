@@ -19,20 +19,28 @@
 / of quoteTime (UTC) in the sample, i.e. HKT - so a HK name's buckets read as
 / Hong Kong local, and a Tokyo name's read an hour ahead of Tokyo.  Nothing is
 / converted here.
+/
+/ If a call fails with a bare `type or `length, run the stages in .lp.types,
+/ .lp.cols, .lp.rows and .lp.buckets - see DIAGNOSIS at the foot of this file.
 
-/ THE BUCKET IS CAST, NOT USED RAW.  "t"$00:10 is 00:10:00.000, so 00:10 and
-/ 00:10:00.000 both mean ten minutes.  Casting between temporal types converts
-/ units; ARITHMETIC ON THEM DOES NOT.  00:10 is a minute, carrying the
-/ underlying value 10, and a time is a count of milliseconds - so an unchecked
-/ `00:10 xbar time` buckets by ten MILLISECONDS.  The cast removes the trap.
+/ =============================================================================
+/ THE ARGUMENTS ARE COERCED.  Both of these cost one line and remove the two
+/ ways a caller's types can differ from the table's, each of which fails with
+/ an error that names neither the column nor the argument.
+/ =============================================================================
+
+/ MILLISECONDS, ALWAYS.  "t"$00:10 is 00:10:00.000, so 00:10 and 00:10:00.000
+/ both mean ten minutes.  Casting between temporal types converts units;
+/ ARITHMETIC ON THEM DOES NOT.  00:10 is a minute carrying the underlying value
+/ 10, and a time is a count of milliseconds, so an unchecked `00:10 xbar time`
+/ buckets by ten MILLISECONDS.  The cast removes the trap.
 .lp.bkt:{"t"$x};
 
-/ THE SYM IS COERCED.  qatt`sym is a symbol column, so `sym=s` needs s to be a
-/ symbol: hand it the char vector "0700.HK" instead and q compares a column of
-/ N rows against a list of 7 characters and answers 'length, naming nothing.
-/ A client sending a string is the normal case, not a mistake - pykx maps
-/ python bytes to a char vector, which is what market_stats.q's `like` wants -
-/ so take either and convert here.
+/ qatt`sym is a symbol column, so `sym=s` needs s to be a symbol: hand it the
+/ char vector "0700.HK" instead and q compares a column of N rows against a
+/ list of 7 characters and answers `length, naming nothing.  A client sending a
+/ string is the normal case rather than a mistake - pykx maps python bytes to a
+/ char vector, which is what market_stats.q's `like` wants - so take either.
 .lp.sym:{$[-11h=type x; x; `$x]};
 
 / what a day with no prints comes back as - typed, so the caller charts an
@@ -40,27 +48,43 @@
 .lp.empty:([] bkt:0#0Nt; trades:0#0j; shares:0#0j; turnover:0#0n;
   pct:0#0n; cum_pct:0#0n);
 
+/ =============================================================================
+/ The worker, in two halves so a failure can be placed: .lp.buckets reads qatt
+/ and aggregates, .lp.profile fills the gaps and takes the percentages.
+/ =============================================================================
+
 / s is one sym.  dt is a date, or a list of dates for the shape of a typical
 / day - the counts then total across the dates, the percentages do not.
-.lp.profile:{[s;dt;bkt]
-  b:.lp.bkt bkt;
-  s:.lp.sym s;
+/ An empty general list means the name did not trade.
+.lp.buckets:{[s;dt;bkt]
+  ms:"j"$.lp.bkt bkt;
+  sy:.lp.sym s;
   / price>0 and size>0 is the whole test for "this row is a print": every qatt
   / row is a transaction carrying the quote that stood at the time, so there
   / are no quote-only rows to exclude.  See market_stats.q note 8.
-  t:select time,price,size from qatt where date in dt, sym=s, price>0, size>0;
-  if[0=count t; :.lp.empty];
+  t:select time,price,size from qatt where date in dt, sym=sy, price>0, size>0;
+  if[0=count t; :()];
+  / BUCKETED IN MILLISECONDS, not with xbar against a temporal.  "j"$time is
+  / the count of ms since midnight, div ms is the bucket's index, *ms is its
+  / start and "t"$ puts it back on the clock - four steps in one unit, with no
+  / cross type temporal arithmetic anywhere in them.  xbar would read as the
+  / obvious thing to write here, and it is exactly what the comment on .lp.bkt
+  / warns about: its two arguments have to already agree.
   / "j"$size before summing - size is an int, and a day of a heavily traded
-  / small cap goes past the 2.1bn an int tops out at
-  r:0!select trades:count i, shares:sum "j"$size, turnover:sum price*"f"$size
-    by bkt:b xbar time from t;
+  / small cap goes past the 2.1bn an int tops out at.
+  0!select trades:count i, shares:sum "j"$size, turnover:sum price*"f"$size
+    by bkt:"t"$ms*("j"$time) div ms from t
+ };
+
+.lp.profile:{[s;dt;bkt]
+  r:.lp.buckets[s;dt;bkt];
+  if[0=count r; :.lp.empty];
+  ms:"j"$.lp.bkt bkt;
   / every bucket from the first print to the last, so the lunch break and a
   / dead hour read as empty bars rather than as rows that are not there.
-  / Built in longs - milliseconds - for the same reason .lp.bkt casts: time
-  / arithmetic against a bucket is only safe once both are the same unit.
+  / In milliseconds again, for the same reason.
   lo:"j"$first r`bkt;
   hi:"j"$last r`bkt;
-  ms:"j"$b;
   r:([] bkt:"t"$lo+ms*til 1+(hi-lo) div ms) lj `bkt xkey r;
   r:update trades:0^trades, shares:0^shares, turnover:0f^turnover from r;
   tot:sum r`shares;
@@ -76,4 +100,28 @@
   r:.lp.profile[s;dt;bkt];
   if[0=count r; :r];
   update bar:.lp.bar[max pct] each pct from r
+ };
+
+/ =============================================================================
+/ DIAGNOSIS.  q answers a mismatched argument with `type or `length and names
+/ nothing - not the column, not the argument, not the line.  These run the same
+/ pipeline in stages, each one safe to call on its own, so the stage that fails
+/ IS the answer.  The script's --probe walks them in order.
+/
+/   q).lp.types[`0700.HK;2026.08.25;00:10]   / what q was actually handed
+/   q).lp.cols[]                             / what qatt is made of
+/   q).lp.rows[`0700.HK;2026.08.25]          / does the where clause run
+/   q)count .lp.buckets[`0700.HK;2026.08.25;00:10]    / does the bucketing
+/ =============================================================================
+
+/ cannot fail: it touches no table and coerces nothing
+.lp.types:{[s;dt;bkt] `arg_sym`arg_dt`arg_bkt!(type s;type dt;type bkt)};
+
+/ the four columns this query depends on, as the HDB actually stores them
+.lp.cols:{exec c!t from 0!meta qatt where c in `time`sym`price`size};
+
+/ the where clause on its own - a count, so nothing large comes back
+.lp.rows:{[s;dt]
+  count select from qatt
+    where date in dt, sym=.lp.sym s, price>0, size>0
  };
