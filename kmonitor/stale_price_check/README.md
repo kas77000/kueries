@@ -43,7 +43,7 @@ Admin, otherwise the period switch is not offered.
 | `now_price` | latest print for that name |
 | `now_dev_bps` | the gap to it now |
 | `now_age_ms` | how long since the tape last moved on that name |
-| `flag` | `noprint` / `both` / `price` / `age` / `ok` |
+| `flag` | `noprint` / `both` / `price` / `age` / `ok` — see the lookback section for what `noprint` means |
 
 `price_age_ms` answers *"was the data already old when the order was born"*.
 `now_age_ms` answers *"is it still old right now"* — which is the difference
@@ -51,6 +51,33 @@ between an order that was born bad and one still being fed bad data.
 
 `t_gen` and `qatt`'s `time` come off the same clock, so they compare directly.
 No timezone and no DST conversion anywhere in this dashboard.
+
+## The lookback, and the two windows
+
+**Lookback (minutes)** bounds `t_gen` — how recently the workorder was created.
+It exists because reading the whole session out of `qatt` is too slow to run on
+a refresh.
+
+`qatt` is read from **twice that far back**. An order generated at the very
+start of the order window still needs prints *before* it to as-of onto, so the
+quote window has to open earlier than the order window does:
+
+```
+qatt scanned   |<--------- 2 x lookback --------->|
+workorders                    |<--- lookback ---->|
+               t0-lookback   t0                  now
+```
+
+The consequence is that **`noprint` means "no print in the scanned window"**,
+not "never traded today". That is still a finding rather than a gap: a name we
+are working that has not printed in twice your lookback is stale by any
+reading. But it is a different sentence from the one the column used to say,
+and a very short lookback will produce more of them on thin names.
+
+**On a historical period the lookback is ignored.** "The last 10 minutes"
+cannot mean anything on a past date — the reader already bounded that frame
+with the dates — so both windows are passed `00:00:00.000` and the whole of
+each day in range is read. A historical run is deliberately the slow path.
 
 ## The two thresholds
 
@@ -63,8 +90,9 @@ of them. Read `dev_bps` and `price_age_ms` directly on that run, decide what
 "bad" looks like on this book, then set the two boxes. The shipped defaults —
 25 bps and 5000 ms — are a starting guess, not a measurement.
 
-Rows where the name has **never printed** come back whatever the thresholds
-say. A name we are working that has not traded is a finding, not an absence.
+Rows where the name has **no print in the scanned window** come back whatever
+the thresholds say. A name we are working that has not traded is a finding, not
+an absence.
 
 ## What it deliberately does not do
 

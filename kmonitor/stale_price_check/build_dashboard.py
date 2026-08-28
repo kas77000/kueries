@@ -60,6 +60,30 @@ def dataset(name: str, env: str, qsql: str) -> dict:
 def parameters() -> list:
     return [
         {
+            "name": "lookback_mins",
+            "label": "Lookback (minutes, real-time only)",
+            "kind": "number",
+            "choices": [],
+            "dataset": "",
+            "column": "",
+            "default": "10",
+            "q_type": "number",
+            "help": ("How recently the workorder was created. Live, this is "
+                     "what keeps the query runnable on a refresh - reading the "
+                     "whole session out of qatt is too slow. qatt itself is "
+                     "read from twice this far back, so an order at the start "
+                     "of the window still has prints before it to land on. On "
+                     "a historical period it is IGNORED: the dates already "
+                     "bound that frame."),
+            "required": True,
+            "pattern": "",
+            "pattern_message": "",
+            "minimum": "1",
+            "maximum": "",
+            "integer": True,
+            "weekdays_only": False,
+        },
+        {
             "name": "min_dev_bps",
             "label": "Minimum deviation (bps)",
             "kind": "number",

@@ -60,17 +60,49 @@ per `id_work`, so the order's current price is what decides rather than some
 earlier row's. `0<` drops a null price as well. `otype` stays in the output so
 the kind of limit order is still visible.
 
+## The lookback, and the two windows
+
+`lookback` is in minutes and bounds `t_gen` — how recently the workorder was
+created. It exists because reading the whole session out of `qatt` is too slow
+to run live. Named `lookback`, not `mins`: `mins` is the q keyword for running
+minimums and using it as a parameter gives a type error.
+
+`qatt` is read from **twice that far back**, because an order generated at the
+very start of the order window still needs prints before it to as-of onto:
+
+```
+qatt scanned   |<--------- 2 x lookback --------->|
+workorders                    |<--- lookback ---->|
+               t0-lookback   t0                  now
+```
+
+So `noprint` means **"no print in the scanned window"**, not "never traded
+today". Still a finding — a name we are working that has not printed in twice
+the lookback is stale by any reading — but a different sentence from the one
+the column said before the bound existed.
+
+In the KdbMonitor version the lookback applies to the **real-time period only**.
+On a historical period both windows are passed `00:00:00.000`, ie no bound: "the
+last 10 minutes" cannot mean anything on a past date, where the reader has
+already bounded the frame with the dates.
+
+`sym in syms` stays the *first* constraint in the `qatt` where clause, ahead of
+the time bound. The RDB keeps `` `g#sym `` and the where clause can only use
+that attribute on the constraint it applies first; the time cut then runs on
+what survives.
+
 ## Thresholds
 
-`stalePriceCheck[h;minDevBps;minAgeMs]`.
+`stalePriceCheck[h;lookback;minDevBps;minAgeMs]`.
 
-A threshold of `0` turns that test **off**. `[h;0;0]` therefore returns every
-workorder under a live parent, ranked worst-first, with every number filled in
+A threshold of `0` turns that test **off**. `[h;10;0;0]` therefore returns every
+workorder in the window, ranked worst-first, with every number filled in
 and `flag` reading `ok` on all of them — the calibration run. Once the numbers
 on this book are known, `[h;25;5000]` returns breaches only.
 
-Rows with no print at all are always returned, whatever the thresholds. A name
-we are working that has never traded is a finding, not an absence.
+Rows with no print in the scanned window are always returned, whatever the
+thresholds. A name we are working that has not traded is a finding, not an
+absence.
 
 ## Known limit
 
@@ -110,8 +142,9 @@ time, so a historical range cannot join a print across a day boundary.
 measured to the session end read off the other names in the frame, the same way
 `limit_up_down` reads a session end.
 
-Reader parameters: `min_dev_bps` (default 25), `min_price_age_ms` (default
-5000). Both accept 0 to turn that test off.
+Reader parameters: `lookback_mins` (default 10, real-time only),
+`min_dev_bps` (default 25), `min_price_age_ms` (default 5000). Both
+thresholds accept 0 to turn that test off.
 
 ## Deliverables
 
