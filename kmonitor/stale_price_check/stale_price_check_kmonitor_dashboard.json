@@ -1,0 +1,261 @@
+{
+  "kind": "kdbmonitor-export",
+  "version": 2,
+  "exported_at": null,
+  "connections": [],
+  "alerts": [],
+  "dashboards": [
+    {
+      "id": null,
+      "name": "Stale price check - workorders vs the tape",
+      "description": "Every workorder under an activated parent, with the price the algo gave it beside the last print qatt actually had for that name at the same instant. dev_bps is the gap; price_age_ms is how old that print already was. Both thresholds accept 0, which turns that test off and returns everything for calibration. Reads the same live and over a historical range. Source of truth is stale_price_check_kmonitor.q; regenerate this file with build_dashboard.py rather than editing it.",
+      "group": "Market structure",
+      "refresh_secs": 30,
+      "periods": "both",
+      "orientation": "landscape",
+      "source": "kdb",
+      "time_context": {
+        "mode": "realtime"
+      },
+      "parameters": [
+        {
+          "name": "min_dev_bps",
+          "label": "Minimum deviation (bps)",
+          "kind": "number",
+          "choices": [],
+          "dataset": "",
+          "column": "",
+          "default": "25",
+          "q_type": "number",
+          "help": "How far the order price has to sit from the print qatt had at t_gen before it counts. Set it to 0 to turn the price test off and see every workorder - that is the calibration run.",
+          "required": true,
+          "pattern": "",
+          "pattern_message": "",
+          "minimum": "0",
+          "maximum": "",
+          "integer": false,
+          "weekdays_only": false
+        },
+        {
+          "name": "min_price_age_ms",
+          "label": "Minimum print age (ms)",
+          "kind": "number",
+          "choices": [],
+          "dataset": "",
+          "column": "",
+          "default": "5000",
+          "q_type": "number",
+          "help": "How old the last print already was when the order was generated before it counts. Set it to 0 to turn the age test off. Thin names sit high on this one because they are not trading, not because anything is stale.",
+          "required": true,
+          "pattern": "",
+          "pattern_message": "",
+          "minimum": "0",
+          "maximum": "",
+          "integer": true,
+          "weekdays_only": false
+        }
+      ],
+      "datasets": [
+        {
+          "name": "live_orders",
+          "env": "OMS",
+          "time_mode": "inherit",
+          "time_context": null,
+          "mode": "raw",
+          "table": "",
+          "filters": [],
+          "raw_qsql": "/ The live book and its children.  Collapsed to one row per workorder here so\n/ dataset 2 joins against a clean set.\n{[]\n  / target_state and workorder0 both carry date on the RDB as well as the HDB,\n  / so one lambda serves both servers\n  mk:{[dts]\n    s:0!select state:last state by date,id_server,id_target\n      from target_state where date in dts;\n    ids:exec distinct id_target from s where state=`activated;\n    / NOT filtered on the child's own state - a workorder still in `init under\n    / a live parent was priced off the same data as its activated siblings\n    w:select date,id_server,id_target,id_work,sequence,trader,sym,side,size,\n        otype,state,t_gen,price\n      from workorder0 where date in dts, id_target in ids;\n    / workorder0 writes a row per state change; sequence is the order the\n    / server wrote them, and time can tie\n    w:0!select by date,id_server,id_work from `sequence xasc w;\n    / LIMIT ORDERS ONLY.  a market order carries price 0 - there is no order\n    / price to hold a print against, and leaving it in reads as -10000 bps and\n    / sorts to the top of every run.  0< also drops a null price.\n    / after the collapse, so it is the order's CURRENT price that decides and\n    / not some earlier row's.\n    select from w where 0<price\n   };\n  {{#realtime}}mk enlist .z.D{{/realtime}}{{#historical}}{[mk]\n     want:{{date_from}}+til 1+{{date_to}}-{{date_from}};\n     / asked of the ORDER hdb: it and the quote hdb are written down on their\n     / own schedules, so one having today says nothing about the other\n     hasToday:0<count select date from workorder0 where date=.z.D;\n     stitch:(.z.D in want) and not hasToday;\n     o:mk[$[stitch; want except .z.D; want]];\n     if[stitch;\n       c:hopen {{conn:OMS:realtime}};\n       t:c(mk;enlist .z.D);\n       hclose c;\n       o:o uj t];\n     o\n    }[mk]{{/historical}}\n }[]",
+          "extra_connections": [],
+          "transforms": [],
+          "max_rows": 5000,
+          "static": false,
+          "source": "kdb",
+          "shape": null,
+          "file_label": ""
+        },
+        {
+          "name": "stale_check",
+          "env": "QUOTES",
+          "time_mode": "inherit",
+          "time_context": null,
+          "mode": "raw",
+          "table": "",
+          "filters": [],
+          "raw_qsql": "/ The whole order table comes across, because an aj needs both sides local.\n{[w;minDevBps;minAgeMs]\n  now:.z.T;\n  / nothing activated: back out before touching qatt.  this hands the widgets\n  / the empty ORDER table rather than an empty result with the columns they\n  / name, so an empty book may show as a column error rather than as no rows.\n  if[0=count w; :w];\n  syms:exec distinct sym from w;\n  / dates come from the orders, so this is already whatever dataset 1 found\n  dts:exec distinct date from w;\n  / the quote RDB has NO date column - it is today by definition - so unlike\n  / the order side the two halves cannot share a lambda.  this is the RDB half.\n  / PRINTS ONLY: qatt carries quote updates on the same table and their price\n  / is null, and an asof onto one of those would date the order against a row\n  / that never traded.\n  rdb:{[syms]\n    update date:.z.D from\n      select time, sym, gen_price:price, ptime:time\n        from qatt where sym in syms, 0<0^price\n   };\n  p:{{#realtime}}rdb syms{{/realtime}}{{#historical}}{[dts;syms;rdb]\n      hasToday:0<count select date from qatt where date=.z.D;\n      stitch:(.z.D in dts) and not hasToday;\n      dd:$[stitch; dts except .z.D; dts];\n      q:select date, time, sym, gen_price:price, ptime:time\n        from qatt where date in dd, sym in syms, 0<0^price;\n      if[stitch;\n        c:hopen {{conn:QUOTES:realtime}};\n        t:c(rdb;syms);\n        hclose c;\n        q:q uj t];\n      q\n     }[dts;syms;rdb]{{/historical}};\n  / aj wants the right side sorted by the join columns.  date is IN the join\n  / here, unlike the bare-q version: an exact match on date and sym, asof on\n  / time, so a range can never date an order against another day's print.\n  p:`date`sym`time xasc p;\n  x:aj[`date`sym`time; update time:t_gen from w; p];\n\n  / ---- the two prices, and the gap ------------------------------------\n  x:update price_age_ms:\"j\"$t_gen-ptime from x;\n  / price is a real limit price by now - market orders never left the order\n  / server.  the guard left is gen_price: a name with no print has none.\n  x:update dev_bps:?[0<gen_price;\n      10000*(price-gen_price)%gen_price; 0n] from x;\n  / where the tape is now: says whether this is an order that was born bad or\n  / one still being fed bad data\n  c:select now_price:last gen_price, now_ptime:last time by date,sym from p;\n  x:x lj c;\n  / \"now\" on a past date means that day's last print, read off the other names\n  / in the frame - the same way a pinned stock's session end is read\n  e:select sess:max time by date from p;\n  x:x lj e;\n  x:update now_age_ms:\"j\"$?[date=.z.D; now; sess]-now_ptime from x;\n  x:update now_dev_bps:?[0<now_price;\n      10000*(price-now_price)%now_price; 0n] from x;\n\n  / ---- verdict --------------------------------------------------------\n  / 0 turns a test off rather than making everything breach it\n  x:update hit_price:(0<minDevBps)&minDevBps<=abs dev_bps,\n      hit_age:(0<minAgeMs)&minAgeMs<=price_age_ms,\n      noprint:null ptime from x;\n  x:update flag:?[noprint;`noprint;\n      ?[hit_price&hit_age;`both;\n      ?[hit_price;`price;\n      ?[hit_age;`age;`ok]]]] from x;\n  x:update flagged:not flag=`ok from x;\n  / a name we are working that has never printed is a finding, not an absence,\n  / so it comes back whatever the thresholds say\n  x:$[(0=minDevBps)&0=minAgeMs; x; select from x where flagged];\n  / worst first, and the ones with nothing to compare against on top\n  r:`noprint`sev xdesc update sev:abs dev_bps from x;\n  select date, id_server, id_target, id_work, trader, sym, side, size, otype,\n      state, t_gen, price, gen_price, dev_bps, abs_dev_bps:sev, ptime,\n      price_age_ms, now_price, now_dev_bps, now_age_ms, flag, flagged\n    from r\n }[{{table:live_orders}};{{param:min_dev_bps}};{{param:min_price_age_ms}}]",
+          "extra_connections": [],
+          "transforms": [],
+          "max_rows": 5000,
+          "static": false,
+          "source": "kdb",
+          "shape": null,
+          "file_label": ""
+        }
+      ],
+      "rows": [
+        {
+          "widgets": [
+            {
+              "type": "kpi",
+              "dataset": "stale_check",
+              "title": "Workorders checked",
+              "spec": {
+                "column": "id_work",
+                "agg": "count",
+                "fmt": ",.0f"
+              },
+              "width": 1.0
+            },
+            {
+              "type": "kpi",
+              "dataset": "stale_check",
+              "title": "Flagged",
+              "spec": {
+                "column": "flagged",
+                "agg": "sum",
+                "fmt": ",.0f",
+                "thresholds": [
+                  {
+                    "op": ">",
+                    "value": 0,
+                    "color": "critical"
+                  }
+                ]
+              },
+              "width": 1.0
+            },
+            {
+              "type": "kpi",
+              "dataset": "stale_check",
+              "title": "Worst deviation",
+              "spec": {
+                "column": "abs_dev_bps",
+                "agg": "max",
+                "fmt": ",.1f",
+                "suffix": " bps"
+              },
+              "width": 1.0
+            },
+            {
+              "type": "kpi",
+              "dataset": "stale_check",
+              "title": "Oldest print at t_gen",
+              "spec": {
+                "column": "price_age_ms",
+                "agg": "max",
+                "fmt": ",.0f",
+                "suffix": " ms"
+              },
+              "width": 1.0
+            },
+            {
+              "type": "kpi",
+              "dataset": "stale_check",
+              "title": "Names affected",
+              "spec": {
+                "column": "sym",
+                "agg": "nunique",
+                "fmt": ",.0f"
+              },
+              "width": 1.0
+            }
+          ],
+          "height_in": 0.9,
+          "gap_above_in": 0.0,
+          "col_gap_in": 0.1
+        },
+        {
+          "widgets": [
+            {
+              "type": "table",
+              "dataset": "stale_check",
+              "title": "Workorder price vs the print qatt had at t_gen",
+              "spec": {
+                "columns": [
+                  "date",
+                  "sym",
+                  "side",
+                  "state",
+                  "otype",
+                  "trader",
+                  "id_target",
+                  "id_work",
+                  "size",
+                  "t_gen",
+                  "price",
+                  "gen_price",
+                  "dev_bps",
+                  "ptime",
+                  "price_age_ms",
+                  "now_price",
+                  "now_dev_bps",
+                  "now_age_ms",
+                  "flag"
+                ],
+                "labels": {
+                  "sym": "Stock",
+                  "side": "Side",
+                  "state": "Child state",
+                  "otype": "Type",
+                  "trader": "Trader",
+                  "id_target": "Parent",
+                  "id_work": "Child",
+                  "size": "Order qty",
+                  "t_gen": "Generated",
+                  "price": "Order price",
+                  "gen_price": "Print at t_gen",
+                  "dev_bps": "Gap (bps)",
+                  "ptime": "Print time",
+                  "price_age_ms": "Print age (ms)",
+                  "now_price": "Print now",
+                  "now_dev_bps": "Gap now (bps)",
+                  "now_age_ms": "Since last print (ms)",
+                  "flag": "Verdict"
+                },
+                "formats": {
+                  "size": ",.0f",
+                  "price": ",.4f",
+                  "gen_price": ",.4f",
+                  "now_price": ",.4f",
+                  "dev_bps": ",.1f",
+                  "now_dev_bps": ",.1f",
+                  "price_age_ms": ",.0f",
+                  "now_age_ms": ",.0f"
+                },
+                "highlight": [
+                  {
+                    "column": "flag",
+                    "op": "=",
+                    "value": "both",
+                    "color": "critical"
+                  },
+                  {
+                    "column": "flag",
+                    "op": "=",
+                    "value": "noprint",
+                    "color": "critical"
+                  },
+                  {
+                    "column": "flag",
+                    "op": "=",
+                    "value": "price",
+                    "color": "blue"
+                  },
+                  {
+                    "column": "flag",
+                    "op": "=",
+                    "value": "age",
+                    "color": "blue"
+                  }
+                ]
+              },
+              "width": 1.0
+            }
+          ],
+          "height_in": 6.4,
+          "gap_above_in": 0.15,
+          "col_gap_in": 0.0
+        }
+      ]
+    }
+  ]
+}
