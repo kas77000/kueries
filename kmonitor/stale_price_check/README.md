@@ -35,12 +35,12 @@ Admin, otherwise the period switch is not offered.
 
 | Column | |
 | --- | --- |
-| `price` | what the algo priced the workorder at |
-| `gen_price` | last `qatt` print at or before that workorder's `t_gen` |
-| `dev_bps` | `10000*(price-gen_price)%gen_price` — the gap between the two |
+| `order_price` | what the algo priced the workorder at, **as generated** |
+| `qatt_price` | last `qatt` print at or before that workorder's `t_gen` |
+| `dev_bps` | `10000*(order_price-qatt_price)%qatt_price` — the gap between the two |
 | `ptime` | when that print was |
 | `price_age_ms` | `t_gen - ptime` — how old the print already was when the order was born |
-| `now_price` | latest print for that name |
+| `qatt_price_now` | latest print for that name |
 | `now_dev_bps` | the gap to it now |
 | `now_age_ms` | how long since the tape last moved on that name |
 | `flag` | `noprint` / `both` / `price` / `age` / `ok` — see the lookback section for what `noprint` means |
@@ -51,6 +51,25 @@ between an order that was born bad and one still being fed bad data.
 
 `t_gen` and `qatt`'s `time` come off the same clock, so they compare directly.
 No timezone and no DST conversion anywhere in this dashboard.
+
+## The order price is the one it was GENERATED with
+
+`workorder0` writes a row per state change. `t_gen` is stamped at generation and
+never moves — but `price` **is** rewritten, because a chase repoints it. So the
+report reads the **first** row by `sequence` for everything describing the
+order: `t_gen`, `price`, `sym`, `side`, `size`. Only `state` comes off the last
+row, because the current state is the one thing you want current.
+
+Taking the last row instead pairs a repriced price with a generation timestamp
+and then holds it against the market at generation — right time, wrong price,
+and a deviation that is pure fiction. That is what this query did until it was
+caught against a real order on 2026-08-28.
+
+The consequence to know about: **a repricing is not checked.** A chase at 14:30
+also used market data and could also have been stale, and this report will not
+see it. Doing that properly means one row per price change compared against the
+market at *its own* timestamp — `workorder0` carries a per-row `time` for
+exactly that — which is a bigger change than this one.
 
 ## The lookback, and the two windows
 

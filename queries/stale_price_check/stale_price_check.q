@@ -59,14 +59,22 @@ stalePriceCheck:{[h;lookback;minDevBps;minAgeMs]
     w:select date,id_server,id_target,id_work,sequence,trader,sym,side,size,
         otype,state,t_gen,price
       from workorder0 where date=d, t_gen>=t0, id_target in ids;
-    / workorder0 writes a row per state change, so collapse to one row per
-    / child.  sequence is the order the server wrote them; time can tie.
-    w:0!select by date,id_server,id_work from `sequence xasc w;
+    / ONE ROW PER CHILD, AND IT IS THE FIRST ONE.  workorder0 writes a row per
+    / state change.  t_gen is stamped at generation and never moves, but price
+    / IS rewritten - a chase repoints it - so taking the last row pairs a
+    / repriced price with a generation timestamp and the comparison below stops
+    / meaning anything: right time, wrong price.
+    / Everything describing the order AS GENERATED therefore comes off the
+    / first row by sequence.  Only state is read from the last, because the
+    / current state is the one thing you want current.
+    w:`sequence xasc w;
+    w:0!select id_target:first id_target, trader:first trader, sym:first sym,
+        side:first side, size:first size, otype:first otype,
+        t_gen:first t_gen, price:first price, state:last state
+      by date,id_server,id_work from w;
     / LIMIT ORDERS ONLY.  a market order carries price 0 - there is no order
     / price to hold a print against, and leaving it in reads as -10000 bps and
     / sorts to the top of every run.  0< also drops a null price.
-    / after the collapse, so it is the order's CURRENT price that decides and
-    / not some earlier row's.
     select from w where 0<price
    };
   w:$[0<h; h(f;d;t0); f[d;t0]];
@@ -122,8 +130,29 @@ stalePriceCheck:{[h;lookback;minDevBps;minAgeMs]
   x:$[(0=minDevBps)&0=minAgeMs; x; select from x where flagged];
   / worst first, and the ones with nothing to compare against on top
   r:`noprint`sev xdesc update sev:abs dev_bps from x;
+  / renamed on the way out so the two can never be read for each other:
+  / order_price is ours, qatt_price is the tape's
   select date, id_server, id_target, id_work, trader, sym, side, size, otype,
-      state, t_gen, price, gen_price, dev_bps, abs_dev_bps:sev, ptime,
-      price_age_ms, now_price, now_dev_bps, now_age_ms, flag, flagged
+      state, t_gen, order_price:price, qatt_price:gen_price, dev_bps,
+      abs_dev_bps:sev, ptime, price_age_ms, qatt_price_now:now_price,
+      now_dev_bps, now_age_ms, flag, flagged
     from r
+ };
+
+/ stalePriceRows[h;idWork] - every workorder0 row for one child, in write
+/ order, with all four price fields beside each other.
+/
+/   q)stalePriceRows[h;5001i]
+/
+/ Reach for it when a number in the report looks wrong.  It shows whether price
+/ moved over the order's life, which row the report now takes (the first), and
+/ what limit_target / limit_candidate hold on that same row - so a disagreement
+/ names itself instead of having to be guessed at from one collapsed row.
+stalePriceRows:{[h;idWork]
+  f:{[d;idWork]
+    `sequence xasc select sequence,time,t_gen,state,sym,side,size,otype,
+        price,limit_target,limit_candidate,bps_candidate
+      from workorder0 where date=d, id_work=idWork
+   };
+  $[0<h; h(f;.z.D;idWork); f[.z.D;idWork]]
  };

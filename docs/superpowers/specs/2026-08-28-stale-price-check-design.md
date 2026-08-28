@@ -16,10 +16,22 @@ Two numbers side by side, and the gap between them.
 1. **Live parents.** Latest `state` per `date,id_server,id_target` in
    `target_state`; keep the ones now `` `activated ``. That is the live book.
 2. **Their children.** Every `workorder0` row whose `id_target` is in that set.
-3. **One row per child.** `workorder0` carries a row per state change, so
-   collapse to the last row per `date,id_server,id_work`, ordered by
-   `sequence`. `state` survives as a column, not a filter — a child that is
-   `init` under a live parent is still exposed to the same bad data.
+3. **One row per child, and it is the FIRST one.** `workorder0` carries a row
+   per state change. `t_gen` is stamped at generation and never moves, but
+   `price` is rewritten when the algo chases. So everything describing the
+   order — `t_gen`, `price`, `sym`, `side`, `size` — comes off the first row by
+   `sequence`; only `state` is read from the last, because the current state is
+   the one thing worth having current. `state` is a column, not a filter — a
+   child that is `init` under a live parent is exposed to the same bad data.
+
+   Taking the last row pairs a repriced price with a generation timestamp and
+   holds it against the market at generation: right time, wrong price. That was
+   the original implementation and it was wrong; caught 2026-08-28 against a
+   real order showing 175 against a tape at 113.6.
+
+   The known gap this leaves: **a repricing is not checked.** Doing that means
+   one row per price change against the market at *its own* timestamp, for
+   which `workorder0` carries a per-row `time`.
 
 No `state` filter on the child. The parent being activated is the filter.
 
@@ -35,12 +47,12 @@ clock, so they compare directly — no timezone or DST conversion.
 
 | Column | Meaning |
 | --- | --- |
-| `price` | what the algo priced the workorder at |
-| `gen_price` | last `qatt` print at or before `t_gen` |
-| `dev_bps` | `10000*(price-gen_price)%gen_price` |
+| `order_price` | what the algo priced the workorder at, as generated |
+| `qatt_price` | last `qatt` print at or before `t_gen` |
+| `dev_bps` | `10000*(order_price-qatt_price)%qatt_price` |
 | `ptime` | when that print was |
 | `price_age_ms` | `t_gen - ptime` — how old the print already was |
-| `now_price` | latest print for that name |
+| `qatt_price_now` | latest print for that name |
 | `now_dev_bps` | the gap to it now |
 | `now_age_ms` | how long since the tape last moved on that name |
 | `flag` | `noprint` / `both` / `price` / `age` / `ok` |
