@@ -3,7 +3,9 @@
 x axis: volume per intraday bucket, the bid and ask, and the cumulative share.
 
     python scripts/liquidity_profile/liquidity_profile.py --sym 0700.HK --date 2026-08-25
+    python scripts/liquidity_profile/liquidity_profile.py --sym 0700.HK
     python scripts/liquidity_profile/liquidity_profile.py --id-target 84213 --date 2026-08-25
+    python scripts/liquidity_profile/liquidity_profile.py --id-target 84213
     python scripts/liquidity_profile/liquidity_profile.py --sym 7203.JP --date 2026-08-25 --mins 5
     python scripts/liquidity_profile/liquidity_profile.py --sym 0700.HK --date 2026-08-25 --probe
     python scripts/liquidity_profile/liquidity_profile.py --self-test
@@ -20,7 +22,13 @@ The q is not duplicated here: queries/liquidity_profile/liquidity_profile.q is
 sent to both servers as it stands, so the chart and anything else reading these
 tables cannot drift apart.
 
-QATT_SERVER and ORDER_SERVER go in a local_settings.py beside this file - see
+NO --date MEANS TODAY, LIVE.  The four servers are two pairs: with a --date it
+asks the HDBs, without one it asks the RDBs and the date constraint is dropped
+entirely, which is what an RDB wants - it holds today and nothing else.  The
+day is then the day so far, so its percentages are shares of an unfinished day
+and the chart says so.
+
+The four servers go in a local_settings.py beside this file - see
 scripts/lib/README.md.  pykx is imported lazily inside connect(), so
 --self-test runs on a machine with no kdb at all.
 
@@ -46,8 +54,12 @@ from lib.local_config import apply_local          # noqa: E402
 # CONFIG.  Override in local_settings.py beside this file; git ignores it.
 # =============================================================================
 
-QATT_SERVER = "CHANGEME:5011"      # qatt - the HISTORICAL side, it needs date
-ORDER_SERVER = "CHANGEME:5010"     # execution, workorder, target
+#  Two pairs.  A --date is answered by the HDBs, no --date by the RDBs; they
+#  are different processes, the same split kmonitor/dark_summary works to.
+QATT_SERVER = "CHANGEME:5011"      # qatt, written down.  A --date lands here
+ORDER_SERVER = "CHANGEME:5010"     # execution, workorder, target, written down
+QATT_RDB = "CHANGEME:5013"         # qatt today, in memory.  No --date lands here
+ORDER_RDB = "CHANGEME:5012"        # the order tables today, in memory
 
 MINS = 10                          # bucket width, minutes
 THEME = "dark"                     # dark | light
@@ -146,6 +158,61 @@ def _load(hostport, what):
     return h
 
 
+def servers(live: bool):
+    """(quote server, order server, and what each is called in the config).
+
+    Read at call time, so a local_settings.py has already been applied over
+    them.  The RDBs hold today in memory and the HDBs hold what has been
+    written down; they are separate processes, so the mode picks the pair
+    rather than changing the query that is sent to it."""
+    if live:
+        return QATT_RDB, ORDER_RDB, "QATT_RDB", "ORDER_RDB"
+    return QATT_SERVER, ORDER_SERVER, "QATT_SERVER", "ORDER_SERVER"
+
+
+def _dts(h, day):
+    """The date argument: the day itself, or - for live - the query's own empty
+    date list, which tells every reader to drop the date constraint.  Taken
+    FROM THE SERVER rather than built here, so there is exactly one definition
+    of what live means and it sits in the .q beside the branches it drives."""
+    return day if day is not None else h(".lp.live")
+
+
+def _server_now(h):
+    """The date and the time on the process that answered - the plant clock,
+    which is what "so far" has to be measured against.  Not this machine's:
+    the script may well be run from a different timezone than the plant."""
+    n = h(".lp.now").pd()
+    day = pd.Timestamp(n["date"].iloc[0]).date()
+    #  a q time normally lands as a Timedelta, but this is a label on a chart:
+    #  if pykx hands back something else it is worth a rough clock rather than
+    #  an exception on the one line that says how current the chart is
+    t = n["time"].iloc[0]
+    try:
+        return day, bucket_label(pd.to_timedelta(t))
+    except (ValueError, TypeError):
+        return day, str(t)[:5]
+
+
+def dates_seen(*frames) -> list:
+    """The distinct dates the order server actually returned.
+
+    In live mode nothing constrains the date, so this IS the constraint's
+    replacement: an RDB holding today alone gives one date back, and one that
+    has somehow kept two says so here rather than quietly summing them into
+    the same bars."""
+    out = set()
+    for f in frames:
+        if f is None or not len(f) or "date" not in getattr(f, "columns", []):
+            continue
+        for v in pd.unique(f["date"]):
+            try:
+                out.add(str(pd.Timestamp(v).date()))
+            except (ValueError, TypeError):       # a null date, nothing to say
+                pass
+    return sorted(out)
+
+
 def _bkt(h, mins: int):
     """The bucket as a q time.  int * 00:01:00.000 is a time in milliseconds,
     which is the one unit the query buckets against."""
@@ -169,21 +236,33 @@ def _i(v) -> int:
     return 0 if n == -2147483648 else n
 
 
-def fetch(sym: str, day: dt.date, mins: int, id_target=None) -> dict:
+def fetch(sym: str, day, mins: int, id_target=None) -> dict:
     """Everything one chart needs, as plain frames.  The order server is opened
-    only when there is an id_target to look up."""
+    only when there is an id_target to look up.
+
+    day is None for live: the RDBs answer, the date constraint is dropped, and
+    the day the chart is labelled with comes back off the quote server's own
+    clock rather than being assumed here."""
+    live = day is None
+    qhost, ohost, qname, oname = servers(live)
     src_sym = "--sym"
     tgt = None
     ho = None
+    dto = None
 
     if id_target is not None:
-        log(f"  order server  {ORDER_SERVER} ...")
-        ho = _load(ORDER_SERVER, "ORDER_SERVER")
-        tgt = ho(".lp.tgt", day, id_target).pd()
+        log(f"  order server  {ohost} ...")
+        ho = _load(ohost, oname)
+        dto = _dts(ho, day)
+        tgt = ho(".lp.tgt", dto, id_target).pd()
         if not len(tgt):
             raise SystemExit(
-                f"no target with id_target={id_target} on {day}.  Check the "
-                f"date - the id is only unique within one.")
+                f"no target with id_target={id_target} "
+                + (f"on the order RDB, which holds today only.  Give --date "
+                   f"{dt.date.today()} or whichever day it ran, and the HDB "
+                   f"answers instead." if live else
+                   f"on {day}.  Check the date - the id is only unique "
+                   f"within one."))
         if len(tgt.drop_duplicates(subset=["id_server", "id_target"])) > 1:
             raise SystemExit(
                 f"id_target={id_target} on {day} matches more than one server: "
@@ -197,33 +276,49 @@ def fetch(sym: str, day: dt.date, mins: int, id_target=None) -> dict:
         if not sym:
             sym, src_sym = found, "the target"
 
-    log(f"liquidity_profile  {sym} (from {src_sym})  {day}  "
-        f"{mins} minute buckets")
-    log(f"  quote server  {QATT_SERVER} ...")
-    hq = _load(QATT_SERVER, "QATT_SERVER")
+    log(f"liquidity_profile  {sym} (from {src_sym})  "
+        f"{'LIVE, today so far' if live else day}  {mins} minute buckets")
+    log(f"  quote server  {qhost} ...")
+    hq = _load(qhost, qname)
+    dtq = _dts(hq, day)
     bkt = _bkt(hq, mins)
 
+    asof = None
+    if live:
+        #  the label comes off the server holding the data, not off this box
+        day, asof = _server_now(hq)
+        log(f"  the quote server says it is {day} {asof}")
+
     t0 = time.perf_counter()
-    prof = hq(".lp.profile", sym.encode(), day, bkt).pd()
+    prof = hq(".lp.profile", sym.encode(), dtq, bkt).pd()
     log(f"  {len(prof):>7,} buckets   {time.perf_counter() - t0:5.1f}s")
 
     t0 = time.perf_counter()
-    quotes = hq(".lp.quotes", sym.encode(), day).pd()
+    quotes = hq(".lp.quotes", sym.encode(), dtq).pd()
     log(f"  {len(quotes):>7,} quotes    {time.perf_counter() - t0:5.1f}s"
         f"   (every print, not a bucket average)")
 
     orders, execs = None, None
     if id_target is not None and len(prof):
-        execs = ho(".lp.execs", day, id_target).pd()
+        execs = ho(".lp.execs", dto, id_target).pd()
         prof = _stack(prof, execs, float(mins) * 60_000.0)
-        orders = _classify(ho(".lp.orders", day, id_target).pd())
+        orders = _classify(ho(".lp.orders", dto, id_target).pd())
         log(f"  {len(orders):>7,} child orders, {len(execs):,} fills, "
             f"{_i(prof['ours'].sum()):,} shares executed")
+        if live:
+            seen = dates_seen(tgt, execs, orders)
+            log(f"  the order rows are dated "
+                f"{', '.join(seen) if seen else '(no date came back)'}")
+            if len(seen) > 1:
+                log("  WARNING: the order RDB returned more than one date.  "
+                    "Live mode does not constrain the date because an RDB is "
+                    "one day; these bars and points are mixing days, so read "
+                    "them with --date instead.")
         _say_states(orders)
 
     return {"profile": prof, "quotes": quotes, "orders": orders,
             "execs": execs, "sym": sym, "day": day, "mins": mins,
-            "id_target": id_target}
+            "id_target": id_target, "live": live, "asof": asof}
 
 
 def bucket_of(t_ms, ms: float):
@@ -574,7 +669,10 @@ def _titles(fig, d, ink, ink2, stacked):
         head += f"   |   id_target {d['id_target']}"
     fig.suptitle(head, color=ink, fontsize=14, x=0.075, ha="left", y=0.968)
 
-    sub = (f"{d['day']}   |   {d['mins']} minute buckets   |   "
+    when = str(d["day"])
+    if d.get("live"):
+        when = f"LIVE  {d['day']}  {d.get('asof') or ''} so far"
+    sub = (f"{when}   |   {d['mins']} minute buckets   |   "
            f"{_si(shares)} shares   |   {_si(turnover)} turnover, local "
            f"currency   |   {len(d['quotes']):,} quotes")
     if stacked:
@@ -583,16 +681,21 @@ def _titles(fig, d, ink, ink2, stacked):
         sub += f"   |   ours {_si(ours)} shares, {pct:.2f}% of the tape"
     fig.text(0.075, 0.925, sub, color=ink2, fontsize=10, ha="left")
 
-    #  two lines, because one ran off the right edge of the figure
-    foot = ("Auctions included - the open and close buckets carry them, and in "
+    #  ONE SENTENCE PER LINE, because a run-on footnote ran off the right edge
+    #  of the figure and was silently clipped - which is worse than no note.
+    foot = ["Auctions included - the open and close buckets carry them, and in "
             "HK, JP and AU the closing auction is often the biggest bar.  "
-            "Times are the plant clock (HKT), not exchange local.\n"
-            "The bid and ask are every print's quote, not a bucket average.")
+            "Times are the plant clock (HKT), not exchange local.",
+            "The bid and ask are every print's quote, not a bucket average."]
     if d["id_target"] is not None:
-        foot += ("  Ringed points are the price we showed, at t_on_market (or "
-                 "the order's own time where it never reached the book); the "
-                 "small orange marks are our fills.")
-    fig.text(0.075, 0.020, foot, color=ink2, fontsize=8, ha="left",
+        foot[-1] += ("  Ringed points are the price we showed, at t_on_market "
+                     "(or the order's own time where it never reached the "
+                     "book); the small orange marks are our fills.")
+    if d.get("live"):
+        foot.append("THE DAY IS NOT OVER: every percentage here is a share of "
+                    "the day so far, the last bucket is still filling, and "
+                    "the closing auction has not happened.")
+    fig.text(0.075, 0.020, "\n".join(foot), color=ink2, fontsize=8, ha="left",
              va="bottom", linespacing=1.5)
 
 
@@ -631,37 +734,48 @@ def write_csv(d: dict, stem: str):
 # nothing; each stage is its own IPC call, so the stage that throws is named.
 # =============================================================================
 
-def probe(sym: str, day: dt.date, mins: int, id_target=None) -> int:
-    log(f"liquidity_profile --probe  {sym or '(from the target)'}  {day}")
+def probe(sym: str, day, mins: int, id_target=None) -> int:
+    live = day is None
+    qhost, ohost, qname, oname = servers(live)
+    log(f"liquidity_profile --probe  {sym or '(from the target)'}  "
+        f"{'LIVE, off the RDBs' if live else day}")
     stages = []
     if id_target is not None:
-        ho = _load(ORDER_SERVER, "ORDER_SERVER")
+        ho = _load(ohost, oname)
+        dto = _dts(ho, day)
         stages += [
-            ("the target row", lambda: ho(".lp.tgt", day, id_target).pd()),
-            ("our fills", lambda: ho("{count .lp.execs[x;y]}", day, id_target)),
-            ("the child orders", lambda: ho("{count .lp.orders[x;y]}", day,
+            ("the order server's own clock", lambda: ho(".lp.now").pd()),
+            ("the target row", lambda: ho(".lp.tgt", dto, id_target).pd()),
+            ("our fills", lambda: ho("{count .lp.execs[x;y]}", dto, id_target)),
+            ("the child orders", lambda: ho("{count .lp.orders[x;y]}", dto,
                                             id_target)),
         ]
         if not sym:
             try:
-                sym = _s(ho(".lp.tgt", day, id_target).pd()["sym"].iloc[0])
+                sym = _s(ho(".lp.tgt", dto, id_target).pd()["sym"].iloc[0])
             except Exception:                     # noqa: BLE001 - stages say why
                 sym = ""
 
-    hq = _load(QATT_SERVER, "QATT_SERVER")
+    hq = _load(qhost, qname)
+    dtq = _dts(hq, day)
     raw = (sym or "").encode()
     stages += [
-        ("what q was handed", lambda: hq(".lp.types", raw, day,
+        ("the quote server's own clock", lambda: hq(".lp.now").pd()),
+        ("what q was handed", lambda: hq(".lp.types", raw, dtq,
                                          _bkt(hq, mins))),
+        #  on an RDB the answer is usually no, and that is the whole reason
+        #  live mode drops the date constraint rather than passing .z.D
+        ("does qatt carry a date column here",
+         lambda: hq("{`date in cols qatt}").py()),
         ("what qatt is made of", lambda: hq(".lp.cols")),
         ("the sym coercion", lambda: hq(".lp.sym", raw)),
         ("the bucket cast", lambda: hq(".lp.bkt", _bkt(hq, mins))),
-        ("the where clause", lambda: hq(".lp.rows", raw, day)),
-        ("the bucketing", lambda: hq("{count .lp.buckets[x;y;z]}", raw, day,
+        ("the where clause", lambda: hq(".lp.rows", raw, dtq)),
+        ("the bucketing", lambda: hq("{count .lp.buckets[x;y;z]}", raw, dtq,
                                      _bkt(hq, mins))),
-        ("the full profile", lambda: hq("{count .lp.profile[x;y;z]}", raw, day,
+        ("the full profile", lambda: hq("{count .lp.profile[x;y;z]}", raw, dtq,
                                         _bkt(hq, mins))),
-        ("the quote curve", lambda: hq("{count .lp.quotes[x;y]}", raw, day)),
+        ("the quote curve", lambda: hq("{count .lp.quotes[x;y]}", raw, dtq)),
     ]
     for name, fn in stages:
         try:
@@ -749,7 +863,7 @@ def _fake_execs() -> pd.DataFrame:
     })
 
 
-def _fake_day(with_target=False) -> dict:
+def _fake_day(with_target=False, live=False) -> dict:
     df = _fake()
     execs = _fake_execs() if with_target else None
     if with_target:
@@ -757,7 +871,8 @@ def _fake_day(with_target=False) -> dict:
     return {"profile": df, "quotes": _fake_quotes(), "execs": execs,
             "orders": _classify(_fake_orders()) if with_target else None,
             "sym": "0700.HK", "day": dt.date(2026, 8, 25), "mins": 10,
-            "id_target": 84213 if with_target else None}
+            "id_target": 84213 if with_target else None,
+            "live": live, "asof": "13:45" if live else None}
 
 
 def self_test() -> int:
@@ -790,7 +905,16 @@ def self_test() -> int:
     check("every function the script calls is defined",
           all(f".lp.{n}:" in src for n in
               ("profile", "buckets", "quotes", "execs", "orders", "tgt",
-               "types", "cols", "rows")), True)
+               "types", "cols", "rows", "live", "isLive", "now")), True)
+    check("live is an empty date list, so it constrains nothing",
+          ".lp.live:0#0Nd" in code, True)
+    #  the one way this can rot: a reader gains a date constraint and not the
+    #  live branch beside it, and live mode silently answers for one day only
+    #  on the RDB - or for none at all.  One branch per constraint, counted.
+    check("every date constraint has a live branch beside it",
+          code.count("$[.lp.isLive dt"), code.count("date in dt"))
+    check("and there is one of each per reader",
+          code.count("date in dt"), 6)
 
     print("\nclassifying a child order")
     check("all of it filled", classify(1000, 1000, "done", "new"), "filled")
@@ -863,6 +987,31 @@ def self_test() -> int:
     check("2.5M reads as 2.5M", _si(2_500_000), "2.5M")
     check("a symbol's bytes become text", _s(b"0700.HK"), "0700.HK")
 
+    print("\npicking the servers")
+    check("no date opens the two RDBs",
+          servers(True)[:2], (QATT_RDB, ORDER_RDB))
+    check("a date opens the two written-down servers",
+          servers(False)[:2], (QATT_SERVER, ORDER_SERVER))
+    check("and the config names four separate processes",
+          len({QATT_SERVER, ORDER_SERVER, QATT_RDB, ORDER_RDB}), 4)
+    check("all four are placeholders until local_settings.py names them",
+          all(h.startswith(_PLACEHOLDER) for h in
+              (QATT_SERVER, ORDER_SERVER, QATT_RDB, ORDER_RDB)), True)
+
+    print("\nwhat the order server dated its rows")
+    #  live mode drops the date constraint, so this is what replaces it
+    oneday = pd.DataFrame({"date": pd.to_datetime(["2026-08-28"] * 3)})
+    twodays = pd.DataFrame({"date": pd.to_datetime(["2026-08-27",
+                                                    "2026-08-28"])})
+    check("one day back reads as one day",
+          dates_seen(oneday), ["2026-08-28"])
+    check("two days back is caught, not summed quietly",
+          len(dates_seen(twodays)), 2)
+    check("a frame with no date column claims nothing",
+          dates_seen(pd.DataFrame({"x": [1]})), [])
+    check("nor does an empty frame, or one that was never read",
+          dates_seen(None, oneday.iloc[0:0]), [])
+
     print("\ndrawing")
     import matplotlib.pyplot as plt
     for with_target in (False, True):
@@ -874,6 +1023,19 @@ def self_test() -> int:
                 check(f"{'with' if with_target else 'without'} an id_target, "
                       f"{theme}", p.stat().st_size > 5000, True)
             plt.close(fig)
+
+    #  a live day must SAY it is unfinished: its percentages are shares of a
+    #  day that has not closed, which is the one way this chart can mislead
+    fig = draw(_fake_day(True, live=True), "dark")
+    words = " ".join(t.get_text() for t in fig.texts)
+    check("a live day draws", fig is not None, True)
+    check("and is labelled LIVE", "LIVE" in words, True)
+    check("and warns that the day is not over", "NOT OVER" in words, True)
+    check("a dated day carries no such warning",
+          "NOT OVER" in " ".join(t.get_text()
+                                 for t in draw(_fake_day(True), "dark").texts),
+          False)
+    plt.close("all")
 
     #  a flat day has no spike to label, and a day with no quotes at all must
     #  not take the price panel down with it
@@ -901,7 +1063,8 @@ def main(argv=None) -> int:
         description="Liquidity through the day for one stock on one date.")
     p.add_argument("--sym", help="one sym as it appears in qatt, e.g. 0700.HK."
                                  " Optional with --id-target, which names it")
-    p.add_argument("--date", help="YYYY-MM-DD")
+    p.add_argument("--date", help="YYYY-MM-DD, answered by the HDBs.  Omit "
+                                  "it for today so far, live off the RDBs")
     p.add_argument("--id-target", type=int,
                    help="a parent order: stacks our executed shares into the "
                         "bars and puts every child order's price on the quote "
@@ -917,29 +1080,39 @@ def main(argv=None) -> int:
 
     if a.self_test:
         return self_test()
-    if not a.date:
-        p.error("required unless --self-test: --date")
     if not a.sym and a.id_target is None:
         p.error("name the stock with --sym, or a parent order with --id-target")
     if a.mins < 1:
         p.error("--mins must be at least 1")
-    try:
-        day = dt.date.fromisoformat(a.date)
-    except ValueError:
-        p.error(f"--date must be YYYY-MM-DD, not {a.date!r}")
+    #  no --date is not a missing argument, it is the live mode: day stays None
+    #  all the way down to the query, where an empty date list drops the
+    #  constraint on whichever RDB answered.
+    day = None
+    if a.date:
+        try:
+            day = dt.date.fromisoformat(a.date)
+        except ValueError:
+            p.error(f"--date must be YYYY-MM-DD, not {a.date!r}")
 
     if a.probe:
         return probe(a.sym, day, a.mins, a.id_target)
 
     d = fetch(a.sym, day, a.mins, a.id_target)
     if not len(d["profile"]):
-        log(f"  no prints for {d['sym']} on {day} - check the sym spelling "
-            f"against qatt, and that the HDB holds this date")
+        log(f"  no prints for {d['sym']} " + (
+            "on the quote RDB - check the sym spelling against qatt, and that "
+            "this session has actually opened" if d["live"] else
+            f"on {d['day']} - check the sym spelling against qatt, and that "
+            f"the HDB holds this date"))
         return 1
     stem = (f"liquidity_profile_{d['sym'].replace('.', '_')}"
-            f"_{day:%Y%m%d}_{a.mins}m")
+            f"_{d['day']:%Y%m%d}_{a.mins}m")
     if a.id_target is not None:
         stem += f"_t{a.id_target}"
+    #  a live run overwrites the last live run for the same day, which is what
+    #  you want while watching one - the dated file is never touched by it
+    if d["live"]:
+        stem += "_live"
     save(draw(d, a.theme), stem)
     write_csv(d, stem)
     return 0

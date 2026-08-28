@@ -4,9 +4,13 @@
 /   q)\l queries/liquidity_profile/liquidity_profile.q
 /   q).lp.show[`0700.HK;2026.08.25;00:10]      / bars, to read in the console
 /   q).lp.profile[`0700.HK;2026.08.25;00:10]   / the numbers, to chart or save
+/   q).lp.profile[`0700.HK;.lp.live;00:10]     / on the RDB: today, so far
 /
-/ Runs where qatt is.  No handle, no order tables, no FX - one name in one
-/ currency needs no rate.
+/ TWO SERVERS, and now two of each.  .lp.buckets, .lp.profile and .lp.quotes
+/ read qatt; .lp.execs, .lp.orders and .lp.tgt read the order tables.  Load
+/ this file onto all four processes - the quote HDB, the quote RDB, the order
+/ HDB, the order RDB - and call each function on the handle that has its
+/ tables.  Nothing here opens a handle itself.
 /
 / AUCTIONS ARE IN.  The open and close buckets carry the auction alongside the
 / continuous prints, so in HK, JP and AU the last bar is fat by construction.
@@ -43,6 +47,31 @@
 / char vector, which is what market_stats.q's `like` wants - so take either.
 .lp.sym:{$[-11h=type x; x; `$x]};
 
+/ =============================================================================
+/ REAL TIME.  Pass .lp.live - an empty date list - as dt and the date
+/ constraint is DROPPED, which is what an RDB wants: it holds today and only
+/ today, so there is nothing left to constrain.  qatt in memory may not even
+/ carry a date column to constrain against; on the HDB date is the PARTITION,
+/ which is selectable but is not one of the row's stored columns either.
+/
+/ NOT date=.z.D.  .z.D is the SERVER's date, and this plant's clock runs ahead
+/ of UTC (see the note on time above), so either side of midnight UTC the
+/ server's date and the trading date are not the same day.  An RDB holds one
+/ day by construction, so it needs no such guess - and a guess that is wrong
+/ here returns nothing at all rather than failing.
+/
+/ Every reader below therefore has TWO branches, live and dated, with the same
+/ columns in both.  CHANGE ONE AND CHANGE THE OTHER - the same arrangement
+/ kmonitor/dark_summary uses, for the same reason.
+/ =============================================================================
+
+.lp.live:0#0Nd;
+.lp.isLive:{$[0=count x; 1b; all null x]};
+
+/ the server's own clock, so a live chart can say what "so far" means.  Read
+/ off the process that answered, not off the machine running the script.
+.lp.now:{([] date:enlist .z.D; time:enlist .z.T)};
+
 / what a day with no prints comes back as - typed, so the caller charts an
 / empty day rather than handling a special case
 .lp.empty:([] bkt:0#0Nt; trades:0#0j; shares:0#0j; turnover:0#0n;
@@ -62,7 +91,9 @@
   / price>0 and size>0 is the whole test for "this row is a print": every qatt
   / row is a transaction carrying the quote that stood at the time, so there
   / are no quote-only rows to exclude.  See market_stats.q note 8.
-  t:select time,price,size from qatt where date in dt, sym=sy, price>0, size>0;
+  t:$[.lp.isLive dt;
+    select time,price,size from qatt where sym=sy, price>0, size>0;
+    select time,price,size from qatt where date in dt, sym=sy, price>0, size>0];
   if[0=count t; :()];
   / BUCKETED IN MILLISECONDS, not with xbar against a temporal.  "j"$time is
   / the count of ms since midnight, div ms is the bucket's index, *ms is its
@@ -104,14 +135,16 @@
 
 .lp.quotes:{[s;dt]
   sy:.lp.sym s;
-  select time,qbid,qask from qatt
-    where date in dt, sym=sy, qbid>0, qask>0
+  $[.lp.isLive dt;
+    select time,qbid,qask from qatt where sym=sy, qbid>0, qask>0;
+    select time,qbid,qask from qatt where date in dt, sym=sy, qbid>0, qask>0]
  };
 
 / =============================================================================
-/ THE ORDER SIDE.  These three read the ORDER server, not the quote server -
-/ load this file onto both and call each function on the handle that has its
-/ tables, the way market_stats.q's fxOn is called on the order server.
+/ THE ORDER SIDE.  These three read an ORDER server, not a quote server - the
+/ order HDB for a date, the order RDB for today.  Call each function on the
+/ handle that has its tables, the way market_stats.q's fxOn is called on the
+/ order server.
 /
 / id_target is an int in all three tables, so it is cast rather than trusted:
 / a python int arrives as a long, and a long against an int column is one more
@@ -130,8 +163,11 @@
 / id_work links each fill back to the child order that made it.
 .lp.execs:{[dt;idt]
   i:.lp.tid idt;
-  select date,id_server,id_work,id_target,time,fillprice,fillsize
-    from execution where date in dt, id_target=i, fillsize>0
+  $[.lp.isLive dt;
+    select date,id_server,id_work,id_target,time,fillprice,fillsize
+      from execution where id_target=i, fillsize>0;
+    select date,id_server,id_work,id_target,time,fillprice,fillsize
+      from execution where date in dt, id_target=i, fillsize>0]
  };
 
 / every child order of the target, with the price it showed and what became of
@@ -139,17 +175,24 @@
 / like, and cannot do that without seeing the vocabulary this server uses.
 .lp.orders:{[dt;idt]
   i:.lp.tid idt;
-  select date,id_server,id_work,id_target,time,t_transmit,t_on_market,
-      sym,side,size,make,price,state,request
-    from workorder where date in dt, id_target=i
+  $[.lp.isLive dt;
+    select date,id_server,id_work,id_target,time,t_transmit,t_on_market,
+        sym,side,size,make,price,state,request
+      from workorder where id_target=i;
+    select date,id_server,id_work,id_target,time,t_transmit,t_on_market,
+        sym,side,size,make,price,state,request
+      from workorder where date in dt, id_target=i]
  };
 
 / the parent, for the sym and the side - so --id-target alone is enough to
 / name the stock, and giving both is checked rather than assumed
 .lp.tgt:{[dt;idt]
   i:.lp.tid idt;
-  select date,id_server,id_target,sym,side,size,limit_price
-    from target where date in dt, id_target=i
+  $[.lp.isLive dt;
+    select date,id_server,id_target,sym,side,size,limit_price
+      from target where id_target=i;
+    select date,id_server,id_target,sym,side,size,limit_price
+      from target where date in dt, id_target=i]
  };
 
 / Same table with a bar drawn from pct and scaled to the busiest bucket, which
@@ -172,17 +215,22 @@
 /   q).lp.types[`0700.HK;2026.08.25;00:10]   / what q was actually handed
 /   q).lp.cols[]                             / what qatt is made of
 /   q).lp.rows[`0700.HK;2026.08.25]          / does the where clause run
+/   q).lp.rows[`0700.HK;.lp.live]            / the same against an RDB
 /   q)count .lp.buckets[`0700.HK;2026.08.25;00:10]    / does the bucketing
 / =============================================================================
 
 / cannot fail: it touches no table and coerces nothing
 .lp.types:{[s;dt;bkt] `arg_sym`arg_dt`arg_bkt!(type s;type dt;type bkt)};
 
-/ the four columns this query depends on, as the HDB actually stores them
-.lp.cols:{exec c!t from 0!meta qatt where c in `time`sym`price`size};
+/ the columns this query depends on, as the process actually stores them.
+/ date is in the list on purpose: whether it comes back is how you tell an HDB
+/ partition from an RDB that has no date column at all.
+.lp.cols:{exec c!t from 0!meta qatt where c in `date`time`sym`price`size};
 
 / the where clause on its own - a count, so nothing large comes back
 .lp.rows:{[s;dt]
-  count select from qatt
-    where date in dt, sym=.lp.sym s, price>0, size>0
+  sy:.lp.sym s;
+  $[.lp.isLive dt;
+    count select from qatt where sym=sy, price>0, size>0;
+    count select from qatt where date in dt, sym=sy, price>0, size>0]
  };
