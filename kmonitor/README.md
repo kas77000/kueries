@@ -16,7 +16,7 @@ can be copied wherever KdbMonitor wants it without dragging the others along.
 | `dark_summary/` | Dark venue execution | `queries/dark_summary/dark_summary.q` | OMS only |
 | `dark_routed_executed/` | Dark routed vs executed, by country | `queries/dark_summary/dark_routed_executed.q` | OMS only |
 | `market_stats/` | Market Statistics — six panels per market | `queries/market_stats/market_stats.q` | QUOTES + OMS (fx) |
-| `stale_price_check/` | Stale price check — workorder price vs the tape | `queries/stale_price_check/stale_price_check.q` | OMS + quote server |
+| `stale_price_check/` | Stale price check - take orders vs the touch | `queries/stale_price_check/stale_price_check.q` | OMS + quote server |
 
 Each folder has its own README with the install steps and what its numbers mean.
 

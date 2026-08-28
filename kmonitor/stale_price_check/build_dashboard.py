@@ -24,7 +24,7 @@ BLOCK = re.compile(
     re.M | re.S,
 )
 
-NAMES = ("live_orders", "stale_check")
+NAMES = ("live_takes", "touch_check")
 
 
 def blocks() -> dict[str, tuple[str, str]]:
@@ -84,45 +84,24 @@ def parameters() -> list:
             "weekdays_only": False,
         },
         {
-            "name": "min_dev_bps",
-            "label": "Minimum deviation (bps)",
+            "name": "max_ticks",
+            "label": "Max ticks off the touch",
             "kind": "number",
             "choices": [],
             "dataset": "",
             "column": "",
-            "default": "25",
+            "default": "5",
             "q_type": "number",
-            "help": ("How far the order price has to sit from the print qatt "
-                     "had at t_gen before it counts. Set it to 0 to turn the "
-                     "price test off and see every workorder - that is the "
-                     "calibration run."),
+            "help": ("How far off the touch a take order may sit before it "
+                     "counts. A buy is measured against the ask and a sell "
+                     "against the bid, in ticks of that stock's own ticksize. "
+                     "0 means it must be exactly on the touch."),
             "required": True,
             "pattern": "",
             "pattern_message": "",
             "minimum": "0",
             "maximum": "",
             "integer": False,
-            "weekdays_only": False,
-        },
-        {
-            "name": "min_price_age_ms",
-            "label": "Minimum print age (ms)",
-            "kind": "number",
-            "choices": [],
-            "dataset": "",
-            "column": "",
-            "default": "5000",
-            "q_type": "number",
-            "help": ("How old the last print already was when the order was "
-                     "generated before it counts. Set it to 0 to turn the age "
-                     "test off. Thin names sit high on this one because they "
-                     "are not trading, not because anything is stale."),
-            "required": True,
-            "pattern": "",
-            "pattern_message": "",
-            "minimum": "0",
-            "maximum": "",
-            "integer": True,
             "weekdays_only": False,
         },
     ]
@@ -138,16 +117,18 @@ def build() -> dict:
         "alerts": [],
         "dashboards": [{
             "id": None,
-            "name": "Stale price check - workorders vs the tape",
+            "name": "Stale price check - take orders vs the touch",
             "description": (
-                "Every workorder under an activated parent, with the price the "
-                "algo gave it beside the last print qatt actually had for that "
-                "name at the same instant. dev_bps is the gap; price_age_ms is "
-                "how old that print already was. Both thresholds accept 0, "
-                "which turns that test off and returns everything for "
-                "calibration. Reads the same live and over a historical range. "
-                "Source of truth is stale_price_check_kmonitor.q; regenerate "
-                "this file with build_dashboard.py rather than editing it."
+                "Every take order under an activated parent, with the touch it "
+                "should have been sitting on beside the price it was actually "
+                "sent at. A take lifts the offer or hits the bid, so its price "
+                "is dictated by the book rather than chosen - sent at anything "
+                "else, the book the algo saw was not the book that existed. "
+                "ticks_off is signed: how far the price sits above the touch. "
+                "Short sales are excluded. Reads the same live and over a "
+                "historical range. Source of truth is "
+                "stale_price_check_kmonitor.q; regenerate this file with "
+                "build_dashboard.py rather than editing it."
             ),
             "group": "Market structure",
             "refresh_secs": 30,
@@ -160,29 +141,29 @@ def build() -> dict:
             "rows": [
                 {
                     "widgets": [
-                        {"type": "kpi", "dataset": "stale_check",
-                         "title": "Workorders checked",
+                        {"type": "kpi", "dataset": "touch_check",
+                         "title": "Take orders checked",
                          "spec": {"column": "id_work", "agg": "count",
                                   "fmt": ",.0f"},
                          "width": 1.0},
-                        {"type": "kpi", "dataset": "stale_check",
-                         "title": "Flagged",
+                        {"type": "kpi", "dataset": "touch_check",
+                         "title": "Off the touch",
                          "spec": {"column": "flagged", "agg": "sum",
                                   "fmt": ",.0f",
                                   "thresholds": [{"op": ">", "value": 0,
                                                   "color": "critical"}]},
                          "width": 1.0},
-                        {"type": "kpi", "dataset": "stale_check",
-                         "title": "Worst deviation",
-                         "spec": {"column": "abs_dev_bps", "agg": "max",
-                                  "fmt": ",.1f", "suffix": " bps"},
+                        {"type": "kpi", "dataset": "touch_check",
+                         "title": "Worst",
+                         "spec": {"column": "ticks_abs", "agg": "max",
+                                  "fmt": ",.1f", "suffix": " ticks"},
                          "width": 1.0},
-                        {"type": "kpi", "dataset": "stale_check",
-                         "title": "Oldest print at t_gen",
-                         "spec": {"column": "price_age_ms", "agg": "max",
+                        {"type": "kpi", "dataset": "touch_check",
+                         "title": "Oldest quote at t_gen",
+                         "spec": {"column": "quote_age_ms", "agg": "max",
                                   "fmt": ",.0f", "suffix": " ms"},
                          "width": 1.0},
-                        {"type": "kpi", "dataset": "stale_check",
+                        {"type": "kpi", "dataset": "touch_check",
                          "title": "Names affected",
                          "spec": {"column": "sym", "agg": "nunique",
                                   "fmt": ",.0f"},
@@ -194,58 +175,49 @@ def build() -> dict:
                 },
                 {
                     "widgets": [
-                        {"type": "table", "dataset": "stale_check",
-                         "title": ("Workorder price vs the print qatt had at "
-                                   "t_gen"),
+                        {"type": "table", "dataset": "touch_check",
+                         "title": ("Take orders, and the touch they should "
+                                   "have been on"),
                          "spec": {
-                             "columns": ["date", "sym", "side", "state",
-                                         "otype", "trader", "id_target",
-                                         "id_work", "size", "t_gen",
-                                         "order_price", "limit_target",
-                                         "limit_candidate", "qatt_price",
-                                         "dev_bps", "ptime",
-                                         "price_age_ms", "qatt_price_now",
-                                         "now_dev_bps", "now_age_ms", "flag"],
+                             "columns": ["date", "sym", "side", "ref_side",
+                                         "venue", "state", "trader",
+                                         "id_target", "id_work", "size",
+                                         "t_gen", "order_price", "qbid",
+                                         "qask", "touch", "ticksize",
+                                         "ticks_off", "ptime", "quote_age_ms",
+                                         "now_age_ms", "flag"],
                              "labels": {
                                  "sym": "Stock", "side": "Side",
-                                 "state": "Child state", "otype": "Type",
-                                 "trader": "Trader", "id_target": "Parent",
-                                 "id_work": "Child", "size": "Order qty",
-                                 "t_gen": "Generated",
+                                 "ref_side": "Measured vs", "venue": "Venue",
+                                 "state": "Child state", "trader": "Trader",
+                                 "id_target": "Parent", "id_work": "Child",
+                                 "size": "Order qty", "t_gen": "Generated",
                                  "order_price": "Order price",
-                                 "limit_target": "Limit (target)",
-                                 "limit_candidate": "Limit (candidate)",
-                                 "qatt_price": "Print at t_gen",
-                                 "dev_bps": "Gap (bps)",
-                                 "ptime": "Print time",
-                                 "price_age_ms": "Print age (ms)",
-                                 "qatt_price_now": "Print now",
-                                 "now_dev_bps": "Gap now (bps)",
-                                 "now_age_ms": "Since last print (ms)",
+                                 "qbid": "Bid", "qask": "Ask",
+                                 "touch": "Touch", "ticksize": "Tick",
+                                 "ticks_off": "Ticks off",
+                                 "ptime": "Quote time",
+                                 "quote_age_ms": "Quote age (ms)",
+                                 "now_age_ms": "Since last quote (ms)",
                                  "flag": "Verdict",
                              },
                              "formats": {"size": ",.0f",
                                          "order_price": ",.4f",
-                                         "limit_target": ",.4f",
-                                         "limit_candidate": ",.4f",
-                                         "qatt_price": ",.4f",
-                                         "qatt_price_now": ",.4f",
-                                         "dev_bps": ",.1f",
-                                         "now_dev_bps": ",.1f",
-                                         "price_age_ms": ",.0f",
+                                         "qbid": ",.4f", "qask": ",.4f",
+                                         "touch": ",.4f", "ticksize": ",.4f",
+                                         "ticks_off": ",.1f",
+                                         "quote_age_ms": ",.0f",
                                          "now_age_ms": ",.0f"},
                              # Only "critical", "good", "blue", "ink", "ink2",
                              # "muted" or a #hex resolve - anything else goes
                              # to ink and reads as no highlight at all.
                              "highlight": [
                                  {"column": "flag", "op": "=",
-                                  "value": "both", "color": "critical"},
+                                  "value": "off", "color": "critical"},
                                  {"column": "flag", "op": "=",
-                                  "value": "noprint", "color": "critical"},
+                                  "value": "noquote", "color": "blue"},
                                  {"column": "flag", "op": "=",
-                                  "value": "price", "color": "blue"},
-                                 {"column": "flag", "op": "=",
-                                  "value": "age", "color": "blue"},
+                                  "value": "notick", "color": "blue"},
                              ],
                          },
                          "width": 1.0},

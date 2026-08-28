@@ -7,8 +7,8 @@
   "dashboards": [
     {
       "id": null,
-      "name": "Stale price check - workorders vs the tape",
-      "description": "Every workorder under an activated parent, with the price the algo gave it beside the last print qatt actually had for that name at the same instant. dev_bps is the gap; price_age_ms is how old that print already was. Both thresholds accept 0, which turns that test off and returns everything for calibration. Reads the same live and over a historical range. Source of truth is stale_price_check_kmonitor.q; regenerate this file with build_dashboard.py rather than editing it.",
+      "name": "Stale price check - take orders vs the touch",
+      "description": "Every take order under an activated parent, with the touch it should have been sitting on beside the price it was actually sent at. A take lifts the offer or hits the bid, so its price is dictated by the book rather than chosen - sent at anything else, the book the algo saw was not the book that existed. ticks_off is signed: how far the price sits above the touch. Short sales are excluded. Reads the same live and over a historical range. Source of truth is stale_price_check_kmonitor.q; regenerate this file with build_dashboard.py rather than editing it.",
       "group": "Market structure",
       "refresh_secs": 30,
       "periods": "both",
@@ -37,15 +37,15 @@
           "weekdays_only": false
         },
         {
-          "name": "min_dev_bps",
-          "label": "Minimum deviation (bps)",
+          "name": "max_ticks",
+          "label": "Max ticks off the touch",
           "kind": "number",
           "choices": [],
           "dataset": "",
           "column": "",
-          "default": "25",
+          "default": "5",
           "q_type": "number",
-          "help": "How far the order price has to sit from the print qatt had at t_gen before it counts. Set it to 0 to turn the price test off and see every workorder - that is the calibration run.",
+          "help": "How far off the touch a take order may sit before it counts. A buy is measured against the ask and a sell against the bid, in ticks of that stock's own ticksize. 0 means it must be exactly on the touch.",
           "required": true,
           "pattern": "",
           "pattern_message": "",
@@ -53,36 +53,18 @@
           "maximum": "",
           "integer": false,
           "weekdays_only": false
-        },
-        {
-          "name": "min_price_age_ms",
-          "label": "Minimum print age (ms)",
-          "kind": "number",
-          "choices": [],
-          "dataset": "",
-          "column": "",
-          "default": "5000",
-          "q_type": "number",
-          "help": "How old the last print already was when the order was generated before it counts. Set it to 0 to turn the age test off. Thin names sit high on this one because they are not trading, not because anything is stale.",
-          "required": true,
-          "pattern": "",
-          "pattern_message": "",
-          "minimum": "0",
-          "maximum": "",
-          "integer": true,
-          "weekdays_only": false
         }
       ],
       "datasets": [
         {
-          "name": "live_orders",
+          "name": "live_takes",
           "env": "OMS",
           "time_mode": "inherit",
           "time_context": null,
           "mode": "raw",
           "table": "",
           "filters": [],
-          "raw_qsql": "/ The live book and its children.  Collapsed to one row per workorder here so\n/ dataset 2 joins against a clean set.\n{[lookback]\n  / target_state and workorder0 both carry date on the RDB as well as the HDB,\n  / so one lambda serves both servers.  t0 is how far back t_gen may sit;\n  / 00:00:00.000 is the no-bound value the historical branch passes.\n  mk:{[dts;t0]\n    s:0!select state:last state by date,id_server,id_target\n      from target_state where date in dts;\n    ids:exec distinct id_target from s where state=`activated;\n    / NOT filtered on the child's own state - a workorder still in `init under\n    / a live parent was priced off the same data as its activated siblings\n    / price, limit_target and limit_candidate all come back.  which of the\n    / three is the price the algo actually decided on has never been verified\n    / against a server, and reading `price` gave an order at 175 against a tape\n    / at 113.6 - so the report carries all three and lets the tape say which.\n    w:select date,id_server,id_target,id_work,sequence,trader,sym,side,size,\n        otype,state,t_gen,price,limit_target,limit_candidate\n      from workorder0 where date in dts, t_gen>=t0, id_target in ids;\n    / ONE ROW PER CHILD, AND IT IS THE FIRST ONE.  workorder0 writes a row per\n    / state change.  t_gen is stamped at generation and never moves, but price\n    / IS rewritten - a chase repoints it - so taking the last row pairs a\n    / repriced price with a generation timestamp and the comparison below stops\n    / meaning anything: right time, wrong price.\n    / Everything describing the order AS GENERATED therefore comes off the\n    / first row by sequence.  Only state is read from the last, because the\n    / current state is the one thing you want current.\n    w:`sequence xasc w;\n    w:0!select id_target:first id_target, trader:first trader, sym:first sym,\n        side:first side, size:first size, otype:first otype,\n        t_gen:first t_gen, price:first price,\n        limit_target:first limit_target, limit_candidate:first limit_candidate,\n        state:last state\n      by date,id_server,id_work from w;\n    / LIMIT ORDERS ONLY.  a market order carries price 0 - there is no order\n    / price to hold a print against, and leaving it in reads as -10000 bps and\n    / sorts to the top of every run.  0< also drops a null price.\n    select from w where 0<price\n   };\n  {{#realtime}}mk[enlist .z.D; .z.T-60000*lookback]{{/realtime}}{{#historical}}{[mk]\n     want:{{date_from}}+til 1+{{date_to}}-{{date_from}};\n     / asked of the ORDER hdb: it and the quote hdb are written down on their\n     / own schedules, so one having today says nothing about the other\n     hasToday:0<count select date from workorder0 where date=.z.D;\n     stitch:(.z.D in want) and not hasToday;\n     o:mk[$[stitch; want except .z.D; want]; 00:00:00.000];\n     if[stitch;\n       c:hopen {{conn:OMS:realtime}};\n       t:c(mk;enlist .z.D;00:00:00.000);\n       hclose c;\n       o:o uj t];\n     o\n    }[mk]{{/historical}}\n }[{{param:lookback_mins}}]",
+          "raw_qsql": "/ Take orders under a live parent, one row per child, with the tick size that\n/ turns a price difference into ticks.\n{[lookback]\n  / target_state, workorder0 and target_stock all carry date on the RDB as well\n  / as the HDB, so one lambda serves both servers.  t0 is how far back t_gen may\n  / sit; 00:00:00.000 is the no-bound value the historical branch passes.\n  mk:{[dts;t0]\n    s:0!select state:last state by date,id_server,id_target\n      from target_state where date in dts;\n    ids:exec distinct id_target from s where state=`activated;\n    / TAKE VENUES ONLY.  upper-cased because q's like is case sensitive and the\n    / venue vocabulary is not known here.  the constraint sits last so it runs\n    / on the rows the three cheap ones already left.\n    w:select date,id_server,id_target,id_work,sequence,trader,sym,side,size,\n        otype,state,venue,venuetype,t_gen,price\n      from workorder0 where date in dts, t_gen>=t0, id_target in ids,\n        (upper string venue) like \"*TAKE*\";\n    / ONE ROW PER CHILD, AND IT IS THE FIRST ONE.  t_gen is stamped at\n    / generation and never moves, but price IS rewritten - a chase repoints it -\n    / so the last row would pair a repriced price with a generation timestamp.\n    / Only state is read from the last row, being the one thing worth current.\n    w:`sequence xasc w;\n    w:0!select id_target:first id_target, trader:first trader, sym:first sym,\n        side:first side, size:first size, otype:first otype,\n        venue:first venue, venuetype:first venuetype,\n        t_gen:first t_gen, price:first price, state:last state\n      by date,id_server,id_work from w;\n    / a market order carries price 0 and has no price to hold against a touch\n    w:select from w where 0<price;\n    / SIDE READ OFF ITS TEXT, not against an assumed enum.  Anything beginning\n    / b buys and looks at the offer; everything else sells and looks at the bid.\n    w:update sidelc:lower string side from w;\n    w:update isshort:(sidelc like \"*short*\")|sidelc like \"ss\" from w;\n    w:select from w where not isshort;\n    w:update ref_side:?[sidelc like \"b*\";`ask;`bid] from w;\n    / target_stock also carries sym, so only the columns wanted are taken - an\n    / lj would overwrite it\n    ts:`date`id_server`id_target xkey select date,id_server,id_target,ticksize\n      from target_stock\n      where date in dts, id_target in exec distinct id_target from w;\n    delete sidelc,isshort from w lj ts\n   };\n  {{#realtime}}mk[enlist .z.D; .z.T-60000*lookback]{{/realtime}}{{#historical}}{[mk]\n     want:{{date_from}}+til 1+{{date_to}}-{{date_from}};\n     / asked of the ORDER hdb: it and the quote hdb are written down on their\n     / own schedules, so one having today says nothing about the other\n     hasToday:0<count select date from workorder0 where date=.z.D;\n     stitch:(.z.D in want) and not hasToday;\n     o:mk[$[stitch; want except .z.D; want]; 00:00:00.000];\n     if[stitch;\n       c:hopen {{conn:OMS:realtime}};\n       t:c(mk;enlist .z.D;00:00:00.000);\n       hclose c;\n       o:o uj t];\n     o\n    }[mk]{{/historical}}\n }[{{param:lookback_mins}}]",
           "extra_connections": [],
           "transforms": [],
           "max_rows": 5000,
@@ -92,14 +74,14 @@
           "file_label": ""
         },
         {
-          "name": "stale_check",
+          "name": "touch_check",
           "env": "QUOTES",
           "time_mode": "inherit",
           "time_context": null,
           "mode": "raw",
           "table": "",
           "filters": [],
-          "raw_qsql": "/ The whole order table comes across, because an aj needs both sides local.\n{[w;lookback;minDevBps;minAgeMs]\n  now:.z.T;\n  / nothing activated: back out before touching qatt.  this hands the widgets\n  / the empty ORDER table rather than an empty result with the columns they\n  / name, so an empty book may show as a column error rather than as no rows.\n  if[0=count w; :w];\n  syms:exec distinct sym from w;\n  / dates come from the orders, so this is already whatever dataset 1 found\n  dts:exec distinct date from w;\n  / the quote RDB has NO date column - it is today by definition - so unlike\n  / the order side the two halves cannot share a lambda.  this is the RDB half.\n  / PRINTS ONLY: qatt carries quote updates on the same table and their price\n  / is null, and an asof onto one of those would date the order against a row\n  / that never traded.\n  / sym first: the RDB keeps `g#sym, and the where clause can only use that\n  / attribute on the constraint it applies first.  the time cut then runs on\n  / what survives, which is already a small fraction of the session.\n  rdb:{[syms;q0]\n    update date:.z.D from\n      select time, sym, gen_price:price, ptime:time\n        from qatt where sym in syms, time>=q0, 0<0^price\n   };\n  p:{{#realtime}}rdb[syms; .z.T-2*60000*lookback]{{/realtime}}{{#historical}}{[dts;syms;rdb]\n      hasToday:0<count select date from qatt where date=.z.D;\n      stitch:(.z.D in dts) and not hasToday;\n      dd:$[stitch; dts except .z.D; dts];\n      q:select date, time, sym, gen_price:price, ptime:time\n        from qatt where date in dd, sym in syms, 0<0^price;\n      if[stitch;\n        c:hopen {{conn:QUOTES:realtime}};\n        t:c(rdb;syms;00:00:00.000);\n        hclose c;\n        q:q uj t];\n      q\n     }[dts;syms;rdb]{{/historical}};\n  / aj wants the right side sorted by the join columns.  date is IN the join\n  / here, unlike the bare-q version: an exact match on date and sym, asof on\n  / time, so a range can never date an order against another day's print.\n  p:`date`sym`time xasc p;\n  x:aj[`date`sym`time; update time:t_gen from w; p];\n\n  / ---- the two prices, and the gap ------------------------------------\n  x:update price_age_ms:\"j\"$t_gen-ptime from x;\n  / price is a real limit price by now - market orders never left the order\n  / server.  the guard left is gen_price: a name with no print has none.\n  x:update dev_bps:?[0<gen_price;\n      10000*(price-gen_price)%gen_price; 0n] from x;\n  / where the tape is now: says whether this is an order that was born bad or\n  / one still being fed bad data\n  c:select now_price:last gen_price, now_ptime:last time by date,sym from p;\n  x:x lj c;\n  / \"now\" on a past date means that day's last print, read off the other names\n  / in the frame - the same way a pinned stock's session end is read\n  e:select sess:max time by date from p;\n  x:x lj e;\n  x:update now_age_ms:\"j\"$?[date=.z.D; now; sess]-now_ptime from x;\n  x:update now_dev_bps:?[0<now_price;\n      10000*(price-now_price)%now_price; 0n] from x;\n\n  / ---- verdict --------------------------------------------------------\n  / 0 turns a test off rather than making everything breach it\n  x:update hit_price:(0<minDevBps)&minDevBps<=abs dev_bps,\n      hit_age:(0<minAgeMs)&minAgeMs<=price_age_ms,\n      noprint:null ptime from x;\n  x:update flag:?[noprint;`noprint;\n      ?[hit_price&hit_age;`both;\n      ?[hit_price;`price;\n      ?[hit_age;`age;`ok]]]] from x;\n  x:update flagged:not flag=`ok from x;\n  / a name we are working that has never printed is a finding, not an absence,\n  / so it comes back whatever the thresholds say\n  x:$[(0=minDevBps)&0=minAgeMs; x; select from x where flagged];\n  / worst first, and the ones with nothing to compare against on top\n  r:`noprint`sev xdesc update sev:abs dev_bps from x;\n  / renamed on the way out so the two can never be read for each other:\n  / order_price is ours, qatt_price is the tape's\n  select date, id_server, id_target, id_work, trader, sym, side, size, otype,\n      state, t_gen, order_price:price, limit_target, limit_candidate,\n      qatt_price:gen_price, dev_bps,\n      abs_dev_bps:sev, ptime, price_age_ms, qatt_price_now:now_price,\n      now_dev_bps, now_age_ms, flag, flagged\n    from r\n }[{{table:live_orders}};{{param:lookback_mins}};{{param:min_dev_bps}};{{param:min_price_age_ms}}]",
+          "raw_qsql": "/ The whole order table comes across, because an aj needs both sides local.\n{[w;lookback;maxTicks]\n  now:.z.T;\n  / nothing to check: back out before touching qatt.  this hands the widgets\n  / the empty ORDER table rather than an empty result with the columns they\n  / name, so an empty book may show as a column error rather than as no rows.\n  if[0=count w; :w];\n  syms:exec distinct sym from w;\n  / dates come from the orders, so this is already whatever dataset 1 found\n  dts:exec distinct date from w;\n  / the quote RDB has NO date column - it is today by definition - so unlike\n  / the order side the two halves cannot share a lambda.  this is the RDB half.\n  / TWO-SIDED QUOTES ONLY: a one-sided book has no far touch to take against,\n  / and a zero on either side would read as a touch of nothing.\n  / sym first: the RDB keeps `g#sym, and the where clause can only use that\n  / attribute on the constraint it applies first.  the time cut then runs on\n  / what survives, which is already a small fraction of the session.\n  rdb:{[syms;q0]\n    update date:.z.D from\n      select time, sym, qbid, qask, ptime:time\n        from qatt where sym in syms, time>=q0, 0<0^qbid, 0<0^qask\n   };\n  p:{{#realtime}}rdb[syms; .z.T-2*60000*lookback]{{/realtime}}{{#historical}}{[dts;syms;rdb]\n      hasToday:0<count select date from qatt where date=.z.D;\n      stitch:(.z.D in dts) and not hasToday;\n      dd:$[stitch; dts except .z.D; dts];\n      q:select date, time, sym, qbid, qask, ptime:time\n        from qatt where date in dd, sym in syms, 0<0^qbid, 0<0^qask;\n      if[stitch;\n        c:hopen {{conn:QUOTES:realtime}};\n        t:c(rdb;syms;00:00:00.000);\n        hclose c;\n        q:q uj t];\n      q\n     }[dts;syms;rdb]{{/historical}};\n  / aj wants the right side sorted by the join columns.  date is IN the join\n  / here, unlike the bare-q version: an exact match on date and sym, asof on\n  / time, so a range can never date an order against another day's book.\n  p:`date`sym`time xasc p;\n  x:aj[`date`sym`time; update time:t_gen from w; p];\n\n  / ---- the touch, and how far off it the order was ---------------------\n  x:update quote_age_ms:\"j\"$t_gen-ptime from x;\n  / the far touch: a buy lifts the offer, a sell hits the bid\n  x:update touch:?[ref_side=`ask; qask; qbid] from x;\n  / signed, and it means the same thing on both sides: how far the price sits\n  / ABOVE the touch\n  x:update ticks_off:?[0<ticksize; (price-touch)%ticksize; 0n] from x;\n  x:update ticks_abs:abs ticks_off from x;\n  / how long since the book last moved on that name - says whether this is an\n  / order that was born bad or a name still being fed a frozen quote\n  c:select now_ptime:last time by date,sym from p;\n  x:x lj c;\n  / \"now\" on a past date means that day's last quote, read off the session end\n  / of the other names in the frame - only live does it mean this second\n  e:select sess:max time by date from p;\n  x:x lj e;\n  x:update now_age_ms:\"j\"$?[date=.z.D; now; sess]-now_ptime from x;\n\n  / ---- verdict --------------------------------------------------------\n  / noquote and notick come first: both mean the test could not be RUN, which\n  / is a different statement from the test passing\n  x:update flag:?[null touch;`noquote;\n      ?[null ticks_off;`notick;\n      ?[maxTicks<ticks_abs;`off;`ok]]] from x;\n  x:update flagged:not flag=`ok from x;\n  / worst first, and the ones that could not be tested on top\n  r:`flagged`ticks_abs xdesc x;\n  select date, id_server, id_target, id_work, trader, sym, side, ref_side,\n      size, otype, venue, venuetype, state, t_gen, order_price:price,\n      qbid, qask, touch, ticksize, ticks_off, ticks_abs, ptime, quote_age_ms,\n      now_age_ms, flag, flagged\n    from r\n }[{{table:live_takes}};{{param:lookback_mins}};{{param:max_ticks}}]",
           "extra_connections": [],
           "transforms": [],
           "max_rows": 5000,
@@ -114,8 +96,8 @@
           "widgets": [
             {
               "type": "kpi",
-              "dataset": "stale_check",
-              "title": "Workorders checked",
+              "dataset": "touch_check",
+              "title": "Take orders checked",
               "spec": {
                 "column": "id_work",
                 "agg": "count",
@@ -125,8 +107,8 @@
             },
             {
               "type": "kpi",
-              "dataset": "stale_check",
-              "title": "Flagged",
+              "dataset": "touch_check",
+              "title": "Off the touch",
               "spec": {
                 "column": "flagged",
                 "agg": "sum",
@@ -143,22 +125,22 @@
             },
             {
               "type": "kpi",
-              "dataset": "stale_check",
-              "title": "Worst deviation",
+              "dataset": "touch_check",
+              "title": "Worst",
               "spec": {
-                "column": "abs_dev_bps",
+                "column": "ticks_abs",
                 "agg": "max",
                 "fmt": ",.1f",
-                "suffix": " bps"
+                "suffix": " ticks"
               },
               "width": 1.0
             },
             {
               "type": "kpi",
-              "dataset": "stale_check",
-              "title": "Oldest print at t_gen",
+              "dataset": "touch_check",
+              "title": "Oldest quote at t_gen",
               "spec": {
-                "column": "price_age_ms",
+                "column": "quote_age_ms",
                 "agg": "max",
                 "fmt": ",.0f",
                 "suffix": " ms"
@@ -167,7 +149,7 @@
             },
             {
               "type": "kpi",
-              "dataset": "stale_check",
+              "dataset": "touch_check",
               "title": "Names affected",
               "spec": {
                 "column": "sym",
@@ -185,89 +167,82 @@
           "widgets": [
             {
               "type": "table",
-              "dataset": "stale_check",
-              "title": "Workorder price vs the print qatt had at t_gen",
+              "dataset": "touch_check",
+              "title": "Take orders, and the touch they should have been on",
               "spec": {
                 "columns": [
                   "date",
                   "sym",
                   "side",
+                  "ref_side",
+                  "venue",
                   "state",
-                  "otype",
                   "trader",
                   "id_target",
                   "id_work",
                   "size",
                   "t_gen",
                   "order_price",
-                  "limit_target",
-                  "limit_candidate",
-                  "qatt_price",
-                  "dev_bps",
+                  "qbid",
+                  "qask",
+                  "touch",
+                  "ticksize",
+                  "ticks_off",
                   "ptime",
-                  "price_age_ms",
-                  "qatt_price_now",
-                  "now_dev_bps",
+                  "quote_age_ms",
                   "now_age_ms",
                   "flag"
                 ],
                 "labels": {
                   "sym": "Stock",
                   "side": "Side",
+                  "ref_side": "Measured vs",
+                  "venue": "Venue",
                   "state": "Child state",
-                  "otype": "Type",
                   "trader": "Trader",
                   "id_target": "Parent",
                   "id_work": "Child",
                   "size": "Order qty",
                   "t_gen": "Generated",
                   "order_price": "Order price",
-                  "limit_target": "Limit (target)",
-                  "limit_candidate": "Limit (candidate)",
-                  "qatt_price": "Print at t_gen",
-                  "dev_bps": "Gap (bps)",
-                  "ptime": "Print time",
-                  "price_age_ms": "Print age (ms)",
-                  "qatt_price_now": "Print now",
-                  "now_dev_bps": "Gap now (bps)",
-                  "now_age_ms": "Since last print (ms)",
+                  "qbid": "Bid",
+                  "qask": "Ask",
+                  "touch": "Touch",
+                  "ticksize": "Tick",
+                  "ticks_off": "Ticks off",
+                  "ptime": "Quote time",
+                  "quote_age_ms": "Quote age (ms)",
+                  "now_age_ms": "Since last quote (ms)",
                   "flag": "Verdict"
                 },
                 "formats": {
                   "size": ",.0f",
                   "order_price": ",.4f",
-                  "limit_target": ",.4f",
-                  "limit_candidate": ",.4f",
-                  "qatt_price": ",.4f",
-                  "qatt_price_now": ",.4f",
-                  "dev_bps": ",.1f",
-                  "now_dev_bps": ",.1f",
-                  "price_age_ms": ",.0f",
+                  "qbid": ",.4f",
+                  "qask": ",.4f",
+                  "touch": ",.4f",
+                  "ticksize": ",.4f",
+                  "ticks_off": ",.1f",
+                  "quote_age_ms": ",.0f",
                   "now_age_ms": ",.0f"
                 },
                 "highlight": [
                   {
                     "column": "flag",
                     "op": "=",
-                    "value": "both",
+                    "value": "off",
                     "color": "critical"
                   },
                   {
                     "column": "flag",
                     "op": "=",
-                    "value": "noprint",
-                    "color": "critical"
-                  },
-                  {
-                    "column": "flag",
-                    "op": "=",
-                    "value": "price",
+                    "value": "noquote",
                     "color": "blue"
                   },
                   {
                     "column": "flag",
                     "op": "=",
-                    "value": "age",
+                    "value": "notick",
                     "color": "blue"
                   }
                 ]

@@ -2,166 +2,150 @@
 
 **Date:** 2026-08-28
 **Problem:** orders in the ai3 algo went out priced off market data that had
-gone stale. There is no way to see, live, which workorders that is still
-happening to.
+gone stale. There is no way to see, live, which orders that is still happening
+to.
 
 ## What it answers
 
-For every workorder sitting under a live parent: the price the algo gave it,
-beside the last print `qatt` actually had for that name at the same instant.
-Two numbers side by side, and the gap between them.
+For every **take** order under a live parent: the price it was sent at, beside
+**the touch it should have been sitting on** at the same instant.
+
+## Why a take order, and not any order
+
+A take lifts the offer or hits the bid. Its price is not a judgement call — it
+is dictated by the book at the instant the order was generated. Sent at
+anything else, the book the algo was looking at was not the book that existed.
+
+The first version of this query held the order price against the last **print**
+in `qatt`. That cannot tell a stale quote from a wide spread, and it needs a
+bps threshold nobody can pick before seeing the data. The touch test needs no
+such threshold: the correct answer is *on the touch*, and the only tolerance is
+how many ticks of slack the venue and the algo allow.
+
+| Side | Measured against | |
+| --- | --- | --- |
+| buy | `qask` | you lift the offer |
+| sell | `qbid` | you hit the bid |
+| short sale | — | **dropped** |
+
+Short sales are excluded because a short-sale price test can stop the order
+sitting at the bid, and it would then read as off-touch for a reason unrelated
+to stale data.
 
 ## Row set
 
 1. **Live parents.** Latest `state` per `date,id_server,id_target` in
-   `target_state`; keep the ones now `` `activated ``. That is the live book.
-2. **Their children.** Every `workorder0` row whose `id_target` is in that set.
+   `target_state`; keep the ones now `` `activated ``.
+2. **Take children.** `workorder0` rows under those parents whose `venue`,
+   upper-cased, is `like "*TAKE*"`. The constraint sits last in the where
+   clause so it runs on the rows the cheap ones already left.
 3. **One row per child, and it is the FIRST one.** `workorder0` carries a row
    per state change. `t_gen` is stamped at generation and never moves, but
    `price` is rewritten when the algo chases. So everything describing the
-   order — `t_gen`, `price`, `sym`, `side`, `size` — comes off the first row by
-   `sequence`; only `state` is read from the last, because the current state is
-   the one thing worth having current. `state` is a column, not a filter — a
-   child that is `init` under a live parent is exposed to the same bad data.
+   order comes off the first row by `sequence`; only `state` is read from the
+   last.
 
    Taking the last row pairs a repriced price with a generation timestamp and
-   holds it against the market at generation: right time, wrong price. That was
+   holds it against the book at generation: right time, wrong price. That was
    the original implementation and it was wrong; caught 2026-08-28 against a
-   real order showing 175 against a tape at 113.6.
+   real order.
 
-   The known gap this leaves: **a repricing is not checked.** Doing that means
-   one row per price change against the market at *its own* timestamp, for
-   which `workorder0` carries a per-row `time`.
+   **Known gap:** a repricing is not checked. Doing that means one row per price
+   change against the book at *its own* timestamp, for which `workorder0`
+   carries a per-row `time`.
+4. **Market orders dropped** (`0<price`) — no order price to hold against a
+   touch.
+5. **Tick size** joined from `target_stock` on `date,id_server,id_target`. Only
+   `ticksize` is taken: `target_stock` also carries `sym`, which an `lj` would
+   overwrite.
 
-No `state` filter on the child. The parent being activated is the filter.
+## The comparison
 
-## Price comparison
+`qatt` filtered to **two-sided quotes** (`0<qbid`, `0<qask`) — a one-sided book
+has no far touch, and a zero on either side would read as a touch of nothing.
 
-`qatt` is filtered to **prints only** (`0<price`). Quote-only rows carry a null
-`price`, and an as-of onto one of those would date the order against a row that
-never traded.
+`aj[`sym`time; orders; quotes]` puts each order on the last quote at or before
+its `t_gen`. `t_gen` and `qatt`.`time` come off the same clock, so they compare
+directly — no timezone or DST conversion.
 
-`aj[`sym`time; workorders; prints]` puts each workorder on the last print
-at or before its own `t_gen`. `t_gen` and `qatt`.`time` come off the same
-clock, so they compare directly — no timezone or DST conversion.
+```
+ticks_off = (order_price - touch) % ticksize
+```
 
-| Column | Meaning |
-| --- | --- |
-| `order_price` | what the algo priced the workorder at, as generated |
-| `qatt_price` | last `qatt` print at or before `t_gen` |
-| `dev_bps` | `10000*(order_price-qatt_price)%qatt_price` |
-| `ptime` | when that print was |
-| `price_age_ms` | `t_gen - ptime` — how old the print already was |
-| `qatt_price_now` | latest print for that name |
-| `now_dev_bps` | the gap to it now |
-| `now_age_ms` | how long since the tape last moved on that name |
-| `flag` | `noprint` / `both` / `price` / `age` / `ok` |
-| `flagged` | `flag` is not `ok` — one boolean for counting |
+Signed, and it means the same thing on both sides: how far the price sits
+**above** the touch. A buy at `+3` went three ticks through the offer; a sell at
+`+3` was three ticks short of hitting the bid. `maxTicks` flags on the absolute
+value, so `0` means it must be exactly on the touch.
 
-`price_age_ms` answers "was the data already old when the order was born".
-`now_age_ms` answers "is it still old right now", which is the difference
-between an order that was born bad and one that is still being fed bad data.
+`flag` is `off` / `noquote` / `notick` / `ok`. The middle two mean the test
+could not be **run** — no quote in the window, no tick size for that stock —
+which is a different statement from the test passing, so neither reads as `ok`.
 
-**Market orders are filtered out entirely** — this is a limit-order report. One
-carries `price` 0, so there is no order price to hold a print against, and a
-`dev_bps` of `-10000` for an order that never had a price is a lie that would
-sort to the top of every run.
+## Vocabularies this query does not know
 
-The filter is `0<price`, applied on the OMS side *after* the collapse to one row
-per `id_work`, so the order's current price is what decides rather than some
-earlier row's. `0<` drops a null price as well. `otype` stays in the output so
-the kind of limit order is still visible.
+`venue` and `side` are matched on their text, not against an enum: *contains
+TAKE* case-insensitively, and anything beginning `b` buys. Both raw values stay
+in the output so a wrong reading is visible.
+
+`stalePriceVocab[h;lookback]` lists the `venue` / `venuetype` / `side` values
+actually in use with counts, and deliberately does not apply the venue filter.
+A filter that silently matches nothing, or a side that silently reads as a buy,
+then shows up on the terminal rather than as an empty report. Run it first.
 
 ## The lookback, and the two windows
 
-`lookback` is in minutes and bounds `t_gen` — how recently the workorder was
-created. It exists because reading the whole session out of `qatt` is too slow
-to run live. Named `lookback`, not `mins`: `mins` is the q keyword for running
-minimums and using it as a parameter gives a type error.
+`lookback` is in minutes and bounds `t_gen`. It exists because reading the whole
+session out of `qatt` is too slow to run live. Named `lookback`, not `mins`:
+`mins` is the q keyword for running minimums.
 
 `qatt` is read from **twice that far back**, because an order generated at the
-very start of the order window still needs prints before it to as-of onto:
+very start of the order window still needs quotes before it to as-of onto:
 
 ```
 qatt scanned   |<--------- 2 x lookback --------->|
-workorders                    |<--- lookback ---->|
+take orders                   |<--- lookback ---->|
                t0-lookback   t0                  now
 ```
 
-So `noprint` means **"no print in the scanned window"**, not "never traded
-today". Still a finding — a name we are working that has not printed in twice
-the lookback is stale by any reading — but a different sentence from the one
-the column said before the bound existed.
+So `noquote` means "no two-sided quote in the scanned window", not "never quoted
+today" — still a finding, since a name we are taking on that has not quoted in
+twice the lookback is stale by any reading.
 
-In the KdbMonitor version the lookback applies to the **real-time period only**.
-On a historical period both windows are passed `00:00:00.000`, ie no bound: "the
-last 10 minutes" cannot mean anything on a past date, where the reader has
-already bounded the frame with the dates.
+In the KdbMonitor version the lookback applies to the **real-time period only**;
+a historical period passes `00:00:00.000` to both windows, because "the last 10
+minutes" cannot mean anything on a past date.
 
 `sym in syms` stays the *first* constraint in the `qatt` where clause, ahead of
 the time bound. The RDB keeps `` `g#sym `` and the where clause can only use
 that attribute on the constraint it applies first; the time cut then runs on
 what survives.
 
-## Thresholds
-
-`stalePriceCheck[h;lookback;minDevBps;minAgeMs]`.
-
-A threshold of `0` turns that test **off**. `[h;10;0;0]` therefore returns every
-workorder in the window, ranked worst-first, with every number filled in
-and `flag` reading `ok` on all of them — the calibration run. Once the numbers
-on this book are known, `[h;25;5000]` returns breaches only.
-
-Rows with no print in the scanned window are always returned, whatever the
-thresholds. A name we are working that has not traded is a finding, not an
-absence.
-
-## Known limit
-
-Prints-only means a thin name shows a large `price_age_ms` because it is not
-trading, not because anything is stale. `dev_bps` is the honest signal there.
-If the noise proves bad, the fix is to divide by how often that name normally
-prints — `adv` off `target_stock` — which is deliberately not built here.
-
 ## Where it runs
 
-`qatt` is on the quote server, `workorder0` and `target_state` on the OMS, and
-an `aj` needs both sides local. So the query runs **from the quote session** and
-ships a lambda to the OMS over a handle. Serialized lambda, not a query string.
-Same arrangement as `queries/limit_up_down/limit_up_down_v2.q`.
-
-Pass `0i` for the handle when the order tables are local.
+`qatt` is on the quote server, `workorder0` / `target_state` / `target_stock` on
+the OMS, and an `aj` needs both sides local. So the query runs **from the quote
+session** and ships a lambda to the OMS over a handle. Serialized lambda, not a
+query string. Pass `0i` when the order tables are local.
 
 ## KdbMonitor version
 
-Two chained datasets — dataset 1 already carries every order field, so dataset
-2 finishes the job. No third hop back to the OMS.
-
 | Dataset | Env | Does |
 | --- | --- | --- |
-| `live_orders` | OMS | the row set above |
-| `stale_check` | QUOTES | takes `{{table:live_orders}}` whole, both price lookups, returns the blotter |
+| `live_takes` | OMS | the row set above, with `ticksize` |
+| `touch_check` | QUOTES | takes `{{table:live_takes}}` whole, the quote lookup, returns the blotter |
 
-Both halves use the `hasToday` stitch guard the other dashboards use: on a
-historical period the query lands on the HDB and reaches back to its own RDB
-through `{{conn:ENV:realtime}}`, unless the HDB already holds today.
+Both halves use the `hasToday` stitch guard. The quote RDB has no `date` column,
+so its half gets `update date:.z.D` and the as-of joins on date too, which stops
+a historical range dating an order against another day's book. `now_age_ms` on a
+past date is measured to that day's session end.
 
-The quote RDB has no `date` column, so its half gets `update date:.z.D` and the
-as-of becomes `aj[`date`sym`time; …]` — an exact match on date and sym, as-of on
-time, so a historical range cannot join a print across a day boundary.
-
-`now_*` on a past date means **that day's last print**, not this second. It is
-measured to the session end read off the other names in the frame, the same way
-`limit_up_down` reads a session end.
-
-Reader parameters: `lookback_mins` (default 10, real-time only),
-`min_dev_bps` (default 25), `min_price_age_ms` (default 5000). Both
-thresholds accept 0 to turn that test off.
+Reader parameters: `lookback_mins` (default 10, real-time only) and `max_ticks`
+(default 5).
 
 ## Deliverables
 
 ```
-queries/stale_price_check/stale_price_check.q
+queries/stale_price_check/stale_price_check.q      stalePriceCheck / Vocab / Rows
 kmonitor/stale_price_check/stale_price_check_kmonitor.q
                           /build_dashboard.py
                           /stale_price_check_kmonitor_dashboard.json

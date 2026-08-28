@@ -1,78 +1,93 @@
-/ stale_price_check_kmonitor.q - every workorder under a live parent, with the
-/ price the algo gave it beside the last print qatt actually had for that name
-/ at the same instant.  KdbMonitor version of
-/ queries/stale_price_check/stale_price_check.q.
+/ stale_price_check_kmonitor.q - every TAKE order under a live parent, with the
+/ touch it should have been sitting on beside the price it was actually sent
+/ at.  KdbMonitor version of queries/stale_price_check/stale_price_check.q.
 /
 / Source of truth: build_dashboard.py turns the two blocks below into the
 / importable JSON.  Edit here, re-run the builder, re-import.
 /
 / Two chained datasets - dataset 1 already carries every order field, so
 / dataset 2 finishes the job and there is no third hop back to the OMS:
-/   live_orders  OMS     workorders under an activated parent
-/   stale_check  QUOTES  the print qatt had at each t_gen, and the gap
+/   live_takes   OMS     take orders under an activated parent, with ticksize
+/   touch_check  QUOTES  the book at each t_gen, and how far off it they were
 /
 / "OMS" and "QUOTES" are placeholders - change them in env= AND in
 / {{conn:...:realtime}}.  Details in README.md.
 /
-/ A threshold of 0 turns that test OFF, so 0/0 is the calibration run: every
-/ workorder, every number filled in, nothing flagged.
+/ WHY A TAKE ORDER IS THE SHARP TEST.  A take lifts the offer or hits the bid,
+/ so its price is dictated by the book at the instant it was generated, not
+/ chosen.  Sent at anything else, the book the algo was looking at was not the
+/ book that existed.  The reference is therefore the FAR TOUCH, by side:
+/     buy   -> qask     you lift the offer
+/     sell  -> qbid     you hit the bid
+/ SHORT SALES ARE DROPPED: a short-sale price test can stop the order sitting
+/ at the bid, and it would read as off-touch for a reason that has nothing to
+/ do with stale data.
 /
-/ LIMIT ORDERS ONLY.  a market order carries price 0 and has no order price to
-/ hold a print against, so it never leaves the order server.
+/ ticks_off is signed and means the same thing on both sides - how far the
+/ price sits ABOVE the touch, in ticks, with ticksize off target_stock.
+/ Max ticks flags on the absolute value.
+/
+/ THE SIDE AND VENUE VOCABULARIES ARE NOT KNOWN HERE.  venue is matched as
+/ "contains TAKE" case-insensitively and side is read off its text, so both raw
+/ values stay in the output where a wrong reading is visible.  The bare q ships
+/ stalePriceVocab to list what the server really uses - run that first.
 /
 / THE LOOKBACK IS REAL-TIME ONLY, and it is in minutes.  Live it bounds t_gen -
-/ how recently the workorder was created - because reading the whole session out
-/ of qatt is too slow to run on a refresh.  On a historical period it is passed
-/ as 00:00:00.000, ie no bound, because "the last 10 minutes" cannot mean
-/ anything on a past date: the reader already bounded that frame with the dates.
+/ how recently the workorder was created - because reading the whole session
+/ out of qatt is too slow to run on a refresh.  On a historical period it is
+/ passed as 00:00:00.000, ie no bound, because "the last 10 minutes" cannot
+/ mean anything on a past date: the reader already bounded that frame with the
+/ dates.
 /
 / TWO WINDOWS, AND qatt's IS THE WIDER ONE.  Live, the orders come from the last
-/ `lookback` minutes and qatt is read from TWICE that far back, because an order
-/ generated at the very start of the order window still needs prints before it
-/ to land on.  `noprint` therefore means "no print in the scanned window" rather
-/ than "never traded today" - still a finding, since a name that has not printed
-/ in 2x lookback is stale by any reading.
+/ lookback minutes and qatt is read from TWICE that far back, because an order
+/ generated at the very start of the order window still needs quotes before it
+/ to land on.  So noquote means "no two-sided quote in the scanned window"
+/ rather than "never quoted today".
 
 
-/ ==== DATASET: live_orders | env=OMS ====
-/ The live book and its children.  Collapsed to one row per workorder here so
-/ dataset 2 joins against a clean set.
+/ ==== DATASET: live_takes | env=OMS ====
+/ Take orders under a live parent, one row per child, with the tick size that
+/ turns a price difference into ticks.
 {[lookback]
-  / target_state and workorder0 both carry date on the RDB as well as the HDB,
-  / so one lambda serves both servers.  t0 is how far back t_gen may sit;
-  / 00:00:00.000 is the no-bound value the historical branch passes.
+  / target_state, workorder0 and target_stock all carry date on the RDB as well
+  / as the HDB, so one lambda serves both servers.  t0 is how far back t_gen may
+  / sit; 00:00:00.000 is the no-bound value the historical branch passes.
   mk:{[dts;t0]
     s:0!select state:last state by date,id_server,id_target
       from target_state where date in dts;
     ids:exec distinct id_target from s where state=`activated;
-    / NOT filtered on the child's own state - a workorder still in `init under
-    / a live parent was priced off the same data as its activated siblings
-    / price, limit_target and limit_candidate all come back.  which of the
-    / three is the price the algo actually decided on has never been verified
-    / against a server, and reading `price` gave an order at 175 against a tape
-    / at 113.6 - so the report carries all three and lets the tape say which.
+    / TAKE VENUES ONLY.  upper-cased because q's like is case sensitive and the
+    / venue vocabulary is not known here.  the constraint sits last so it runs
+    / on the rows the three cheap ones already left.
     w:select date,id_server,id_target,id_work,sequence,trader,sym,side,size,
-        otype,state,t_gen,price,limit_target,limit_candidate
-      from workorder0 where date in dts, t_gen>=t0, id_target in ids;
-    / ONE ROW PER CHILD, AND IT IS THE FIRST ONE.  workorder0 writes a row per
-    / state change.  t_gen is stamped at generation and never moves, but price
-    / IS rewritten - a chase repoints it - so taking the last row pairs a
-    / repriced price with a generation timestamp and the comparison below stops
-    / meaning anything: right time, wrong price.
-    / Everything describing the order AS GENERATED therefore comes off the
-    / first row by sequence.  Only state is read from the last, because the
-    / current state is the one thing you want current.
+        otype,state,venue,venuetype,t_gen,price
+      from workorder0 where date in dts, t_gen>=t0, id_target in ids,
+        (upper string venue) like "*TAKE*";
+    / ONE ROW PER CHILD, AND IT IS THE FIRST ONE.  t_gen is stamped at
+    / generation and never moves, but price IS rewritten - a chase repoints it -
+    / so the last row would pair a repriced price with a generation timestamp.
+    / Only state is read from the last row, being the one thing worth current.
     w:`sequence xasc w;
     w:0!select id_target:first id_target, trader:first trader, sym:first sym,
         side:first side, size:first size, otype:first otype,
-        t_gen:first t_gen, price:first price,
-        limit_target:first limit_target, limit_candidate:first limit_candidate,
-        state:last state
+        venue:first venue, venuetype:first venuetype,
+        t_gen:first t_gen, price:first price, state:last state
       by date,id_server,id_work from w;
-    / LIMIT ORDERS ONLY.  a market order carries price 0 - there is no order
-    / price to hold a print against, and leaving it in reads as -10000 bps and
-    / sorts to the top of every run.  0< also drops a null price.
-    select from w where 0<price
+    / a market order carries price 0 and has no price to hold against a touch
+    w:select from w where 0<price;
+    / SIDE READ OFF ITS TEXT, not against an assumed enum.  Anything beginning
+    / b buys and looks at the offer; everything else sells and looks at the bid.
+    w:update sidelc:lower string side from w;
+    w:update isshort:(sidelc like "*short*")|sidelc like "ss" from w;
+    w:select from w where not isshort;
+    w:update ref_side:?[sidelc like "b*";`ask;`bid] from w;
+    / target_stock also carries sym, so only the columns wanted are taken - an
+    / lj would overwrite it
+    ts:`date`id_server`id_target xkey select date,id_server,id_target,ticksize
+      from target_stock
+      where date in dts, id_target in exec distinct id_target from w;
+    delete sidelc,isshort from w lj ts
    };
   {{#realtime}}mk[enlist .z.D; .z.T-60000*lookback]{{/realtime}}{{#historical}}{[mk]
      want:{{date_from}}+til 1+{{date_to}}-{{date_from}};
@@ -92,11 +107,11 @@
 / ==== END ====
 
 
-/ ==== DATASET: stale_check | env=QUOTES ====
+/ ==== DATASET: touch_check | env=QUOTES ====
 / The whole order table comes across, because an aj needs both sides local.
-{[w;lookback;minDevBps;minAgeMs]
+{[w;lookback;maxTicks]
   now:.z.T;
-  / nothing activated: back out before touching qatt.  this hands the widgets
+  / nothing to check: back out before touching qatt.  this hands the widgets
   / the empty ORDER table rather than an empty result with the columns they
   / name, so an empty book may show as a column error rather than as no rows.
   if[0=count w; :w];
@@ -105,23 +120,22 @@
   dts:exec distinct date from w;
   / the quote RDB has NO date column - it is today by definition - so unlike
   / the order side the two halves cannot share a lambda.  this is the RDB half.
-  / PRINTS ONLY: qatt carries quote updates on the same table and their price
-  / is null, and an asof onto one of those would date the order against a row
-  / that never traded.
+  / TWO-SIDED QUOTES ONLY: a one-sided book has no far touch to take against,
+  / and a zero on either side would read as a touch of nothing.
   / sym first: the RDB keeps `g#sym, and the where clause can only use that
   / attribute on the constraint it applies first.  the time cut then runs on
   / what survives, which is already a small fraction of the session.
   rdb:{[syms;q0]
     update date:.z.D from
-      select time, sym, gen_price:price, ptime:time
-        from qatt where sym in syms, time>=q0, 0<0^price
+      select time, sym, qbid, qask, ptime:time
+        from qatt where sym in syms, time>=q0, 0<0^qbid, 0<0^qask
    };
   p:{{#realtime}}rdb[syms; .z.T-2*60000*lookback]{{/realtime}}{{#historical}}{[dts;syms;rdb]
       hasToday:0<count select date from qatt where date=.z.D;
       stitch:(.z.D in dts) and not hasToday;
       dd:$[stitch; dts except .z.D; dts];
-      q:select date, time, sym, gen_price:price, ptime:time
-        from qatt where date in dd, sym in syms, 0<0^price;
+      q:select date, time, sym, qbid, qask, ptime:time
+        from qatt where date in dd, sym in syms, 0<0^qbid, 0<0^qask;
       if[stitch;
         c:hopen {{conn:QUOTES:realtime}};
         t:c(rdb;syms;00:00:00.000);
@@ -131,50 +145,41 @@
      }[dts;syms;rdb]{{/historical}};
   / aj wants the right side sorted by the join columns.  date is IN the join
   / here, unlike the bare-q version: an exact match on date and sym, asof on
-  / time, so a range can never date an order against another day's print.
+  / time, so a range can never date an order against another day's book.
   p:`date`sym`time xasc p;
   x:aj[`date`sym`time; update time:t_gen from w; p];
 
-  / ---- the two prices, and the gap ------------------------------------
-  x:update price_age_ms:"j"$t_gen-ptime from x;
-  / price is a real limit price by now - market orders never left the order
-  / server.  the guard left is gen_price: a name with no print has none.
-  x:update dev_bps:?[0<gen_price;
-      10000*(price-gen_price)%gen_price; 0n] from x;
-  / where the tape is now: says whether this is an order that was born bad or
-  / one still being fed bad data
-  c:select now_price:last gen_price, now_ptime:last time by date,sym from p;
+  / ---- the touch, and how far off it the order was ---------------------
+  x:update quote_age_ms:"j"$t_gen-ptime from x;
+  / the far touch: a buy lifts the offer, a sell hits the bid
+  x:update touch:?[ref_side=`ask; qask; qbid] from x;
+  / signed, and it means the same thing on both sides: how far the price sits
+  / ABOVE the touch
+  x:update ticks_off:?[0<ticksize; (price-touch)%ticksize; 0n] from x;
+  x:update ticks_abs:abs ticks_off from x;
+  / how long since the book last moved on that name - says whether this is an
+  / order that was born bad or a name still being fed a frozen quote
+  c:select now_ptime:last time by date,sym from p;
   x:x lj c;
-  / "now" on a past date means that day's last print, read off the other names
-  / in the frame - the same way a pinned stock's session end is read
+  / "now" on a past date means that day's last quote, read off the session end
+  / of the other names in the frame - only live does it mean this second
   e:select sess:max time by date from p;
   x:x lj e;
   x:update now_age_ms:"j"$?[date=.z.D; now; sess]-now_ptime from x;
-  x:update now_dev_bps:?[0<now_price;
-      10000*(price-now_price)%now_price; 0n] from x;
 
   / ---- verdict --------------------------------------------------------
-  / 0 turns a test off rather than making everything breach it
-  x:update hit_price:(0<minDevBps)&minDevBps<=abs dev_bps,
-      hit_age:(0<minAgeMs)&minAgeMs<=price_age_ms,
-      noprint:null ptime from x;
-  x:update flag:?[noprint;`noprint;
-      ?[hit_price&hit_age;`both;
-      ?[hit_price;`price;
-      ?[hit_age;`age;`ok]]]] from x;
+  / noquote and notick come first: both mean the test could not be RUN, which
+  / is a different statement from the test passing
+  x:update flag:?[null touch;`noquote;
+      ?[null ticks_off;`notick;
+      ?[maxTicks<ticks_abs;`off;`ok]]] from x;
   x:update flagged:not flag=`ok from x;
-  / a name we are working that has never printed is a finding, not an absence,
-  / so it comes back whatever the thresholds say
-  x:$[(0=minDevBps)&0=minAgeMs; x; select from x where flagged];
-  / worst first, and the ones with nothing to compare against on top
-  r:`noprint`sev xdesc update sev:abs dev_bps from x;
-  / renamed on the way out so the two can never be read for each other:
-  / order_price is ours, qatt_price is the tape's
-  select date, id_server, id_target, id_work, trader, sym, side, size, otype,
-      state, t_gen, order_price:price, limit_target, limit_candidate,
-      qatt_price:gen_price, dev_bps,
-      abs_dev_bps:sev, ptime, price_age_ms, qatt_price_now:now_price,
-      now_dev_bps, now_age_ms, flag, flagged
+  / worst first, and the ones that could not be tested on top
+  r:`flagged`ticks_abs xdesc x;
+  select date, id_server, id_target, id_work, trader, sym, side, ref_side,
+      size, otype, venue, venuetype, state, t_gen, order_price:price,
+      qbid, qask, touch, ticksize, ticks_off, ticks_abs, ptime, quote_age_ms,
+      now_age_ms, flag, flagged
     from r
- }[{{table:live_orders}};{{param:lookback_mins}};{{param:min_dev_bps}};{{param:min_price_age_ms}}]
+ }[{{table:live_takes}};{{param:lookback_mins}};{{param:max_ticks}}]
 / ==== END ====
