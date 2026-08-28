@@ -56,8 +56,12 @@ stalePriceCheck:{[h;lookback;minDevBps;minAgeMs]
     / every child of those parents.  NOT filtered on the child's own state -
     / a workorder still in `init under a live parent was priced off the same
     / data as its activated siblings.
+    / price, limit_target and limit_candidate all come back.  which of the
+    / three is the price the algo actually decided on has never been verified
+    / against a server, and reading `price` gave an order at 175 against a tape
+    / at 113.6 - so the report carries all three and lets the tape say which.
     w:select date,id_server,id_target,id_work,sequence,trader,sym,side,size,
-        otype,state,t_gen,price
+        otype,state,t_gen,price,limit_target,limit_candidate
       from workorder0 where date=d, t_gen>=t0, id_target in ids;
     / ONE ROW PER CHILD, AND IT IS THE FIRST ONE.  workorder0 writes a row per
     / state change.  t_gen is stamped at generation and never moves, but price
@@ -70,7 +74,9 @@ stalePriceCheck:{[h;lookback;minDevBps;minAgeMs]
     w:`sequence xasc w;
     w:0!select id_target:first id_target, trader:first trader, sym:first sym,
         side:first side, size:first size, otype:first otype,
-        t_gen:first t_gen, price:first price, state:last state
+        t_gen:first t_gen, price:first price,
+        limit_target:first limit_target, limit_candidate:first limit_candidate,
+        state:last state
       by date,id_server,id_work from w;
     / LIMIT ORDERS ONLY.  a market order carries price 0 - there is no order
     / price to hold a print against, and leaving it in reads as -10000 bps and
@@ -133,7 +139,8 @@ stalePriceCheck:{[h;lookback;minDevBps;minAgeMs]
   / renamed on the way out so the two can never be read for each other:
   / order_price is ours, qatt_price is the tape's
   select date, id_server, id_target, id_work, trader, sym, side, size, otype,
-      state, t_gen, order_price:price, qatt_price:gen_price, dev_bps,
+      state, t_gen, order_price:price, limit_target, limit_candidate,
+      qatt_price:gen_price, dev_bps,
       abs_dev_bps:sev, ptime, price_age_ms, qatt_price_now:now_price,
       now_dev_bps, now_age_ms, flag, flagged
     from r
