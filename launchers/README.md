@@ -8,7 +8,8 @@ Scheduler something to call at 19:00. One `.cmd` per report; they all go through
 launchers/
   run_luld_orders.cmd          the LULD order report, today
   run_short_sell_report.cmd    the short sell report, today
-  run_all.cmd                  both, one after the other, one prompt
+  run_dark_summary.cmd         dark venue execution by venue, today
+  run_all.cmd                  the two daily reports, one after the other
   _run.cmd                     the shared launcher.  Not for double clicking
   local_settings.cmd.example   copy to local_settings.cmd and edit
   logs/                        written on the first scheduled run
@@ -54,7 +55,12 @@ Arguments still work, from a prompt or from a shortcut:
 ```bat
 run_luld_orders.cmd --date 2026-08-21 --no-email
 run_short_sell_report.cmd --monthly 2026-07
+run_dark_summary.cmd --monthly 2026-07 --csv --raw
 ```
+
+`run_all.cmd` is the two **daily** reports and does not include
+`run_dark_summary.cmd` — add it there if you want it going out every evening
+too, which is a decision about a distribution list rather than about launching.
 
 ## The `scheduled` word
 
