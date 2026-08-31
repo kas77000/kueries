@@ -18,6 +18,12 @@ stack into the volume bars, and every child order's price becomes a point on
 the quote panel, coloured by what became of it.  Without it, the same three
 panels show the market alone and the order server is never opened.
 
+A CHILD ORDER PRICED AT OR INSIDE THE TOUCH IS NOT PLOTTED.  Showing at the
+bid, at the ask, or between them is the ordinary thing to do, so those points
+are dropped and what is left on the panel is every order priced through the
+quote that stood at the time.  --show-inside puts them back, and the orders CSV
+always holds all of them with the quote each was matched against.
+
 The q is not duplicated here: queries/liquidity_profile/liquidity_profile.q is
 sent to both servers as it stands, so the chart and anything else reading these
 tables cannot drift apart.
@@ -236,7 +242,8 @@ def _i(v) -> int:
     return 0 if n == -2147483648 else n
 
 
-def fetch(sym: str, day, mins: int, id_target=None) -> dict:
+def fetch(sym: str, day, mins: int, id_target=None,
+          hide_inside: bool = True) -> dict:
     """Everything one chart needs, as plain frames.  The order server is opened
     only when there is an id_target to look up.
 
@@ -302,9 +309,18 @@ def fetch(sym: str, day, mins: int, id_target=None) -> dict:
     if id_target is not None and len(prof):
         execs = ho(".lp.execs", dto, id_target).pd()
         prof = _stack(prof, execs, float(mins) * 60_000.0)
-        orders = _classify(ho(".lp.orders", dto, id_target).pd())
+        orders = mark_inside(_classify(ho(".lp.orders", dto, id_target).pd()),
+                             quotes)
         log(f"  {len(orders):>7,} child orders, {len(execs):,} fills, "
             f"{_i(prof['ours'].sum()):,} shares executed")
+        priced = pd.to_numeric(orders["px"], errors="coerce") > 0
+        nq = int((priced & orders["qbid"].isna()).sum())
+        log(f"  {int((orders['inside'] & priced).sum()):>7,} priced at or "
+            f"inside the touch"
+            + ("" if hide_inside else " (shown: --show-inside)")
+            + ("" if not nq else
+               f", and {nq} with no quote to judge them against, which are "
+               f"shown"))
         if live:
             seen = dates_seen(tgt, execs, orders)
             log(f"  the order rows are dated "
@@ -318,7 +334,8 @@ def fetch(sym: str, day, mins: int, id_target=None) -> dict:
 
     return {"profile": prof, "quotes": quotes, "orders": orders,
             "execs": execs, "sym": sym, "day": day, "mins": mins,
-            "id_target": id_target, "live": live, "asof": asof}
+            "id_target": id_target, "live": live, "asof": asof,
+            "hide_inside": hide_inside}
 
 
 def bucket_of(t_ms, ms: float):
@@ -371,6 +388,62 @@ def _classify(orders: pd.DataFrame) -> pd.DataFrame:
                                          out["time"])
     out["px"] = pd.to_numeric(out["price"], errors="coerce")
     return out
+
+
+def mark_inside(orders: pd.DataFrame, quotes: pd.DataFrame) -> pd.DataFrame:
+    """Which child orders were priced at or inside the touch, and against what.
+
+    THE QUOTE IS MATCHED AS OF THE POINT'S OWN TIME - the last print at or
+    before it - because a price is only inside a spread that actually stood at
+    that moment.  Matched here rather than with an aj on the server: the quote
+    curve is already in hand for the panel behind these points, so a second
+    read could disagree with what is drawn, and this way --self-test can prove
+    the matching.
+
+    NOT JUDGED IS NOT THE SAME AS OUTSIDE.  An order before the day's first
+    print, or any order on a name whose quotes came back empty, has no quote
+    to be inside of; inside stays false so it is never filtered away on an
+    assumption, and qbid/qask stay null so the CSV says why."""
+    if orders is None or not len(orders):
+        return orders
+    out = orders.copy()
+    out["qbid"] = np.nan
+    out["qask"] = np.nan
+
+    if quotes is not None and len(quotes):
+        q = pd.DataFrame({
+            "_t": pd.to_timedelta(quotes["time"]),
+            "_b": pd.to_numeric(quotes["qbid"], errors="coerce"),
+            "_a": pd.to_numeric(quotes["qask"], errors="coerce"),
+        }).dropna().sort_values("_t")
+        left = pd.DataFrame({"_t": pd.to_timedelta(out["at"]),
+                             "_i": out.index})
+        left = left[left["_t"].notna()].sort_values("_t")
+        if len(q) and len(left):
+            m = pd.merge_asof(left, q, on="_t",
+                              direction="backward").set_index("_i")
+            out.loc[m.index, "qbid"] = m["_b"]
+            out.loc[m.index, "qask"] = m["_a"]
+
+    px = pd.to_numeric(out["px"], errors="coerce")
+    #  AT the touch counts as inside: joining the queue at the bid is the most
+    #  ordinary price there is, and it is not what this filter leaves behind.
+    out["inside"] = ((px > 0) & out["qbid"].notna() & out["qask"].notna()
+                     & (px >= out["qbid"]) & (px <= out["qask"]))
+    return out
+
+
+def hidden_inside(d: dict) -> int:
+    """How many child orders the price panel is leaving out.  Read from the
+    frame rather than remembered from drawing it, so the number on the chart
+    and the points on the chart cannot disagree."""
+    o = d.get("orders")
+    if o is None or not len(o) or not d.get("hide_inside", True):
+        return 0
+    if "inside" not in o.columns:
+        return 0
+    return int((o["inside"] & (pd.to_numeric(o["px"], errors="coerce") > 0))
+               .sum())
 
 
 def classify(size: int, make: int, state: str, request: str) -> str:
@@ -610,11 +683,23 @@ def _panel_price(ax, d, quotes, orders, lo_ms, ms, theme, ink, ink2, surface,
             highs.append(float(np.nanmax(yf[good])))
 
     if orders is not None and len(orders):
-        o = orders[orders["px"] > 0].sort_values("at")
+        o = orders[orders["px"] > 0]
         dropped = len(orders) - len(o)
+        #  at or inside the touch is the ordinary price, and it is filtered:
+        #  what stays is every order we priced THROUGH the quote of the moment
+        inside = hidden_inside(d)
+        every = o.sort_values("at")
+        if inside:
+            o = o[~o["inside"]]
+        o = o.sort_values("at")
         xo = xpos(to_ms(o["at"]), lo_ms, ms)
-        #  the path the algo walked, behind the points rather than over them
-        ax.step(xo, o["px"].to_numpy(float), where="post", color=ink2,
+        #  THE PATH IS DRAWN OVER EVERY ORDER, filtered or not, behind the
+        #  points rather than over them.  Stepping only between the survivors
+        #  would draw a route the algo never took - and the line through the
+        #  spread is exactly where the filtered points went, so leaving it in
+        #  is what makes their absence readable instead of invisible.
+        ax.step(xpos(to_ms(every["at"]), lo_ms, ms),
+                every["px"].to_numpy(float), where="post", color=ink2,
                 linewidth=1.0, alpha=0.55, zorder=2)
         for key in POINT_ORDER:
             m = (o["cls"] == key).to_numpy()
@@ -629,12 +714,21 @@ def _panel_price(ax, d, quotes, orders, lo_ms, ms, theme, ink, ink2, surface,
                                   markeredgecolor=c, markeredgewidth=1.4,
                                   label=f"{POINTS[key][0]} ({int(m.sum())})",
                                   **kw))
-        if len(o):
-            lows.append(float(np.nanmin(o["px"])))
-            highs.append(float(np.nanmax(o["px"])))
+        #  from EVERY order, so hiding a point never rescales the panel and
+        #  the same day always draws against the same axis
+        if len(every):
+            lows.append(float(np.nanmin(every["px"])))
+            highs.append(float(np.nanmax(every["px"])))
         if dropped:
             log(f"  note: {dropped} child order(s) had no usable price and are "
                 f"not plotted")
+        if inside:
+            handles.append(Line2D([], [], linestyle="none", marker="o",
+                                  markersize=7, fillstyle="none",
+                                  color=surface, markeredgecolor=ink2,
+                                  markeredgewidth=0.8,
+                                  label=f"({inside} at or inside the touch, "
+                                        f"not shown)"))
 
     ax.legend(handles=handles, frameon=False, fontsize=8, labelcolor=ink2,
               loc="upper left", ncol=4, handlelength=1.4)
@@ -691,6 +785,14 @@ def _titles(fig, d, ink, ink2, stacked):
         foot[-1] += ("  Ringed points are the price we showed, at t_on_market "
                      "(or the order's own time where it never reached the "
                      "book); the small orange marks are our fills.")
+        n = hidden_inside(d)
+        if n:
+            foot.append(f"{n} child order(s) priced at or inside the touch "
+                        f"that stood at the time are NOT plotted - only "
+                        f"orders priced through the quote are.  The grey step "
+                        f"line is still the whole path, so it passes through "
+                        f"them.  --show-inside puts the points back; the "
+                        f"orders CSV always has them all.")
     if d.get("live"):
         foot.append("THE DAY IS NOT OVER: every percentage here is a share of "
                     "the day so far, the last bucket is still filling, and "
@@ -828,8 +930,10 @@ def _fake_orders() -> pd.DataFrame:
     """One child order of each class, plus one with no price at all."""
     rows = [
         #  time_min, t_on_market_min, size, make, state,    request, price
-        (600, 601, 1000, 1000, b"done",     b"new",  351.0),
-        (620, 621, 1000,  400, b"done",     b"new",  350.5),
+        #  the first two are priced ON the quote of the moment, so the touch
+        #  filter takes them out; the rest are through it and stay
+        (600, 601, 1000, 1000, b"done",     b"new",  352.3),
+        (620, 621, 1000,  400, b"done",     b"new",  352.95),
         (640, 641, 1000,    0, b"rejected", b"new",  349.0),
         (660, 661, 1000,    0, b"done",     b"cxl",  352.0),
         (680, 681, 1000,    0, b"weird",    b"new",  353.0),
@@ -863,16 +967,20 @@ def _fake_execs() -> pd.DataFrame:
     })
 
 
-def _fake_day(with_target=False, live=False) -> dict:
+def _fake_day(with_target=False, live=False, hide_inside=True) -> dict:
     df = _fake()
+    quotes = _fake_quotes()
     execs = _fake_execs() if with_target else None
     if with_target:
         df = _stack(df, execs, 10 * 60_000.0)
-    return {"profile": df, "quotes": _fake_quotes(), "execs": execs,
-            "orders": _classify(_fake_orders()) if with_target else None,
+    #  through the same two steps fetch() puts them through, in the same order
+    orders = (mark_inside(_classify(_fake_orders()), quotes)
+              if with_target else None)
+    return {"profile": df, "quotes": quotes, "execs": execs, "orders": orders,
             "sym": "0700.HK", "day": dt.date(2026, 8, 25), "mins": 10,
             "id_target": 84213 if with_target else None,
-            "live": live, "asof": "13:45" if live else None}
+            "live": live, "asof": "13:45" if live else None,
+            "hide_inside": hide_inside}
 
 
 def self_test() -> int:
@@ -987,6 +1095,55 @@ def self_test() -> int:
     check("2.5M reads as 2.5M", _si(2_500_000), "2.5M")
     check("a symbol's bytes become text", _s(b"0700.HK"), "0700.HK")
 
+    print("\nat or inside the touch")
+    #  one quote, standing from 10:00: bid 100.0, ask 100.4
+    q = pd.DataFrame({"time": [pd.Timedelta(minutes=600)],
+                      "qbid": [100.0], "qask": [100.4]})
+
+    def one(px, at=601):
+        o = pd.DataFrame({"at": [pd.Timedelta(minutes=at)], "px": [px]})
+        return mark_inside(o, q)
+
+    check("between the two is inside", bool(one(100.2)["inside"].iloc[0]), True)
+    check("exactly on the bid is inside too",
+          bool(one(100.0)["inside"].iloc[0]), True)
+    check("and exactly on the ask", bool(one(100.4)["inside"].iloc[0]), True)
+    check("a tick through the ask is not",
+          bool(one(100.5)["inside"].iloc[0]), False)
+    check("nor is one below the bid", bool(one(99.9)["inside"].iloc[0]), False)
+    check("an order with no price is not inside anything",
+          bool(one(0.0)["inside"].iloc[0]), False)
+    #  the quote is as of the point's own time, not the day's last quote
+    check("an order BEFORE the first quote is not judged",
+          bool(one(100.2, at=599)["inside"].iloc[0]), False)
+    check("and says so, with no quote against it",
+          bool(pd.isna(one(100.2, at=599)["qbid"].iloc[0])), True)
+    check("a later quote does not reach back",
+          float(one(100.2, at=601)["qbid"].iloc[0]), 100.0)
+    two = pd.DataFrame({"time": [pd.Timedelta(minutes=600),
+                                 pd.Timedelta(minutes=610)],
+                        "qbid": [100.0, 200.0], "qask": [100.4, 200.4]})
+    got = mark_inside(pd.DataFrame({"at": [pd.Timedelta(minutes=615)],
+                                    "px": [200.2]}), two)
+    check("the quote that stood at the time is the one used",
+          float(got["qbid"].iloc[0]), 200.0)
+    check("a day with no quotes at all judges nothing",
+          bool(mark_inside(pd.DataFrame({"at": [pd.Timedelta(minutes=601)],
+                                         "px": [100.2]}),
+                           q.iloc[0:0])["inside"].iloc[0]), False)
+    check("no child orders is not an error", mark_inside(None, q), None)
+
+    print("\nhiding them")
+    day = _fake_day(True)
+    check("the fake day has some at the touch", hidden_inside(day) > 0, True)
+    check("and some through it",
+          int((~day["orders"]["inside"]
+               & (day["orders"]["px"] > 0)).sum()) > 0, True)
+    check("--show-inside hides nothing",
+          hidden_inside(_fake_day(True, hide_inside=False)), 0)
+    check("and a day with no id_target has nothing to hide",
+          hidden_inside(_fake_day(False)), 0)
+
     print("\npicking the servers")
     check("no date opens the two RDBs",
           servers(True)[:2], (QATT_RDB, ORDER_RDB))
@@ -1023,6 +1180,18 @@ def self_test() -> int:
                 check(f"{'with' if with_target else 'without'} an id_target, "
                       f"{theme}", p.stat().st_size > 5000, True)
             plt.close(fig)
+
+    #  a filtered point must be COUNTED on the chart, never silently gone
+    fig = draw(_fake_day(True), "dark")
+    words = " ".join(t.get_text() for t in fig.texts)
+    check("the chart says how many it left out", "inside the touch" in words,
+          True)
+    check("a chart that hides none says nothing about it",
+          "inside the touch" in
+          " ".join(t.get_text()
+                   for t in draw(_fake_day(True, hide_inside=False),
+                                 "dark").texts), False)
+    plt.close("all")
 
     #  a live day must SAY it is unfinished: its percentages are shares of a
     #  day that has not closed, which is the one way this chart can mislead
@@ -1071,6 +1240,10 @@ def main(argv=None) -> int:
                         "panel")
     p.add_argument("--mins", type=int, default=MINS,
                    help=f"bucket width in minutes (default {MINS})")
+    p.add_argument("--show-inside", action="store_true",
+                   help="also plot the child orders that were priced at or "
+                        "inside the touch; by default only the ones priced "
+                        "through the quote of the moment are shown")
     p.add_argument("--theme", choices=("dark", "light"), default=THEME)
     p.add_argument("--probe", action="store_true",
                    help="walk the query in stages and name the one that breaks")
@@ -1097,7 +1270,8 @@ def main(argv=None) -> int:
     if a.probe:
         return probe(a.sym, day, a.mins, a.id_target)
 
-    d = fetch(a.sym, day, a.mins, a.id_target)
+    d = fetch(a.sym, day, a.mins, a.id_target,
+              hide_inside=not a.show_inside)
     if not len(d["profile"]):
         log(f"  no prints for {d['sym']} " + (
             "on the quote RDB - check the sym spelling against qatt, and that "
@@ -1109,6 +1283,8 @@ def main(argv=None) -> int:
             f"_{d['day']:%Y%m%d}_{a.mins}m")
     if a.id_target is not None:
         stem += f"_t{a.id_target}"
+        if a.show_inside:
+            stem += "_all"
     #  a live run overwrites the last live run for the same day, which is what
     #  you want while watching one - the dated file is never touched by it
     if d["live"]:
