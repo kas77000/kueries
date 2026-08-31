@@ -7,11 +7,17 @@
 /
 / Two chained datasets - dataset 1 already carries every order field, so
 / dataset 2 finishes the job and there is no third hop back to the OMS:
-/   live_takes   OMS     take orders under an activated parent, with ticksize
-/   touch_check  QUOTES  the book at each t_gen, and how far off it they were
+/   live_takes   OMS   take orders under an activated parent, with ticksize
+/   touch_check  QATT  the book at each t_gen, and how far off it they were
 /
-/ "OMS" and "QUOTES" are placeholders - change them in env= AND in
-/ {{conn:...:realtime}}.  Details in README.md.
+/ "OMS" and "QATT" are the environment names; set your own in the env= of each
+/ DATASET header and nowhere else.  Details in README.md.
+/
+/ REAL TIME ONLY.  Both datasets are pinned to the real-time period, so both
+/ always run against an RDB and always mean today.  That is why there is no
+/ {{#historical}} branch in either block and no {{conn:...}} anywhere: a
+/ dataset reaches past its own environment only to stitch a historical range
+/ onto today, and there is no historical range here to stitch.
 /
 / WHY A TAKE ORDER IS THE SHARP TEST.  A take lifts the offer or hits the bid,
 / so its price is dictated by the book at the instant it was generated, not
@@ -41,14 +47,11 @@
 / values stay in the output where a wrong reading is visible.  The bare q ships
 / stalePriceVocab to list what the server really uses - run that first.
 /
-/ THE LOOKBACK IS REAL-TIME ONLY, and it is in minutes.  Live it bounds t_gen -
-/ how recently the workorder was created - because reading the whole session
-/ out of qatt is too slow to run on a refresh.  On a historical period it is
-/ passed as 00:00:00.000, ie no bound, because "the last 10 minutes" cannot
-/ mean anything on a past date: the reader already bounded that frame with the
-/ dates.
+/ THE LOOKBACK IS IN MINUTES, and it bounds t_gen - how recently the workorder
+/ was created.  It is what keeps this runnable on a refresh: reading the whole
+/ session out of qatt is far too slow to do every thirty seconds.
 /
-/ TWO WINDOWS, AND qatt's IS THE WIDER ONE.  Live, the orders come from the last
+/ TWO WINDOWS, AND qatt's IS THE WIDER ONE.  The orders come from the last
 / lookback minutes and qatt is read from TWICE that far back, because an order
 / generated at the very start of the order window still needs quotes before it
 / to land on.  So noquote means "no two-sided quote in the scanned window"
@@ -59,9 +62,11 @@
 / Take orders under a live parent, one row per child, with the tick size that
 / turns a price difference into ticks.
 {[lookback]
-  / target_state, workorder0 and target_stock all carry date on the RDB as well
-  / as the HDB, so one lambda serves both servers.  t0 is how far back t_gen may
-  / sit; 00:00:00.000 is the no-bound value the historical branch passes.
+  / dts is today and t0 is how far back t_gen may sit.  target_state,
+  / workorder0 and target_stock all carry date on the RDB, so the constraint is
+  / written exactly as it would be against the HDB and means one day either
+  / way - which is what lets this lambda be lifted onto the HDB unchanged if
+  / this dashboard is ever given a historical period.
   mk:{[dts;t0]
     s:0!select state:last state by date,id_server,id_target
       from target_state where date in dts;
@@ -98,25 +103,14 @@
       where date in dts, id_target in exec distinct id_target from w;
     delete sidelc,isshort from w lj ts
    };
-  {{#realtime}}mk[enlist .z.D; .z.T-60000*lookback]{{/realtime}}{{#historical}}{[mk]
-     want:{{date_from}}+til 1+{{date_to}}-{{date_from}};
-     / asked of the ORDER hdb: it and the quote hdb are written down on their
-     / own schedules, so one having today says nothing about the other
-     hasToday:0<count select date from workorder0 where date=.z.D;
-     stitch:(.z.D in want) and not hasToday;
-     o:mk[$[stitch; want except .z.D; want]; 00:00:00.000];
-     if[stitch;
-       c:hopen {{conn:OMS:realtime}};
-       t:c(mk;enlist .z.D;00:00:00.000);
-       hclose c;
-       o:o uj t];
-     o
-    }[mk]{{/historical}}
+  / Today, bounded to the lookback.  One call, on the environment this
+  / dataset's env= names - see the REAL TIME ONLY note at the top of the file.
+  mk[enlist .z.D; .z.T-60000*lookback]
  }[{{param:lookback_mins}}]
 / ==== END ====
 
 
-/ ==== DATASET: touch_check | env=QUOTES ====
+/ ==== DATASET: touch_check | env=QATT ====
 / The whole order table comes across, because an aj needs both sides local.
 {[w;lookback;maxTicks]
   now:.z.T;
@@ -125,10 +119,9 @@
   / name, so an empty book may show as a column error rather than as no rows.
   if[0=count w; :w];
   syms:exec distinct sym from w;
-  / dates come from the orders, so this is already whatever dataset 1 found
-  dts:exec distinct date from w;
-  / the quote RDB has NO date column - it is today by definition - so unlike
-  / the order side the two halves cannot share a lambda.  this is the RDB half.
+  / THE QUOTE RDB HAS NO date COLUMN - it is today by definition - so the date
+  / the aj below joins on is stamped on here rather than read.  It matches the
+  / date dataset 1 put on its rows, which is .z.D on the same clock.
   / TWO-SIDED QUOTES ONLY: a one-sided book has no far touch to take against,
   / and a zero on either side would read as a touch of nothing.
   / sym first: the RDB keeps `g#sym, and the where clause can only use that
@@ -139,22 +132,11 @@
       select time, sym, qbid, qask, ptime:time
         from qatt where sym in syms, time>=q0, 0<0^qbid, 0<0^qask
    };
-  p:{{#realtime}}rdb[syms; .z.T-2*60000*lookback]{{/realtime}}{{#historical}}{[dts;syms;rdb]
-      hasToday:0<count select date from qatt where date=.z.D;
-      stitch:(.z.D in dts) and not hasToday;
-      dd:$[stitch; dts except .z.D; dts];
-      q:select date, time, sym, qbid, qask, ptime:time
-        from qatt where date in dd, sym in syms, 0<0^qbid, 0<0^qask;
-      if[stitch;
-        c:hopen {{conn:QUOTES:realtime}};
-        t:c(rdb;syms;00:00:00.000);
-        hclose c;
-        q:q uj t];
-      q
-     }[dts;syms;rdb]{{/historical}};
+  p:rdb[syms; .z.T-2*60000*lookback];
   / aj wants the right side sorted by the join columns.  date is IN the join
-  / here, unlike the bare-q version: an exact match on date and sym, asof on
-  / time, so a range can never date an order against another day's book.
+  / rather than left out: both sides carry today and agree about it, and
+  / keeping it there is what would let a historical period be added later
+  / without an order ever being dated against another day's book.
   p:`date`sym`time xasc p;
   x:aj[`date`sym`time; update time:t_gen from w; p];
 
@@ -178,14 +160,12 @@
     from x;
   x:select from x where not aggressive;
   / how long since the book last moved on that name - says whether this is an
-  / order that was born bad or a name still being fed a frozen quote
+  / order that was born bad or a name still being fed a frozen quote.  This
+  / dataset is real-time only, so "now" is this second and nothing else: on a
+  / historical period it would have to be that day's last quote instead.
   c:select now_ptime:last time by date,sym from p;
   x:x lj c;
-  / "now" on a past date means that day's last quote, read off the session end
-  / of the other names in the frame - only live does it mean this second
-  e:select sess:max time by date from p;
-  x:x lj e;
-  x:update now_age_ms:"j"$?[date=.z.D; now; sess]-now_ptime from x;
+  x:update now_age_ms:"j"$now-now_ptime from x;
 
   / ---- verdict --------------------------------------------------------
   / noquote and notick come first: both mean the test could not be RUN, which

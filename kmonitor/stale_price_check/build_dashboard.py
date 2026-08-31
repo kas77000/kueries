@@ -41,7 +41,10 @@ def dataset(name: str, env: str, qsql: str) -> dict:
     return {
         "name": name,
         "env": env,
-        "time_mode": "inherit",      # follows the period the reader picked
+        # PINNED, not inherited: both datasets are real-time and there is no
+        # historical branch in the q for them to fall back to.  The dashboard
+        # offers real-time alone as well, so this is belt and braces.
+        "time_mode": "realtime",
         "time_context": None,
         "mode": "raw",
         "table": "",
@@ -61,20 +64,18 @@ def parameters() -> list:
     return [
         {
             "name": "lookback_mins",
-            "label": "Lookback (minutes, real-time only)",
+            "label": "Lookback (minutes)",
             "kind": "number",
             "choices": [],
             "dataset": "",
             "column": "",
             "default": "10",
             "q_type": "number",
-            "help": ("How recently the workorder was created. Live, this is "
-                     "what keeps the query runnable on a refresh - reading the "
+            "help": ("How recently the workorder was created. This is what "
+                     "keeps the query runnable on a refresh - reading the "
                      "whole session out of qatt is too slow. qatt itself is "
                      "read from twice this far back, so an order at the start "
-                     "of the window still has prints before it to land on. On "
-                     "a historical period it is IGNORED: the dates already "
-                     "bound that frame."),
+                     "of the window still has prints before it to land on."),
             "required": True,
             "pattern": "",
             "pattern_message": "",
@@ -126,13 +127,15 @@ def build() -> dict:
                 "existed. Aggressive orders (a buy above the offer, a sell "
                 "below the bid) are excluded: they cross and fill anyway. "
                 "Short sales are excluded. Only breaches come back, so an "
-                "EMPTY TABLE IS THE GOOD ANSWER. Source of truth is "
+                "EMPTY TABLE IS THE GOOD ANSWER. REAL-TIME ONLY: both "
+                "datasets run against their environment's live server and "
+                "mean today. Source of truth is "
                 "stale_price_check_kmonitor.q; regenerate this file with "
                 "build_dashboard.py rather than editing it."
             ),
             "group": "Market structure",
             "refresh_secs": 30,
-            "periods": "both",
+            "periods": "realtime",
             "orientation": "landscape",
             "source": "kdb",
             "time_context": {"mode": "realtime"},

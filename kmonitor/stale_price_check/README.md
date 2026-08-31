@@ -6,7 +6,12 @@ they should have been**, with the book beside the price they were sent at.
 **Only breaches come back, so an empty panel is the good answer.**
 
 Built after orders in ai3 went out priced off market data that had gone stale.
-Reads the same live and over a historical range.
+
+**Real-time only.** Both datasets run against their environment's live server
+and always mean today. There is no period switch on this dashboard, which is
+why the `.q` carries no `{{#historical}}` block and no `{{conn:…}}` handle —
+those exist to stitch a historical range onto today, and there is no range
+here to stitch.
 
 Same logic as `queries/stale_price_check/stale_price_check.q`, repackaged the
 way KdbMonitor consumes it: chained datasets, one raw q query each, with the
@@ -72,15 +77,16 @@ either way, so they are never mistaken for aggressive.
 ## Installing it
 
 1. Change the two environment names if yours are not `OMS` (`target_state`,
-   `workorder0`, `target_stock`) and `QUOTES` (`qatt`). They are the `env=`
-   fields in the `/ ==== DATASET: … ====` headers of the `.q` **and** the
-   `{{conn:OMS:realtime}}` / `{{conn:QUOTES:realtime}}` calls inside them.
+   `workorder0`, `target_stock`) and `QATT` (`qatt`). They are the `env=`
+   fields in the `/ ==== DATASET: … ====` headers of the `.q`, and **nowhere
+   else** — nothing inside either query names an environment.
 2. `python build_dashboard.py`
 3. KdbMonitor → **Dashboards → Import** → pick
    `stale_price_check_kmonitor_dashboard.json`.
 
-Both environments need a real-time **and** a historical server registered in
-Admin, otherwise the period switch is not offered.
+Each environment needs a **real-time** server registered in Admin. A historical
+twin is not required: the dashboard is declared `periods: realtime` and both
+datasets are pinned to `time_mode: realtime`, so neither is ever asked for one.
 
 ## Run `stalePriceVocab` first
 
@@ -145,10 +151,9 @@ So `noquote` means "no two-sided quote in the scanned window", not "never quoted
 today" — still a finding, since a name we are taking on that has not quoted in
 twice the lookback is stale by any reading.
 
-**On a historical period the lookback is ignored.** "The last 10 minutes" cannot
-mean anything on a past date — the reader already bounded that frame with the
-dates — so both windows are passed `00:00:00.000`. A historical run is
-deliberately the slow path.
+**The lookback is the only bound there is.** With no historical period to fall
+back on, "the last 10 minutes" always means the last ten minutes, and both
+windows are always set from it.
 
 ## The order price is the one it was GENERATED with
 
@@ -168,26 +173,24 @@ carries a per-row `time` for exactly that.
 
 ## Which server answers what
 
-| Period selected | Where the rows come from |
-| --- | --- |
-| Real-time | the RDB, today. Nothing else is asked. |
-| A range **not** reaching today | the HDB. Nothing else is asked. |
-| A range that **includes** today | the HDB for the range **plus** the RDB for today, unioned — unless the HDB already holds today, in which case the HDB answers alone. |
+The RDB of each environment, today, and nothing else is ever asked. `live_takes`
+goes to `OMS`, `touch_check` goes to `QATT`, and neither reaches past the
+environment its `env=` names.
 
-KdbMonitor sends a dataset to one server, so on a historical period the query
-lands on the HDB and reaches back to the RDB itself through
-`{{conn:ENV:realtime}}`. The safeguard is `hasToday`: if the HDB already holds
-today, stitching would count it twice, so the RDB is never opened. Each dataset
-asks that question of **its own** server.
+That is the whole story here, and it is worth saying plainly because the other
+dashboards in this folder are not like it: they offer both periods, so they
+land on an HDB and reach back to the RDB through `{{conn:ENV:realtime}}` to
+stitch today on. This one has nothing to stitch.
 
-Two things are specific to this dashboard:
+Two things follow from being live-only:
 
-- The quote RDB has **no `date` column**, so its half gets `update date:.z.D`
-  and the as-of joins on date as well — exact on date and sym, as-of on time. A
-  historical range cannot date an order against another day's book.
-- **`now_age_ms` on a past date** is measured to that day's session end, read
-  off the other names in the frame. Only in real time does it mean "as of right
-  now".
+- The quote RDB has **no `date` column**, so `touch_check` stamps one on with
+  `update date:.z.D` and the as-of join matches on it — exact on date and sym,
+  as-of on time. Both sides carry today and agree about it. The column stays in
+  the join rather than being dropped, so a historical period could be added
+  later without an order ever being dated against another day's book.
+- **`now_age_ms` means "as of right now"**, always. There is no past date for it
+  to be measured to a session end instead.
 
 ## Untested edge, worth checking on the first run
 
