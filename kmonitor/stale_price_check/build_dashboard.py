@@ -119,14 +119,14 @@ def build() -> dict:
             "id": None,
             "name": "Stale price check - take orders vs the touch",
             "description": (
-                "Every take order under an activated parent, with the touch it "
-                "should have been sitting on beside the price it was actually "
-                "sent at. A take lifts the offer or hits the bid, so its price "
-                "is dictated by the book rather than chosen - sent at anything "
-                "else, the book the algo saw was not the book that existed. "
-                "ticks_off is signed: how far the price sits above the touch. "
-                "Short sales are excluded. Reads the same live and over a "
-                "historical range. Source of truth is "
+                "Take orders that were NOT sitting on the touch they should "
+                "have been. A take lifts the offer or hits the bid, so its "
+                "price is dictated by the book rather than chosen - sent at "
+                "anything else, the book the algo saw was not the book that "
+                "existed. Aggressive orders (a buy above the offer, a sell "
+                "below the bid) are excluded: they cross and fill anyway. "
+                "Short sales are excluded. Only breaches come back, so an "
+                "EMPTY TABLE IS THE GOOD ANSWER. Source of truth is "
                 "stale_price_check_kmonitor.q; regenerate this file with "
                 "build_dashboard.py rather than editing it."
             ),
@@ -142,16 +142,16 @@ def build() -> dict:
                 {
                     "widgets": [
                         {"type": "kpi", "dataset": "touch_check",
-                         "title": "Take orders checked",
+                         "title": "Orders off the touch",
                          "spec": {"column": "id_work", "agg": "count",
-                                  "fmt": ",.0f"},
-                         "width": 1.0},
-                        {"type": "kpi", "dataset": "touch_check",
-                         "title": "Off the touch",
-                         "spec": {"column": "flagged", "agg": "sum",
                                   "fmt": ",.0f",
                                   "thresholds": [{"op": ">", "value": 0,
                                                   "color": "critical"}]},
+                         "width": 1.0},
+                        {"type": "kpi", "dataset": "touch_check",
+                         "title": "Names affected",
+                         "spec": {"column": "sym", "agg": "nunique",
+                                  "fmt": ",.0f"},
                          "width": 1.0},
                         {"type": "kpi", "dataset": "touch_check",
                          "title": "Worst",
@@ -163,11 +163,6 @@ def build() -> dict:
                          "spec": {"column": "quote_age_ms", "agg": "max",
                                   "fmt": ",.0f", "suffix": " ms"},
                          "width": 1.0},
-                        {"type": "kpi", "dataset": "touch_check",
-                         "title": "Names affected",
-                         "spec": {"column": "sym", "agg": "nunique",
-                                  "fmt": ",.0f"},
-                         "width": 1.0},
                     ],
                     "height_in": 0.9,
                     "gap_above_in": 0.0,
@@ -176,8 +171,8 @@ def build() -> dict:
                 {
                     "widgets": [
                         {"type": "table", "dataset": "touch_check",
-                         "title": ("Take orders, and the touch they should "
-                                   "have been on"),
+                         "title": ("Take orders that missed the touch "
+                                   "they should have been on"),
                          "spec": {
                              "columns": ["date", "sym", "side", "ref_side",
                                          "venue", "state", "trader",

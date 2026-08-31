@@ -7,8 +7,9 @@ to.
 
 ## What it answers
 
-For every **take** order under a live parent: the price it was sent at, beside
-**the touch it should have been sitting on** at the same instant.
+Take orders under a live parent that were **not sitting on the touch they
+should have been**, with the book beside the price they were sent at. Only
+breaches come back — an empty table is the good answer.
 
 ## Why a take order, and not any order
 
@@ -77,9 +78,39 @@ Signed, and it means the same thing on both sides: how far the price sits
 `+3` was three ticks short of hitting the bid. `maxTicks` flags on the absolute
 value, so `0` means it must be exactly on the touch.
 
-`flag` is `off` / `noquote` / `notick` / `ok`. The middle two mean the test
-could not be **run** — no quote in the window, no tick size for that stock —
-which is a different statement from the test passing, so neither reads as `ok`.
+`flag` is `off` / `noquote` / `notick`. The last two mean the test could not be
+**run** — no quote in the window, no tick size for that stock — which is a
+different statement from the test passing.
+
+## Two filters decide what is even asked
+
+**Aggressive takes are dropped** — a buy *above* the offer, a sell *below* the
+bid:
+
+| `ref_side` | `ticks_off` | |
+| --- | --- | --- |
+| `ask` (buy) | `> 0` | dropped — crossed the offer |
+| `bid` (sell) | `< 0` | dropped — crossed the bid |
+
+Those cross and fill at the touch anyway, so they are deliberate aggression
+rather than a book the algo misread. Stale data shows up as the **opposite**: a
+book that has moved away leaves the buy below the offer and the sell above the
+bid, sitting there not filling. After the filter `ticks_off` is `<=0` on buys
+and `>=0` on sells.
+
+The consequence: if stale data made the algo cross *through* the touch, that
+order is dropped too. It is indistinguishable from deliberate aggression and it
+fills at the touch regardless, so it costs nothing — the direction that costs
+you is the one kept.
+
+**Then only breaches come back** — `ok` rows drop out, so an empty table is the
+good answer and the query is an alert list rather than a blotter.
+
+Rows that could not be tested survive **both** filters: a null `ticks_off`
+compares false either way, so `noquote` and `notick` are never mistaken for
+aggressive, and they are not `ok` so they are not filtered away. They sort to
+the top, ahead of the ranked breaches, via a `notest` sort key — `ticks_abs` is
+null on those rows and a bare `xdesc` would bury them at the bottom.
 
 ## Vocabularies this query does not know
 

@@ -27,6 +27,15 @@
 / price sits ABOVE the touch, in ticks, with ticksize off target_stock.
 / Max ticks flags on the absolute value.
 /
+/ AGGRESSIVE TAKES ARE DROPPED - a buy ABOVE the offer, a sell BELOW the bid.
+/ Those cross and fill at the touch anyway, so they are deliberate aggression
+/ rather than a book the algo misread.  Stale data shows up as the opposite: a
+/ book that has moved away leaves the buy below the offer and the sell above
+/ the bid, sitting there not filling.
+/
+/ ONLY BREACHES COME BACK.  An order on the touch is the book behaving, so `ok
+/ drops out and AN EMPTY PANEL IS THE GOOD ANSWER.
+/
 / THE SIDE AND VENUE VOCABULARIES ARE NOT KNOWN HERE.  venue is matched as
 / "contains TAKE" case-insensitively and side is read off its text, so both raw
 / values stay in the output where a wrong reading is visible.  The bare q ships
@@ -157,6 +166,17 @@
   / ABOVE the touch
   x:update ticks_off:?[0<ticksize; (price-touch)%ticksize; 0n] from x;
   x:update ticks_abs:abs ticks_off from x;
+  / AGGRESSIVE TAKES ARE NOT THIS REPORT'S BUSINESS.  A buy above the offer or
+  / a sell below the bid crosses, and it fills at the touch anyway - that is
+  / deliberate aggression, not a book the algo misread.
+  / Stale data shows up as the OPPOSITE: a book that has moved away leaves the
+  / buy BELOW the offer and the sell ABOVE the bid, and the order sits there
+  / not filling.  That is the direction this report keeps.
+  / A null ticks_off is not aggressive either way - a null comparison is false -
+  / so noquote and notick rows survive to be reported as untestable.
+  x:update aggressive:((ref_side=`ask)&0<ticks_off)|((ref_side=`bid)&ticks_off<0)
+    from x;
+  x:select from x where not aggressive;
   / how long since the book last moved on that name - says whether this is an
   / order that was born bad or a name still being fed a frozen quote
   c:select now_ptime:last time by date,sym from p;
@@ -173,13 +193,19 @@
   x:update flag:?[null touch;`noquote;
       ?[null ticks_off;`notick;
       ?[maxTicks<ticks_abs;`off;`ok]]] from x;
-  x:update flagged:not flag=`ok from x;
-  / worst first, and the ones that could not be tested on top
-  r:`flagged`ticks_abs xdesc x;
+  / BREACHES ONLY.  An order sitting on the touch is the whole book behaving,
+  / and there is nothing to look at - so `ok drops out and an empty table is
+  / the good answer.  flagged is therefore constant true and does not come
+  / back as a column; flag still says WHICH kind of finding each row is.
+  x:select from x where not flag=`ok;
+  / untestable first - a row that could not be checked is worth seeing before
+  / the ranked ones - then worst ticks.  ticks_abs is null on those rows, and
+  / a bare xdesc would sort them to the bottom.
+  r:`notest`ticks_abs xdesc update notest:flag in `noquote`notick from x;
   select date, id_server, id_target, id_work, trader, sym, side, ref_side,
       size, otype, venue, venuetype, state, t_gen, order_price:price,
       qbid, qask, touch, ticksize, ticks_off, ticks_abs, ptime, quote_age_ms,
-      now_age_ms, flag, flagged
+      now_age_ms, flag
     from r
  }[{{table:live_takes}};{{param:lookback_mins}};{{param:max_ticks}}]
 / ==== END ====

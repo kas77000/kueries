@@ -1,7 +1,9 @@
 # Stale price check — KdbMonitor dashboard
 
-Every **take** order under an **activated** parent, with **the touch it should
-have been sitting on** beside the price it was actually sent at.
+Take orders under an **activated** parent that were **not sitting on the touch
+they should have been**, with the book beside the price they were sent at.
+
+**Only breaches come back, so an empty panel is the good answer.**
 
 Built after orders in ai3 went out priced off market data that had gone stale.
 Reads the same live and over a historical range.
@@ -37,6 +39,35 @@ The reference is the **far touch**, by side:
 Short sales are excluded because a short-sale price test can stop the order
 sitting at the bid, and it would then read as off-touch for a reason that has
 nothing to do with stale data.
+
+## Two filters decide what is even asked
+
+**Aggressive takes are dropped** — a buy *above* the offer, a sell *below* the
+bid. Those cross and fill at the touch anyway, so they are deliberate
+aggression rather than a book the algo misread.
+
+Stale data shows up as the **opposite**: a book that has moved away leaves the
+buy below the offer and the sell above the bid, sitting there not filling. That
+is the direction this dashboard keeps, so after the filter `ticks_off` is `<=0`
+on buys and `>=0` on sells.
+
+| `ref_side` | `ticks_off` | |
+| --- | --- | --- |
+| `ask` (buy) | `> 0` | **dropped** — crossed the offer |
+| `ask` (buy) | `<= 0` | kept — this is where stale shows |
+| `bid` (sell) | `< 0` | **dropped** — crossed the bid |
+| `bid` (sell) | `>= 0` | kept — this is where stale shows |
+
+One consequence worth knowing: if stale data made the algo cross *through* the
+touch, that order is dropped too. It is indistinguishable from deliberate
+aggression, and it fills at the touch regardless — so it costs nothing. The
+direction that costs you is the one kept.
+
+**Then only breaches come back.** An order sitting on the touch is the book
+behaving and there is nothing to look at, so `ok` rows drop out. `flag` still
+says which kind of finding each row is, and rows that could not be tested
+(`noquote`, `notick`) always survive both filters — a null comparison is false
+either way, so they are never mistaken for aggressive.
 
 ## Installing it
 
@@ -83,7 +114,7 @@ of being inferred from an empty dashboard.
 | `ticks_off` | `(order_price - touch) % ticksize`, **signed** |
 | `ptime` / `quote_age_ms` | when that quote was, and how old it already was at `t_gen` |
 | `now_age_ms` | how long since the book last moved on that name |
-| `flag` | `off` / `noquote` / `notick` / `ok` |
+| `flag` | `off` / `noquote` / `notick` — `ok` never appears, those rows are filtered out |
 
 `ticks_off` means the same thing on both sides — how far the price sits
 **above** the touch. A buy at `+3` went three ticks through the offer; a sell at
@@ -92,7 +123,8 @@ absolute value, so `0` means it must be exactly on the touch.
 
 `noquote` and `notick` both mean the test **could not be run** — no two-sided
 quote in the window, or no tick size for that stock. That is a different
-statement from the test passing, so neither ever reads as `ok`.
+statement from the test passing, so they come back rather than being filtered
+away with the `ok` rows, and they sort to the top.
 
 ## The lookback, and the two windows
 

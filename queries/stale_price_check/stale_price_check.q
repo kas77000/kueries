@@ -7,6 +7,7 @@
 /   q)stalePriceVocab[h;10]                    / RUN THIS FIRST - see below
 /   q)stalePriceCheck[h;10;5]                  / last 10 min, 5 ticks of slack
 /   q)stalePriceCheck[h;10;0]                  / must be ON the touch exactly
+/   q)count stalePriceCheck[h;10;5]            / 0 is the good answer
 /
 / Run it FROM THE QUOTE SESSION.  qatt lives there, workorder0, target_state and
 / target_stock live on the order server, and an aj needs both sides local - so
@@ -31,9 +32,19 @@
 / to do with stale data.
 /
 / ticks_off is signed and is simply how far the price sits ABOVE the touch, in
-/ ticks: (order_price - touch) % ticksize, with ticksize off target_stock.  A
-/ buy at +3 went three ticks through the offer; a sell at +3 was three ticks
-/ short of hitting the bid.  maxTicks flags on the absolute value.
+/ ticks: (order_price - touch) % ticksize, with ticksize off target_stock.
+/ maxTicks flags on the absolute value.
+/
+/ AGGRESSIVE TAKES ARE DROPPED - a buy ABOVE the offer, a sell BELOW the bid.
+/ Those cross and fill at the touch anyway, so they are deliberate aggression
+/ rather than a book the algo misread.  Stale data shows up as the opposite: a
+/ book that has moved away leaves the buy below the offer and the sell above
+/ the bid, sitting there not filling.  That is the direction kept, so after the
+/ filter ticks_off is <=0 on buys and >=0 on sells.
+/
+/ ONLY BREACHES COME BACK.  An order on the touch is the book behaving, so `ok
+/ drops out and AN EMPTY TABLE IS THE GOOD ANSWER.  flag still says which kind
+/ of finding each row is - off, noquote or notick.
 /
 / THE SIDE AND VENUE VOCABULARIES ARE NOT KNOWN HERE.  venue is matched as
 / "contains TAKE" case-insensitively, and side is read off its text rather than
@@ -136,6 +147,17 @@ stalePriceCheck:{[h;lookback;maxTicks]
   / ABOVE the touch
   x:update ticks_off:?[0<ticksize; (price-touch)%ticksize; 0n] from x;
   x:update ticks_abs:abs ticks_off from x;
+  / AGGRESSIVE TAKES ARE NOT THIS REPORT'S BUSINESS.  A buy above the offer or
+  / a sell below the bid crosses, and it fills at the touch anyway - that is
+  / deliberate aggression, not a book the algo misread.
+  / Stale data shows up as the OPPOSITE: a book that has moved away leaves the
+  / buy BELOW the offer and the sell ABOVE the bid, and the order sits there
+  / not filling.  That is the direction this report keeps.
+  / A null ticks_off is not aggressive either way - a null comparison is false -
+  / so noquote and notick rows survive to be reported as untestable.
+  x:update aggressive:((ref_side=`ask)&0<ticks_off)|((ref_side=`bid)&ticks_off<0)
+    from x;
+  x:select from x where not aggressive;
   / how long since the book last moved on that name - says whether this is an
   / order that was born bad or a name still being fed a frozen quote
   c:select now_ptime:last time by sym from p;
@@ -148,13 +170,19 @@ stalePriceCheck:{[h;lookback;maxTicks]
   x:update flag:?[null touch;`noquote;
       ?[null ticks_off;`notick;
       ?[maxTicks<ticks_abs;`off;`ok]]] from x;
-  x:update flagged:not flag=`ok from x;
-  / worst first, and the ones that could not be tested on top
-  r:`flagged`ticks_abs xdesc x;
+  / BREACHES ONLY.  An order sitting on the touch is the whole book behaving,
+  / and there is nothing to look at - so `ok drops out and an empty table is
+  / the good answer.  flagged is therefore constant true and does not come
+  / back as a column; flag still says WHICH kind of finding each row is.
+  x:select from x where not flag=`ok;
+  / untestable first - a row that could not be checked is worth seeing before
+  / the ranked ones - then worst ticks.  ticks_abs is null on those rows, and
+  / a bare xdesc would sort them to the bottom.
+  r:`notest`ticks_abs xdesc update notest:flag in `noquote`notick from x;
   select date, id_server, id_target, id_work, trader, sym, side, ref_side,
       size, otype, venue, venuetype, state, t_gen, order_price:price,
       qbid, qask, touch, ticksize, ticks_off, ticks_abs, ptime, quote_age_ms,
-      now_age_ms, flag, flagged
+      now_age_ms, flag
     from r
  };
 
