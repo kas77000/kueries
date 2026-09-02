@@ -54,7 +54,8 @@ ever reached.
 In q that is one line:
 
 ```q
-.shd.peak:{[on;off;sz] max sums exec d from `t`d xasc ([]t:on,off; d:sz,neg sz)};
+.shd.peak:{[on;off;sz]
+  (max sz) | max sums exec d from `t`d xasc ([]t:on,off; d:sz,neg sz)};
 ```
 
 reading right to left:
@@ -66,6 +67,7 @@ reading right to left:
 | `exec d from` | take the delta column |
 | `sums` | the running total |
 | `max` | the highest it reached |
+| `(max sz) \|` | never less than the biggest single child — see below |
 
 ## Two details that matter
 
@@ -81,6 +83,21 @@ which sorts before every other event, so the day would start at *minus* its
 size and carry that error the whole way through. This is why the query filters
 `t_off_market > 0` regardless of `.shd.minRestMs` — it is a correctness
 requirement, not a setting.
+
+## Is a single big child counted?
+
+Yes. If one child is larger than anything that ever overlapped, the peak is
+that child's own size — no special case needed. At the moment it goes on
+market the running total already contains its full size, and every other live
+child only adds to it. So `shares_in_dark` is never below the largest single
+child sent.
+
+One exception, and it is why `(max sz) |` is in the code. A child whose
+`t_on_market` and `t_off_market` fall in the **same millisecond** would
+disappear: the delta tie-break sorts its own `−size` before its own `+size`, so
+it contributes nothing. Taking the maximum against the largest child closes
+that, and costs nothing anywhere else — for a child with any real duration the
+sweep already returns at least its size.
 
 ## Reading it against real orders
 
