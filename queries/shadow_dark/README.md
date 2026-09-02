@@ -31,12 +31,19 @@ One row per parent order, days ascending, biggest order first within each day.
 | `children` | how many dark child orders that parent is made of |
 | `shares_routed` | `size` summed over those children — **share-attempts, not shares**, see [below](#shares_routed-counts-the-same-shares-many-times) |
 | `shares_in_dark` | most shares resting in the dark at any one instant — the one comparable to `target_size` |
+| `dark_pct` | `shares_in_dark` as a % of `target_size` — how much of the order was in the dark |
 | `shares_executed` | `make` summed — what actually filled |
+| `exec_pct` | `shares_executed` as a % of `target_size` — how much of the order came back |
 | `adv1t_last` | `onmkt_adv1t` of the last child: volume at the moment we last went on market |
 | `rest_ms_avg` | mean `t_off_market - t_on_market` across those children, in ms |
 
-`shares_executed % shares_routed` is the plain fill rate — read it with the
-caveat below.
+**Read a row as `dark_pct` then `exec_pct`:** *we had 100% of this order
+sitting in dark pools, and 1.1% of it came back.* `shares_routed % target_size`
+is the third number — how many times over we sent it — and the gap between
+that and `dark_pct` is the churn.
+
+`shares_executed % shares_routed` is the plain fill rate, but against a routed
+figure inflated by re-sends it flatters nothing; `exec_pct` is the honest one.
 
 ## The three settings
 
@@ -73,14 +80,19 @@ and the point of putting it in a setting is that it is now made deliberately.
 ### `.shd.minRestMs` — how long a child had to sit
 
 ```q
-.shd.minRestMs:600000;   / 10 minutes
+.shd.minRestMs:0;        / off.  600000 would be 10 minutes
 ```
 
 Milliseconds of time on market, `t_off_market - t_on_market`. Applies to
-**every** child, filled or not; `0` turns it off. A child still on the market
-has `t_off_market = 0`, so it fails this test too.
+**every** child, filled or not.
 
-Read the next two sections together before trusting the number this produces.
+**Off by default**, because `shares_routed` is meant to show the whole effort,
+churn included — and `shares_in_dark` now gives the un-inflated number
+alongside it, which is what a duration floor was being used to approximate.
+
+Independently of the setting, a child still on the market is always excluded:
+`t_off_market` is `0`, so it has no duration and would corrupt the
+`shares_in_dark` sweep.
 
 ### `.shd.keepReasons` — which cancelled orders still count
 
@@ -119,25 +131,25 @@ Orders that never reached a venue at all — rejected, never acked, never
 transmitted — are excluded by `t_on_market > 0`, which is where every dark
 query on this desk starts.
 
-### What a 10-minute floor actually keeps
+### What a 10-minute floor does, if you turn it on
 
-`.shd.minRestMs` is ten minutes. Measured against a first run over
-2026-08-28 to 2026-09-01, that is a reasonable line rather than an extreme one.
+Set `.shd.minRestMs:600000` and the short-lived churn goes. On one
+500,000-share order in `388.HK`, `shares_routed` fell from 12,212,800 to
+497,000: **96% of the routed shares came from children that rested under ten
+minutes**, and what was left came out within 1% of the order itself. Across a
+run over 2026-08-28 to 2026-09-01 the median `shares_routed % target_size` went
+to 0.99, with 12 of 19 rows at or under 1.2.
 
-The engine's own rotation logic uses a per-stock duration clamped to 10–100
-seconds, but that is the **minimum age** before a resting order becomes a
-rotation candidate (`findColdOrders` skips anything younger) — it does not cap
-how long a child lives. Observed `rest_ms_avg` on real orders runs from ten
-minutes to about six hours, the latter being a full ASX session.
+It is off by default because `shares_in_dark` answers the same question without
+discarding rows: the churn shows up as the gap between `shares_routed` and
+`shares_in_dark` rather than by being filtered away. Turn it on when you want
+the long sitters specifically.
 
-What the floor removes is the short-lived churn. On one 500,000-share order in
-`388.HK`, `shares_routed` fell from 12,212,800 unfiltered to 497,000 with the
-floor on: **96% of the routed shares came from children that rested under ten
-minutes**, and what was left came out almost exactly equal to the order.
-
-Across that first run the median `shares_routed % target_size` was **0.99**,
-with 12 of 19 rows at or under 1.2. Set `.shd.minRestMs:0` to see the
-unfiltered population.
+A note on the duration itself: the engine's rotation logic uses a per-stock
+value clamped to 10–100 seconds, but that is the **minimum age** before a
+resting order becomes a rotation candidate (`findColdOrders` skips anything
+younger) — it does not cap how long a child lives. Observed `rest_ms_avg` runs
+from ten minutes to about six hours, the latter a full ASX session.
 
 ## The volume column, and the better one we did not use
 

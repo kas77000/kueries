@@ -9,10 +9,10 @@
 
 .shd.darkCategories:`Dark`Pmid;   / VENUEMAP category.  `Dark alone drops midpoint
 
-/ Minimum time on market, in MILLISECONDS.  600000 = 10 min.  Applies to every
-/ child, filled or not.  0 disables it.  Note the engine's own normal dark rest
-/ is 10-100s, so 10 min keeps only the long sitters - see README.md.
-.shd.minRestMs:600000;
+/ Minimum time on market, in MILLISECONDS.  0 = off, 600000 = 10 min.  Applies
+/ to every child, filled or not.  Off by default: routed is meant to show the
+/ whole effort, churn included.
+.shd.minRestMs:0;
 
 / Cancels that still count as a real dark attempt.  Everything else dropped -
 / goal_change, need_shares, target_modify, stop_to_finish, cancel_for_eod,
@@ -43,8 +43,10 @@ shadowDark:{[d0;d1]
   w:update killreason:{`$last ":" vs string x} each lower state from w;
   w:select from w
     where (make>0) or (t_off_market>0) and killreason in .shd.keepReasons;
-  / still on the market has t_off_market=0, so it fails this too
-  w:select from w where .shd.minRestMs < t_off_market - t_on_market;
+  / t_off_market>0 regardless of the setting: a child still on the market has no
+  / duration, and would corrupt the peak sweep below
+  w:select from w
+    where t_off_market>0, .shd.minRestMs<=t_off_market-t_on_market;
   / ij, not lj - a child whose parent is not SHADOW drops out
   r:`date`time xasc (w ij tg);
   / sorted by time above, so last IS the latest child.  id_server stays in the
@@ -58,7 +60,15 @@ shadowDark:{[d0;d1]
       adv1t_last:last onmkt_adv1t,
       rest_ms_avg:"j"$avg t_off_market - t_on_market
     by date,id_server,id_target,sym from r;
-  `date xasc `shares_routed xdesc delete id_server from s
+  s:delete id_server from s;
+  / of the order itself: how much sat in the dark, and how much came back
+  s:update
+      dark_pct:?[target_size>0;0.01*"j"$1e4*shares_in_dark%target_size;0n],
+      exec_pct:?[target_size>0;0.01*"j"$1e4*shares_executed%target_size;0n]
+    from s;
+  s:(`date`id_target`sym`target_size`children`shares_routed`shares_in_dark,
+     `dark_pct`shares_executed`exec_pct`adv1t_last`rest_ms_avg) xcols s;
+  `date xasc `shares_routed xdesc s
  };
 
 / shares_routed counts the same shares once per send - a parent that rotated
