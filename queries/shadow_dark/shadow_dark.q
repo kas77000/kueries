@@ -2,14 +2,17 @@
 / the dark, the shares that came back, and the volume that was there to trade
 / against while we sat in it.
 /
-/   q)\l queries/shadow_dark/shadow_dark.q
-/   q)hw:hopen `:orderserver:port      / workorder, target, VENUEMAP
-/   q)hs:hopen `:statsserver:port      / work_list
-/   q)shadowDark[hw;hs;.z.D-5;.z.D-1]
+/ From QStudio connected to the order server, which is the normal way to run
+/ this - .shd.hw is already 0, meaning "run here", so only work_list needs a
+/ handle:
 /
-/ TWO handles, because work_list is not on the order server - the same split
-/ cleandirty.q makes.  Both queries go out as lambdas, config included, so
-/ neither server needs anything installed on it.
+/   q)\l queries/shadow_dark/shadow_dark.q
+/   q).shd.hs:hopen `:statsserver:port
+/   q)shadowDark[.z.D-5;.z.D-1]
+/
+/ work_list is NOT on the order server - the same split cleandirty.q makes.
+/ Both halves go out as lambdas with the config as arguments, so no server
+/ needs anything installed on it.
 /
 / Meant for completed days: onmkt_adv1t on a day still trading is a partial
 / volume, so do not pass today as the end date.
@@ -18,9 +21,15 @@
 / attempt.  README.md explains every column and every setting below.
 
 / ---------------------------------------------------------------------------
-/ CONFIG - the whole judgement of this query is these two settings.  They are
+/ CONFIG - the whole judgement of this query is these settings.  They are
 / passed to the server with the query, so editing them here is enough.
 / ---------------------------------------------------------------------------
+
+/ WHERE EACH TABLE LIVES.  0 means "the server I am already talking to", so
+/ QStudio pointed at Orders HT needs no handle for the order-server half.
+/ Set the other one once per session:  .shd.hs:hopen `:statsserver:port
+.shd.hw:0;    / workorder, target, VENUEMAP
+.shd.hs:0;    / work_list - MUST be a handle unless you are on that server
 
 / Which venues count as dark.  This is VENUEMAP's own classification, not a
 / match on the venue's name: a name test misses *-PMID, which is dark, and
@@ -43,10 +52,13 @@
 
 / ---------------------------------------------------------------------------
 
-shadowDark:{[hw;hs;d0;d1]
-  w:hw({[d0;d1;cats;keep]
+/ Run f with args a, here if the handle is 0 and over the wire if it is not.
+.shd.run:{[h;f;a] $[0=h; f . a; h ((enlist f),a)]};
+
+shadowDark:{[d0;d1]
+  w:.shd.run[.shd.hw;{[d0;d1;cats;keep]
     if[not `VENUEMAP in key `.;
-      '"VENUEMAP not found - this is not the order server"];
+      '"VENUEMAP not here - set .shd.hw:hopen `:orderserver:port"];
     tg:`date`id_server`id_target xkey select date,id_server,id_target,algo
       from target where date within (d0;d1), (upper algo)=`SHADOW;
     / t_on_market>0 is where every dark query on this desk starts: it drops the
@@ -66,18 +78,23 @@ shadowDark:{[hw;hs;d0;d1]
       where (make>0) or (t_off_market>0) and killreason in keep;
     / ij, not lj - a child whose parent is not SHADOW drops out
     `date`time xasc (w ij tg)
-    };d0;d1;.shd.darkCategories;.shd.keepReasons);
+    };(d0;d1;.shd.darkCategories;.shd.keepReasons)];
   if[0=count w; :w];
   / work_list is one row per CHILD, and carries the volume that printed at or
   / through that child's own limit while it rested.  date is in the key: over a
   / range, id_work alone repeats across days.
-  v:hs({[d0;d1]select date,id_server,id_target,id_work,vvalid,vvalida
-      from work_list where date within (d0;d1), algo=`SHADOW};d0;d1);
+  v:.shd.run[.shd.hs;{[d0;d1]
+    if[not `work_list in tables `.;
+      '"work_list not here - set .shd.hs:hopen `:statsserver:port"];
+    select date,id_server,id_target,id_work,vvalid,vvalida
+      from work_list where date within (d0;d1), algo=`SHADOW
+    };(d0;d1)];
   r:w lj `date`id_server`id_target`id_work xkey v;
   / sorted by time above, so last IS the latest child of that parent.
   / id_server stays in the by clause so two servers cannot share an id_target,
   / then drops out of the result.
   s:0!select
+      children:count i,
       shares_routed:sum size,
       shares_executed:sum make,
       adv1t_last:last onmkt_adv1t,
@@ -87,6 +104,12 @@ shadowDark:{[hw;hs;d0;d1]
   / stable sorts, so this reads date ascending, biggest order first in each
   `date xasc `shares_routed xdesc delete id_server from s
  };
+
+/ shares_routed counts the SAME SHARES ONCE PER SEND.  SHADOW rotates a parent
+/ round the venues, so a parent that rotated forty times has routed forty times
+/ its own size, and shares_routed can far exceed both the parent size and the
+/ day's volume.  It is share-attempts, not shares - children is there so the
+/ multiple is visible rather than surprising.
 
 / count_chaseprice is NOT the chase counter - the order server writes
 / minExecSize into that column.  The kill reason in state is the only place a

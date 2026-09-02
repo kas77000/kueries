@@ -5,15 +5,22 @@ date range: how many shares we put into dark venues, how many came back as
 fills, and how much volume was actually there to trade against while we sat in
 them.
 
+From QStudio connected to the order server — the normal way to run this —
+`.shd.hw` is already `0`, meaning *run here*, so only `work_list` needs a
+handle:
+
 ```q
 q)\l queries/shadow_dark/shadow_dark.q
-q)hw:hopen `:orderserver:port      / workorder, target, VENUEMAP
-q)hs:hopen `:statsserver:port      / work_list
-q)shadowDark[hw;hs;2026.08.24;2026.08.28]
+q).shd.hs:hopen `:statsserver:port
+q)shadowDark[2026.08.24;2026.08.28]
 ```
 
 Both dates are included. **Do not pass today** — see
 [the volume columns](#the-four-volume-columns) for why.
+
+If either half is on a server you are not talking to, the query says so by
+name rather than failing obscurely: *"work_list not here — set
+`.shd.hs:hopen \`:statsserver:port`"*.
 
 ## The result
 
@@ -24,13 +31,15 @@ One row per parent order, days ascending, biggest order first within each day.
 | `date` | trading day |
 | `id_target` | the parent order — one row per attempt, see [below](#a-replaced-order-appears-twice) |
 | `sym` | the stock |
-| `shares_routed` | `size` summed over the dark children we counted |
+| `children` | how many dark child orders that parent is made of |
+| `shares_routed` | `size` summed over those children — **share-attempts, not shares**, see [below](#shares_routed-counts-the-same-shares-many-times) |
 | `shares_executed` | `make` summed — what actually filled |
 | `adv1t_last` | `onmkt_adv1t` of the last child: volume at the moment we last went on market |
 | `vvalid` | volume that printed **at or through our limit** while our children rested |
 | `vvalida` | the same, measured up to the last fill rather than to the end |
 
-`shares_executed % shares_routed` is the plain fill rate.
+`shares_executed % shares_routed` is the plain fill rate — read it with the
+caveat below.
 `shares_executed % vvalida` is the *effective* fill rate — the one the desk's
 own SHADOW query uses (`cleandirty.q`). See [below](#the-four-volume-columns).
 
@@ -153,6 +162,23 @@ quantity that reconciles against the tape.
 **`adv1t_last` on today is a partial volume.** The day is not finished, so the
 reading is whatever had traded by then. Only pass completed days.
 
+## shares_routed counts the same shares many times
+
+SHADOW rotates a parent order round the venues: it sends shares to one pool,
+cancels (`rotate_venue`), sends the same shares to the next. `shares_routed`
+sums `size` across every one of those children, so **a parent that rotated
+forty times has routed forty times its own quantity**.
+
+That is what "routed" means, and it is the right denominator for "how hard did
+we work this order". It is *not* the parent's size, and `shares_routed` can
+comfortably exceed both the parent quantity and the whole day's volume in the
+name. The `children` column is in the result so that the multiple is visible
+rather than surprising: `shares_routed % children` is roughly the typical
+child size.
+
+If you want the parent's actual quantity, take `size` from `target`, not from
+summed children.
+
 ## A replaced order appears twice
 
 When an order is rejected and re-sent, the engine writes a **new `id_target`**
@@ -172,9 +198,11 @@ rejections are often the finding. The chain-collapse logic lives in
 | `VENUEMAP` | order | `category`, the venue classification |
 | `work_list` | stats | `vvalid`, `vvalida` |
 
-`work_list` living on a different server is why `shadowDark` takes two handles
-rather than running as one lambda on the order server. `cleandirty.q` splits
-the same way, for the same reason.
+`work_list` living on a different server is why the script carries two
+handles, `.shd.hw` and `.shd.hs`, rather than running as one lambda on the
+order server. `cleandirty.q` splits the same way, for the same reason. A
+handle of `0` means "the server I am already talking to", which is why the
+QStudio case needs only one of them set.
 
 ## One trap worth writing down
 
