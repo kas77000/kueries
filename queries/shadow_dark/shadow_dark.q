@@ -9,6 +9,11 @@
 
 .shd.darkCategories:`Dark`Pmid;   / VENUEMAP category.  `Dark alone drops midpoint
 
+/ Minimum time on market, in MILLISECONDS.  600000 = 10 min.  Applies to every
+/ child, filled or not.  0 disables it.  Note the engine's own normal dark rest
+/ is 10-100s, so 10 min keeps only the long sitters - see README.md.
+.shd.minRestMs:600000;
+
 / Cancels that still count as a real dark attempt.  Everything else dropped -
 / goal_change, need_shares, target_modify, stop_to_finish, cancel_for_eod,
 / scheduler_halt, churn_prevent - is the parent moving, not the venue.
@@ -22,7 +27,7 @@ shadowDark:{[d0;d1]
     from target where date within (d0;d1), (upper algo)=`SHADOW;
   / t_on_market>0 drops the children that never reached a venue
   w:select date,time,id_server,id_target,sym,venue,state,size,make,
-      onmkt_adv1t,t_off_market
+      onmkt_adv1t,t_on_market,t_off_market
     from workorder
     where date within (d0;d1), t_on_market>0;
   w:w lj `venue xkey select venue,category from VENUEMAP;
@@ -31,6 +36,8 @@ shadowDark:{[d0;d1]
   w:update killreason:{`$last ":" vs string x} each lower state from w;
   w:select from w
     where (make>0) or (t_off_market>0) and killreason in .shd.keepReasons;
+  / still on the market has t_off_market=0, so it fails this too
+  w:select from w where .shd.minRestMs < t_off_market - t_on_market;
   / ij, not lj - a child whose parent is not SHADOW drops out
   r:`date`time xasc (w ij tg);
   / sorted by time above, so last IS the latest child.  id_server stays in the
@@ -39,7 +46,8 @@ shadowDark:{[d0;d1]
       children:count i,
       shares_routed:sum size,
       shares_executed:sum make,
-      adv1t_last:last onmkt_adv1t
+      adv1t_last:last onmkt_adv1t,
+      rest_ms_avg:"j"$avg t_off_market - t_on_market
     by date,id_server,id_target,sym from r;
   `date xasc `shares_routed xdesc delete id_server from s
  };

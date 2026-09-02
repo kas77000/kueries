@@ -31,13 +31,14 @@ One row per parent order, days ascending, biggest order first within each day.
 | `shares_routed` | `size` summed over those children — **share-attempts, not shares**, see [below](#shares_routed-counts-the-same-shares-many-times) |
 | `shares_executed` | `make` summed — what actually filled |
 | `adv1t_last` | `onmkt_adv1t` of the last child: volume at the moment we last went on market |
+| `rest_ms_avg` | mean `t_off_market - t_on_market` across those children, in ms |
 
 `shares_executed % shares_routed` is the plain fill rate — read it with the
 caveat below.
 
-## The two settings
+## The three settings
 
-Everything this query judges is the two settings at the top of
+Everything this query judges is the three settings at the top of
 `shadow_dark.q`. Editing that file and reloading it is the only step.
 
 ### `.shd.darkCategories` — which venues are dark
@@ -66,6 +67,18 @@ Set it to `` `Dark `` alone to count only true dark pools and exclude midpoint.
 The desk goes both ways depending on the question — `darktoxic.q` uses
 `` `Dark`Pmid ``, `cleandirty.q` uses `` `Dark `` — so this is a real choice,
 and the point of putting it in a setting is that it is now made deliberately.
+
+### `.shd.minRestMs` — how long a child had to sit
+
+```q
+.shd.minRestMs:600000;   / 10 minutes
+```
+
+Milliseconds of time on market, `t_off_market - t_on_market`. Applies to
+**every** child, filled or not; `0` turns it off. A child still on the market
+has `t_off_market = 0`, so it fails this test too.
+
+Read the next two sections together before trusting the number this produces.
 
 ### `.shd.keepReasons` — which cancelled orders still count
 
@@ -104,21 +117,32 @@ Orders that never reached a venue at all — rejected, never acked, never
 transmitted — are excluded by `t_on_market > 0`, which is where every dark
 query on this desk starts.
 
-### Why not a time threshold
+### What a 10-minute floor actually keeps
 
-The obvious rule is "keep the orders that rested long enough", say ten minutes.
-It does not work, and the engine's own numbers say why: its notion of a
-reasonable dark rest is computed per stock from how often that stock trades,
-then **clamped to between 10 and 100 seconds**. The SHADOW venue-rotation cycle
-is bounded by the same scale.
+`.shd.minRestMs` is currently set to ten minutes, and that is a deliberately
+aggressive filter — it is worth being clear about what survives it.
 
-So 100 seconds is the *ceiling* on a normal rest. A ten-minute floor would not
-select the valid cancels — it would select the pathological ones, and throw
-away nearly every genuine dark attempt.
+The engine's own notion of a reasonable dark rest is computed per stock from
+how often that stock trades, then **clamped to between 10 and 100 seconds**.
+The SHADOW venue-rotation cycle is bounded by the same scale. So 100 seconds is
+the *ceiling* on a normal rest, and a ten-minute floor sits six times past it.
 
-The kill reason separates "rotated out after a normal rest" from "cancelled
-instantly because the parent changed" far better than any duration can, because
-that is the distinction it was written to record.
+What that keeps is not the typical valid cancel — it is the child that sat far
+longer than the algo's own rhythm: an order the rotation never got round to, a
+venue left holding shares while the parent worked elsewhere, or a stock quiet
+enough that the per-stock duration ran to its clamp and stayed there. Those are
+worth looking at. They are just not the same population as "orders that had a
+fair chance in the dark", which is what `.shd.keepReasons` selects.
+
+The two filters compose, so what comes back is *children that rested over ten
+minutes AND either filled or were cancelled for an accepted reason*. Because
+almost every accepted cancel happens well inside ten minutes, the duration
+floor is doing nearly all the work and `keepReasons` very little. If the
+intent is the kill-reason population, set `.shd.minRestMs:0`; if the intent is
+long sitters, this is it.
+
+`rest_ms_avg` is in the result so the surviving durations are visible rather
+than assumed.
 
 ## The volume column, and the better one we did not use
 
