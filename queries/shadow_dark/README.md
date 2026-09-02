@@ -30,7 +30,7 @@ One row per parent order, days ascending, biggest order first within each day.
 | `target_size` | the parent's own quantity, from `target` |
 | `children` | how many dark child orders that parent is made of |
 | `shares_routed` | `size` summed over those children — **share-attempts, not shares**, see [below](#shares_routed-counts-the-same-shares-many-times) |
-| `shares_in_dark` | most shares resting in the dark at any one instant — the one comparable to `target_size` |
+| `shares_in_dark` | most shares resting in the dark at any one instant — the one comparable to `target_size`. [How it is computed](shares_in_dark.md) |
 | `dark_pct` | `shares_in_dark` as a % of `target_size` — how much of the order was in the dark |
 | `shares_executed` | `make` summed — what actually filled |
 | `exec_pct` | `shares_executed` as a % of `target_size` — how much of the order came back |
@@ -195,7 +195,9 @@ rotation multiple — how many times over we sent the order into the dark.
 
 **`shares_in_dark` is the column to compare against `target_size`.** It is the
 most shares resting in dark venues at any one instant: the children's on-market
-intervals swept in time order, taking the running maximum. A parent that sent
+intervals swept in time order, taking the running maximum.
+[`shares_in_dark.md`](shares_in_dark.md) walks through it with a worked
+example. A parent that sent
 100,000 shares, cancelled, and sent the same 100,000 again counts 200,000
 routed but 100,000 in the dark. It answers "how much of this order was actually
 sitting in dark pools", which is the question `shares_routed` looks like it

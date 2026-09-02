@@ -21,9 +21,9 @@
 
 / ---------------------------------------------------------------------------
 
-/ Most shares resting in the dark at any one instant.  Sorted by time then by
-/ delta, so an order coming off at the same ms is counted off before the next
-/ goes on.
+/ Most shares resting in the dark at any one instant - see shares_in_dark.md.
+/ Sorted by time THEN BY DELTA, so an order coming off at the same ms is
+/ counted off before the next goes on.
 .shd.peak:{[on;off;sz] max sums exec d from `t`d xasc ([]t:on,off; d:sz,neg sz)};
 
 shadowDark:{[d0;d1]
