@@ -30,6 +30,7 @@ One row per parent order, days ascending, biggest order first within each day.
 | `target_size` | the parent's own quantity, from `target` |
 | `children` | how many dark child orders that parent is made of |
 | `shares_routed` | `size` summed over those children — **share-attempts, not shares**, see [below](#shares_routed-counts-the-same-shares-many-times) |
+| `shares_in_dark` | most shares resting in the dark at any one instant — the one comparable to `target_size` |
 | `shares_executed` | `make` summed — what actually filled |
 | `adv1t_last` | `onmkt_adv1t` of the last child: volume at the moment we last went on market |
 | `rest_ms_avg` | mean `t_off_market - t_on_market` across those children, in ms |
@@ -120,30 +121,23 @@ query on this desk starts.
 
 ### What a 10-minute floor actually keeps
 
-`.shd.minRestMs` is currently set to ten minutes, and that is a deliberately
-aggressive filter — it is worth being clear about what survives it.
+`.shd.minRestMs` is ten minutes. Measured against a first run over
+2026-08-28 to 2026-09-01, that is a reasonable line rather than an extreme one.
 
-The engine's own notion of a reasonable dark rest is computed per stock from
-how often that stock trades, then **clamped to between 10 and 100 seconds**.
-The SHADOW venue-rotation cycle is bounded by the same scale. So 100 seconds is
-the *ceiling* on a normal rest, and a ten-minute floor sits six times past it.
+The engine's own rotation logic uses a per-stock duration clamped to 10–100
+seconds, but that is the **minimum age** before a resting order becomes a
+rotation candidate (`findColdOrders` skips anything younger) — it does not cap
+how long a child lives. Observed `rest_ms_avg` on real orders runs from ten
+minutes to about six hours, the latter being a full ASX session.
 
-What that keeps is not the typical valid cancel — it is the child that sat far
-longer than the algo's own rhythm: an order the rotation never got round to, a
-venue left holding shares while the parent worked elsewhere, or a stock quiet
-enough that the per-stock duration ran to its clamp and stayed there. Those are
-worth looking at. They are just not the same population as "orders that had a
-fair chance in the dark", which is what `.shd.keepReasons` selects.
+What the floor removes is the short-lived churn. On one 500,000-share order in
+`388.HK`, `shares_routed` fell from 12,212,800 unfiltered to 497,000 with the
+floor on: **96% of the routed shares came from children that rested under ten
+minutes**, and what was left came out almost exactly equal to the order.
 
-The two filters compose, so what comes back is *children that rested over ten
-minutes AND either filled or were cancelled for an accepted reason*. Because
-almost every accepted cancel happens well inside ten minutes, the duration
-floor is doing nearly all the work and `keepReasons` very little. If the
-intent is the kill-reason population, set `.shd.minRestMs:0`; if the intent is
-long sitters, this is it.
-
-`rest_ms_avg` is in the result so the surviving durations are visible rather
-than assumed.
+Across that first run the median `shares_routed % target_size` was **0.99**,
+with 12 of 19 rows at or under 1.2. Set `.shd.minRestMs:0` to see the
+unfiltered population.
 
 ## The volume column, and the better one we did not use
 
@@ -186,6 +180,17 @@ child size.
 `target_size` is the parent's own quantity, taken from `target` rather than
 summed from children, so `shares_routed % target_size` reads directly as the
 rotation multiple — how many times over we sent the order into the dark.
+
+**`shares_in_dark` is the column to compare against `target_size`.** It is the
+most shares resting in dark venues at any one instant: the children's on-market
+intervals swept in time order, taking the running maximum. A parent that sent
+100,000 shares, cancelled, and sent the same 100,000 again counts 200,000
+routed but 100,000 in the dark. It answers "how much of this order was actually
+sitting in dark pools", which is the question `shares_routed` looks like it
+answers and does not.
+
+Keep both: `shares_routed` measures effort, `shares_in_dark` measures exposure,
+and the gap between them is the churn.
 
 ## A replaced order appears twice
 

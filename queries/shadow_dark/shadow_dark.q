@@ -21,6 +21,11 @@
 
 / ---------------------------------------------------------------------------
 
+/ Most shares resting in the dark at any one instant.  Sorted by time then by
+/ delta, so an order coming off at the same ms is counted off before the next
+/ goes on.
+.shd.peak:{[on;off;sz] max sums exec d from `t`d xasc ([]t:on,off; d:sz,neg sz)};
+
 shadowDark:{[d0;d1]
   if[not `VENUEMAP in key `.; '"VENUEMAP not here - not the order server"];
   / target_size, not size - workorder has a size column of its own
@@ -48,6 +53,7 @@ shadowDark:{[d0;d1]
       target_size:first target_size,
       children:count i,
       shares_routed:sum size,
+      shares_in_dark:.shd.peak[t_on_market;t_off_market;size],
       shares_executed:sum make,
       adv1t_last:last onmkt_adv1t,
       rest_ms_avg:"j"$avg t_off_market - t_on_market
