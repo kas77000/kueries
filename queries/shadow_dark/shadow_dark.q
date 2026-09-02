@@ -23,7 +23,9 @@
 
 shadowDark:{[d0;d1]
   if[not `VENUEMAP in key `.; '"VENUEMAP not here - not the order server"];
-  tg:`date`id_server`id_target xkey select date,id_server,id_target,algo
+  / target_size, not size - workorder has a size column of its own
+  tg:`date`id_server`id_target xkey select date,id_server,id_target,algo,
+      target_size:size
     from target where date within (d0;d1), (upper algo)=`SHADOW;
   / t_on_market>0 drops the children that never reached a venue
   w:select date,time,id_server,id_target,sym,venue,state,size,make,
@@ -43,6 +45,7 @@ shadowDark:{[d0;d1]
   / sorted by time above, so last IS the latest child.  id_server stays in the
   / by clause so two servers cannot share an id_target, then drops out.
   s:0!select
+      target_size:first target_size,
       children:count i,
       shares_routed:sum size,
       shares_executed:sum make,

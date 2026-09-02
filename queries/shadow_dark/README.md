@@ -27,6 +27,7 @@ One row per parent order, days ascending, biggest order first within each day.
 | `date` | trading day |
 | `id_target` | the parent order — one row per attempt, see [below](#a-replaced-order-appears-twice) |
 | `sym` | the stock |
+| `target_size` | the parent's own quantity, from `target` |
 | `children` | how many dark child orders that parent is made of |
 | `shares_routed` | `size` summed over those children — **share-attempts, not shares**, see [below](#shares_routed-counts-the-same-shares-many-times) |
 | `shares_executed` | `make` summed — what actually filled |
@@ -182,8 +183,9 @@ name. The `children` column is in the result so that the multiple is visible
 rather than surprising: `shares_routed % children` is roughly the typical
 child size.
 
-If you want the parent's actual quantity, take `size` from `target`, not from
-summed children.
+`target_size` is the parent's own quantity, taken from `target` rather than
+summed from children, so `shares_routed % target_size` reads directly as the
+rotation multiple — how many times over we sent the order into the dark.
 
 ## A replaced order appears twice
 
