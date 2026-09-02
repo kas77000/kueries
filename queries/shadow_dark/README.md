@@ -5,22 +5,18 @@ date range: how many shares we put into dark venues, how many came back as
 fills, and how much volume was actually there to trade against while we sat in
 them.
 
-From QStudio connected to the order server — the normal way to run this —
-`.shd.hw` is already `0`, meaning *run here*, so only `work_list` needs a
-handle:
+Runs entirely on the order server — `workorder`, `target` and `VENUEMAP` are
+all there, so no handle is needed.
 
 ```q
 q)\l queries/shadow_dark/shadow_dark.q
-q).shd.hs:hopen `:statsserver:port
 q)shadowDark[2026.08.24;2026.08.28]
 ```
 
-Both dates are included. **Do not pass today** — see
-[the volume columns](#the-four-volume-columns) for why.
+Or `h(shadowDark;d0;d1)` from elsewhere, the way `darkSummary` is called.
 
-If either half is on a server you are not talking to, the query says so by
-name rather than failing obscurely: *"work_list not here — set
-`.shd.hs:hopen \`:statsserver:port`"*.
+Both dates are included. **Do not pass today** — `onmkt_adv1t` mid-session is a
+partial volume.
 
 ## The result
 
@@ -35,19 +31,14 @@ One row per parent order, days ascending, biggest order first within each day.
 | `shares_routed` | `size` summed over those children — **share-attempts, not shares**, see [below](#shares_routed-counts-the-same-shares-many-times) |
 | `shares_executed` | `make` summed — what actually filled |
 | `adv1t_last` | `onmkt_adv1t` of the last child: volume at the moment we last went on market |
-| `vvalid` | volume that printed **at or through our limit** while our children rested |
-| `vvalida` | the same, measured up to the last fill rather than to the end |
 
 `shares_executed % shares_routed` is the plain fill rate — read it with the
 caveat below.
-`shares_executed % vvalida` is the *effective* fill rate — the one the desk's
-own SHADOW query uses (`cleandirty.q`). See [below](#the-four-volume-columns).
 
 ## The two settings
 
 Everything this query judges is the two settings at the top of
-`shadow_dark.q`. They are shipped to the server with the query, so editing that
-file is the only step.
+`shadow_dark.q`. Editing that file and reloading it is the only step.
 
 ### `.shd.darkCategories` — which venues are dark
 
@@ -129,38 +120,29 @@ The kill reason separates "rotated out after a normal rest" from "cancelled
 instantly because the parent changed" far better than any duration can, because
 that is the distinction it was written to record.
 
-## The four volume columns
-
-All four answer "how much volume was around while we were trying", and they are
-**not** interchangeable.
+## The volume column, and the better one we did not use
 
 `adv1t_last` is `onmkt_adv1t` from the last child — a **single reading, taken
-at one instant**, of all volume, with no price filter. It is a rough proxy.
+at one instant**, of all volume, with no price filter. It is a rough proxy for
+"how much was trading while we were in there", and it is the only volume figure
+this query carries. Being a reading rather than a total for the period, on a
+day still trading it is whatever had printed by then — so only pass completed
+days.
 
-`vvalid` is the real measure. While a child rests in the dark, the market keeps
-printing. Some of those prints are at prices we would have been happy with,
-most are not. `vvalid` accumulates across the whole time the child was live and
-counts **only the prints at or through that child's own limit price** — buy
-side, everything at or below our limit; sell side, at or above.
+There is a better measure, and it is worth knowing it exists. `work_list`
+carries `vvalid` and `vvalida`: the volume that printed **at or through that
+child's own limit price**, accumulated across the whole time the child rested
+(`exst.q`, `mktst1a`). That matters because dividing fills by total volume
+punishes a venue whenever the stock traded heavily at prices we would never
+have paid. `vvalid` asks instead: *of the volume I would have taken, how much
+did I get?* `cleandirty.q` — the desk's own SHADOW-only query — uses
+`make % vvalida` as its effective fill rate.
 
-That matters because dividing fills by total volume punishes a venue whenever
-the stock traded heavily at prices we would never have paid. Dividing by
-`vvalid` asks the fair question: *of the volume I would have taken, how much
-did I get?*
-
-`vvalida` is the same calculation measured up to the order's last fill instead
-of to the end of its life. It is the one `cleandirty.q` — the desk's own
-SHADOW-only query — uses for its effective fill rate.
-
-### Two cautions on these numbers
-
-**`vvalid` double counts when children overlap.** It is summed across a
-parent's children, and when two children rest in two venues at the same time,
-the same market prints are counted once for each. Read it as a scale, not as a
-quantity that reconciles against the tape.
-
-**`adv1t_last` on today is a partial volume.** The day is not finished, so the
-reading is whatever had traded by then. Only pass completed days.
+It is not here because **`work_list` is on the EXST server, not the order
+server**. Reaching it costs a second handle, a second round trip, and the
+single-lambda shape every other query in this repo has. If the effective fill
+rate becomes the question, that is the change to make, and `cleandirty.q` is
+the model for it.
 
 ## shares_routed counts the same shares many times
 
@@ -196,13 +178,9 @@ rejections are often the finding. The chain-collapse logic lives in
 | `target` | order | `algo`, to find the SHADOW parents |
 | `workorder` | order | the child orders — size, make, venue, state, times |
 | `VENUEMAP` | order | `category`, the venue classification |
-| `work_list` | stats | `vvalid`, `vvalida` |
 
-`work_list` living on a different server is why the script carries two
-handles, `.shd.hw` and `.shd.hs`, rather than running as one lambda on the
-order server. `cleandirty.q` splits the same way, for the same reason. A
-handle of `0` means "the server I am already talking to", which is why the
-QStudio case needs only one of them set.
+Everything is on the order server, so `shadowDark` goes out as one lambda
+and needs no handle at all.
 
 ## One trap worth writing down
 
