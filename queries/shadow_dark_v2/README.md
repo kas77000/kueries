@@ -31,7 +31,7 @@ sides and splits them by `VENUEMAP.category`.
 
 | column | meaning |
 | --- | --- |
-| `targets` | SHADOW parent orders in the period |
+| `targets` | SHADOW parent orders in the period that passed `.shd.minExecPct` |
 | `target_qty` | their own quantity, summed — the shares we were actually asked to trade |
 | `children` | child orders those parents produced, lit and dark |
 | `routed_dark` | `size` summed over the dark children |
@@ -44,6 +44,35 @@ sides and splits them by `VENUEMAP.category`.
 | `shares_in_dark` | peak shares resting in dark venues, per parent, summed |
 | `mkt_volume` | market volume in those names while we were dark — see below |
 | `dark_pct_vol` | `exec_dark % mkt_volume` — our dark share of the tape |
+
+## Orders that actually traded: `.shd.minExecPct`
+
+```q
+.shd.minExecPct:0.10;   / keep parents that filled at least 10% of their size
+.shd.minExecPct:0;      / off - every parent with a child that reached a venue
+```
+
+Applied per **parent**, against `(exec_dark + exec_lit) % target_qty` — lit and
+dark fills together, because this is a question about the order, not about a
+venue. A parent that fails it is removed whole: its children stop counting
+towards `routed_dark`, `routed_lit`, `children`, `shares_in_dark` and
+`mkt_volume`, not just towards the execution columns.
+
+It exists because a SHADOW parent that traded 0.4% of itself is mostly a record
+of *attempts*. Its children inflate `routed_dark` and drag `dark_pct_exec` down
+without saying much about how the dark venues behaved when we were really
+trading. At 10% the surviving rows are orders the desk actually worked.
+
+`targets` in the result counts the parents that **passed**. To see how many
+were dropped, run once with `.shd.minExecPct:0` and compare.
+
+Two things to keep in mind when quoting a filtered number:
+
+- It is a **survivorship-biased** view by construction. `dark_pct_exec` will
+  rise, because the orders that never filled are exactly the ones removed. That
+  is the point of the filter, but it means the figure answers "when SHADOW
+  traded, how did the dark do" and not "how does SHADOW do".
+- A parent still working at the end of the period is judged on a partial day.
 
 ## Which venues count as dark: `.shd.darkCategories`
 
@@ -71,8 +100,7 @@ in `routed_lit`.
 
 Matched against `workorder.sym` inside the `where` clause, so the rows are
 never read rather than read and thrown away. Children carry their parent's
-`sym`, so filtering the children is the same as filtering the targets — and
-`targets` in the result counts only parents that have a child in scope.
+`sym`, so filtering the children is the same as filtering the targets.
 
 ## Choosing the rows: `.shd.groupBy`
 

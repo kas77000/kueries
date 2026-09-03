@@ -11,6 +11,10 @@
 / Which stocks.  "*.JP" = Japan, "*.HK" = Hong Kong, "*" = everything.
 .shd.symLike:"*.JP";
 
+/ Drop parents that filled less than this share of their own quantity.  0 = off.
+/ Lit and dark fills count together - it is about the order, not the venue.
+.shd.minExecPct:0.10;
+
 / Rows in the result.  () = one row for the whole period, `sym = per stock,
 / `date = per day, `date`sym = both.
 .shd.groupBy:`symbol$();
@@ -68,6 +72,10 @@ shadowDarkPeriod:{[d0;d1]
       exec_dark:sum make*dark,
       exec_lit:sum make*not dark
     by date,id_server,id_target,sym from w;
+  / the order has to have actually traded - everything below counts only these
+  if[.shd.minExecPct>0;
+    p:select from p
+      where target_qty>0, .shd.minExecPct<=(exec_dark+exec_lit)%target_qty];
   / peak and adv1t come from the dark children alone, and need a duration
   d:select from w where dark, t_off_market>0;
   pd:`date`id_server`id_target`sym xkey 0!select
