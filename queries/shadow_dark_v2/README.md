@@ -41,8 +41,13 @@ sides and splits them by `VENUEMAP.category`.
 | `exec_lit` | `make` summed over the lit children |
 | **`dark_pct_traded`** | `exec_dark % (exec_dark + exec_lit)` — **share of what we actually traded that was dark** |
 | **`dark_pct_exec`** | `exec_dark % routed_dark` — **fill rate on what we sent to the dark** |
+| `notional_ord_usd` | what we were asked to trade, in USD — see [below](#the-notional-columns) |
+| `notional_dark_usd` | executed in dark venues, in USD |
+| `notional_lit_usd` | executed in lit venues, in USD |
+| **`dark_pct_notl`** | `notional_dark_usd % (notional_dark_usd + notional_lit_usd)` — the dark share **weighted by money, not shares** |
 | `shares_in_dark` | peak shares resting in dark venues, per parent, summed |
 | `mkt_volume` | market volume in those names while we were dark — see below |
+| `mkt_vol_mult` | `mkt_volume % target_qty` — how many times the order's own size traded past us |
 | `dark_pct_vol` | `exec_dark % mkt_volume` — our dark share of the tape |
 
 ## Orders that actually traded: `.shd.minExecPct`
@@ -189,12 +194,60 @@ Two caveats worth stating to anyone who quotes the number:
 `dark_pct_vol` divides `exec_dark` by it: our dark executions as a share of
 everything that traded. Small numbers are normal.
 
+## The notional columns
+
+All three are **USD**, so they add up across markets. `target_stock.fxlast`
+converts local currency to USD, the same way `dark_summary.q` does it.
+
+| column | how |
+| --- | --- |
+| `notional_ord_usd` | `target_qty * px_arr * fxlast` |
+| `notional_dark_usd` | `sum make * avg_fill_price` over dark children, `* fxlast` |
+| `notional_lit_usd` | the same over lit children |
+
+`px_arr` is the **arrival price**: `transmit_lastprice` on the parent's first
+child — the last trade at the moment we first went on market — falling back to
+`price`, the price the child was sent with, when that is missing. `target` has
+no arrival price of its own and its `limit_price` is a limit rather than a
+valuation, so the first child is the closest the schema gets to "what the order
+was worth when we got it".
+
+Executions are valued at what they actually filled at (`avg_fill_price`), not
+at arrival, so `notional_dark_usd + notional_lit_usd` against
+`notional_ord_usd` carries the price drift as well as the fill rate. It is a
+value ratio, not a completion ratio — use `exec_dark + exec_lit` against
+`target_qty` for completion.
+
+**`dark_pct_notl` is the one to prefer over `dark_pct_traded` when the rows
+span many stocks.** `dark_pct_traded` counts shares, so a 10,000-share fill in
+a ¥400 stock weighs the same as one in a ¥40,000 stock. Weighted by money, the
+two are 100x apart. On a single-stock row they say the same thing.
+
+If `fxlast` is missing for a parent, that parent contributes nothing to the
+notional columns and still contributes to the share columns — the shortfall is
+silent. It should not happen: `target_stock` carries one row per parent.
+
+## How much liquidity went past: `mkt_vol_mult`
+
+`mkt_volume % target_qty`. If the order was 300,000 shares and 6,000,000 traded
+in the name while we were in the dark, it reads **20** — twenty times the order
+went past us, and we caught whatever `dark_pct_vol` says.
+
+Read the two together. A low `dark_pct_exec` with a **high** `mkt_vol_mult`
+means the liquidity was there and we did not get it. The same fill rate with a
+**low** `mkt_vol_mult` means there was nothing to get, and the algo is not the
+problem — the size is too big for the name.
+
+It inherits `mkt_volume`'s caveats below: all volume rather than lit-only, and
+a reading rather than a period total.
+
 ## Where the data comes from
 
 | table | server | what we take |
 | --- | --- | --- |
 | `target` | order | `algo` to find the SHADOW parents, `size` for `target_qty` |
-| `workorder` | order | the children — size, make, venue, state, times, `onmkt_adv1t` |
+| `workorder` | order | the children — size, make, venue, state, times, prices, `onmkt_adv1t` |
+| `target_stock` | order | `fxlast`, local currency to USD |
 | `VENUEMAP` | order | `category`, the venue classification |
 
 Everything is on the order server, so `shadowDarkPeriod` goes out as one lambda

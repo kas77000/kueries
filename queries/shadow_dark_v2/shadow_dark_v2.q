@@ -36,7 +36,8 @@
 .shd.peak:{[on;off;sz]
   (max sz) | max sums exec d from `t`d xasc ([]t:on,off; d:sz,neg sz)};
 
-.shd.pct:{[a;b] ?[b>0; 0.01*"j"$1e4*a%b; 0n]};
+.shd.pct:{[a;b] ?[b>0; 0.01*"j"$1e4*a%b; 0n]};       / percent, 2dp
+.shd.mult:{[a;b] ?[b>0; 0.01*"j"$100*a%b; 0n]};      / multiple, 2dp
 
 / sum every non-key column, whatever the chosen grain
 .shd.roll:{[t;g] c:cols[t] except g;
@@ -53,6 +54,7 @@ shadowDarkPeriod:{[d0;d1]
   / t_on_market>0 drops the children that never reached a venue, lit or dark
   w:select date,time,id_server,id_target,sym,venue,state,
       size:"j"$size, make:"j"$make, onmkt_adv1t:"j"$onmkt_adv1t,
+      avg_fill_price:0f^avg_fill_price, price, transmit_lastprice,
       t_on_market,t_off_market
     from workorder
     where date within (d0;d1), t_on_market>0, sym like .shd.symLike;
@@ -64,18 +66,31 @@ shadowDarkPeriod:{[d0;d1]
     w:update killreason:{`$last ":" vs string x} each lower state from w;
     w:select from w where (make>0) or killreason in .shd.keepReasons];
   / one row per parent: the lit/dark split of its own children
+  / px_arr: last trade when we first went on market, falling back to the price
+  / the child was sent with.  w is time sorted, so first IS the earliest child.
   p:0!select
       target_qty:first target_size,
+      px_arr:first ?[transmit_lastprice>0; transmit_lastprice; price],
       children:count i,
       routed_dark:sum size*dark,
       routed_lit:sum size*not dark,
       exec_dark:sum make*dark,
-      exec_lit:sum make*not dark
+      exec_lit:sum make*not dark,
+      notl_dark:sum (make*dark)*avg_fill_price,
+      notl_lit:sum (make*not dark)*avg_fill_price
     by date,id_server,id_target,sym from w;
   / the order has to have actually traded - everything below counts only these
   if[.shd.minExecPct>0;
     p:select from p
       where target_qty>0, .shd.minExecPct<=(exec_dark+exec_lit)%target_qty];
+  / fxlast is local -> USD, which is what lets notionals add up across markets
+  ids:exec distinct id_target from p;
+  p:p lj `date`id_server`id_target xkey select date,id_server,id_target,fxlast
+    from target_stock where date within (d0;d1), id_target in ids;
+  p:update notional_ord:target_qty*px_arr*fxlast,
+      notional_dark:notl_dark*fxlast,
+      notional_lit:notl_lit*fxlast
+    from p;
   / peak and adv1t come from the dark children alone, and need a duration
   d:select from w where dark, t_off_market>0;
   pd:`date`id_server`id_target`sym xkey 0!select
@@ -88,6 +103,9 @@ shadowDarkPeriod:{[d0;d1]
       targets:count i, target_qty:sum target_qty, children:sum children,
       routed_dark:sum routed_dark, routed_lit:sum routed_lit,
       exec_dark:sum exec_dark, exec_lit:sum exec_lit,
+      notional_ord_usd:"j"$sum notional_ord,
+      notional_dark_usd:"j"$sum notional_dark,
+      notional_lit_usd:"j"$sum notional_lit,
       shares_in_dark:sum shares_in_dark,
       mkt_volume:max adv1t
     by date,sym from p;
@@ -97,11 +115,14 @@ shadowDarkPeriod:{[d0;d1]
       dark_pct_routed:.shd.pct[routed_dark;routed_dark+routed_lit],
       dark_pct_traded:.shd.pct[exec_dark;exec_dark+exec_lit],
       dark_pct_exec:.shd.pct[exec_dark;routed_dark],
-      dark_pct_vol:.shd.pct[exec_dark;mkt_volume]
+      dark_pct_notl:.shd.pct[notional_dark_usd;notional_dark_usd+notional_lit_usd],
+      dark_pct_vol:.shd.pct[exec_dark;mkt_volume],
+      mkt_vol_mult:.shd.mult[mkt_volume;target_qty]
     from s;
   s:(g,`targets`target_qty`children`routed_dark`routed_lit`dark_pct_routed,
      `exec_dark`exec_lit`dark_pct_traded`dark_pct_exec,
-     `shares_in_dark`mkt_volume`dark_pct_vol) xcols s;
+     `notional_ord_usd`notional_dark_usd`notional_lit_usd`dark_pct_notl,
+     `shares_in_dark`mkt_volume`mkt_vol_mult`dark_pct_vol) xcols s;
   $[`date in g; `date xasc s; count g; `routed_dark xdesc s; s]
  };
 
