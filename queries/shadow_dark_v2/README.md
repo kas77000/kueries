@@ -45,6 +45,22 @@ sides and splits them by `VENUEMAP.category`.
 | `mkt_volume` | market volume in those names while we were dark — see below |
 | `dark_pct_vol` | `exec_dark % mkt_volume` — our dark share of the tape |
 
+## Which venues count as dark: `.shd.darkCategories`
+
+```q
+.shd.darkCategories:`Dark;   / dark pools only
+```
+
+`Pmid` — midpoint-pegged, non-displayed — is **not** in the default. The engine
+classifies PMID as lit-but-hidden (`AggressionLevel.isLit()` returns true for
+it) and `grey_include_pmid` defaults to `0` outside EU, so for Asia the engine
+itself does not count it as dark. The full argument, and the two wider sets
+(`` `Dark`Pmid `` and `` `Dark`Pmid`PostBlind ``), are in
+[`../shadow_dark/README.md`](../shadow_dark/README.md#why-pmid-is-not-in-the-default).
+
+Changing this moves the split twice: a pmid child leaving `routed_dark` lands
+in `routed_lit`.
+
 ## Which stocks: `.shd.symLike`
 
 ```q
@@ -161,9 +177,9 @@ never acked, never transmitted — on both the lit and the dark side.
 
 ## A first run, and one trap it caught
 
-A month of SHADOW flow, single row, `.shd.groupBy` empty. This was run
-**before** `.shd.symLike` existed, so it is every region, not Japan — the
-shape of the answer is the point, not the figures:
+A month of SHADOW flow, single row, `.shd.groupBy` empty. It predates both
+`.shd.symLike` and the removal of `Pmid`, so it is every region and it counts
+midpoint as dark — the shape of the answer is the point, not the figures:
 
 | | |
 | --- | ---: |

@@ -53,7 +53,7 @@ Everything this query judges is the three settings at the top of
 ### `.shd.darkCategories` — which venues are dark
 
 ```q
-.shd.darkCategories:`Dark`Pmid;
+.shd.darkCategories:`Dark;
 ```
 
 Venues are classified by **`VENUEMAP`**, a reference table on the order server
@@ -72,10 +72,44 @@ wrong in two ways:
   rewriting `LEHM-DARK` to `BCAP-DARK`, and there is a whole `VENUERENAME`
   table. A name test bakes in today's names; a category survives the rename.
 
-Set it to `` `Dark `` alone to count only true dark pools and exclude midpoint.
-The desk goes both ways depending on the question — `darktoxic.q` uses
-`` `Dark`Pmid ``, `cleandirty.q` uses `` `Dark `` — so this is a real choice,
-and the point of putting it in a setting is that it is now made deliberately.
+### Why `Pmid` is not in the default
+
+`Pmid` is midpoint-pegged, non-displayed liquidity — the desk's venue table
+calls the type "MidPoint Pegged". It looks like dark: no quote shown, price
+pegged to the mid, wait for a counterparty. But it is usually a midpoint *order
+type on a lit venue*, not a dark pool, and the engine classifies it that way:
+
+```java
+// AggressionLevel.java
+public boolean isLit() {
+    return !(this == BLOCK || this == DARK || this == CROSS || this == DARKPING
+          || this == DARKTAKE || this == IOI || this == M2HIOI || this == TAL);
+}
+public boolean isHidden() { return this == PMID || this == MID_PING || this == POSTBLIND; }
+```
+
+PMID is absent from the `isLit` exclusion list, so `isLit()` returns **true**
+for it. It is *hidden*, not *dark*. `ExchangeMaster.isGreyVenue` counts pmid
+only when `grey_include_pmid` is set, and that defaults to `1` for EU and `0`
+everywhere else — so for Asia the engine itself does not treat pmid as dark.
+`cleandirty.q`, the desk's SHADOW-only query, uses `` `Dark `` alone.
+
+The argument the other way is real, which is why this is a setting: the venue
+score table SHADOW uses defaults to `` `Dark`Pmid `` (`AlgoConfig.java`),
+`blp_lib.q` measures venue performance over `` `Pmid`Dark ``, and one venue
+mapping script rewrites pmid to Dark outright. Routing code has a dedicated
+`isPmidOrDark()` test.
+
+Two other sets worth knowing:
+
+| setting | question it answers |
+| --- | --- |
+| `` `Dark `` | dark pools only — the default, and the defensible one in Asia |
+| `` `Dark`Pmid `` | dark pools plus midpoint |
+| `` `Dark`Pmid`PostBlind `` | all non-displayed liquidity — `POSTBLIND` is in the same `isHidden()` list |
+
+Note the number moves twice when you change this: a pmid child leaving
+`routed_dark` lands in `routed_lit`.
 
 ### `.shd.minRestMs` — how long a child had to sit
 

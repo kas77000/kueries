@@ -7,7 +7,9 @@
 
 / ---- CONFIG ---------------------------------------------------------------
 
-.shd.darkCategories:`Dark`Pmid;   / VENUEMAP category.  `Dark alone drops midpoint
+/ VENUEMAP category.  `Dark alone: the engine calls PMID lit, not dark, and
+/ grey_include_pmid is 0 outside EU.  Add `Pmid back for all hidden liquidity.
+.shd.darkCategories:`Dark;
 
 / Minimum time on market, in MILLISECONDS.  0 = off, 600000 = 10 min.  Applies
 / to every child, filled or not.  Off by default: routed is meant to show the

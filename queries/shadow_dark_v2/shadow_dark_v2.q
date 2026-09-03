@@ -15,7 +15,9 @@
 / `date = per day, `date`sym = both.
 .shd.groupBy:`symbol$();
 
-.shd.darkCategories:`Dark`Pmid;   / VENUEMAP category.  `Dark alone drops midpoint
+/ VENUEMAP category.  `Dark alone: the engine calls PMID lit, not dark, and
+/ grey_include_pmid is 0 outside EU.  Add `Pmid back for all hidden liquidity.
+.shd.darkCategories:`Dark;
 
 / 1b drops cancels that were the parent moving rather than a venue decision -
 / applied to lit as well, so the split stays like-for-like.  0b (default) counts
