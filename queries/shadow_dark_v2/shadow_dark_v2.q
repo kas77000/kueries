@@ -37,11 +37,14 @@ shadowDarkPeriod:{[d0;d1]
   if[not `VENUEMAP in key `.; '"VENUEMAP not here - not the order server"];
   g:(),.shd.groupBy;
   tg:`date`id_server`id_target xkey select date,id_server,id_target,algo,
-      target_size:size
+      target_size:"j"$size
     from target where date within (d0;d1), (upper algo)=`SHADOW;
+  / "j"$ is not cosmetic - size and make are 32-bit ints and sum wraps at 2^31,
+  / which over a month turns routed_dark negative
   / t_on_market>0 drops the children that never reached a venue, lit or dark
-  w:select date,time,id_server,id_target,sym,venue,state,size,make,
-      onmkt_adv1t,t_on_market,t_off_market
+  w:select date,time,id_server,id_target,sym,venue,state,
+      size:"j"$size, make:"j"$make, onmkt_adv1t:"j"$onmkt_adv1t,
+      t_on_market,t_off_market
     from workorder
     where date within (d0;d1), t_on_market>0;
   w:w lj `venue xkey select venue,category from VENUEMAP;
@@ -79,11 +82,13 @@ shadowDarkPeriod:{[d0;d1]
   s:.shd.roll[b;g];
   s:update
       dark_pct_routed:.shd.pct[routed_dark;routed_dark+routed_lit],
+      dark_pct_traded:.shd.pct[exec_dark;exec_dark+exec_lit],
       dark_pct_exec:.shd.pct[exec_dark;routed_dark],
       dark_pct_vol:.shd.pct[exec_dark;mkt_volume]
     from s;
   s:(g,`targets`target_qty`children`routed_dark`routed_lit`dark_pct_routed,
-     `exec_dark`dark_pct_exec`exec_lit`shares_in_dark`mkt_volume`dark_pct_vol) xcols s;
+     `exec_dark`exec_lit`dark_pct_traded`dark_pct_exec,
+     `shares_in_dark`mkt_volume`dark_pct_vol) xcols s;
   $[`date in g; `date xasc s; count g; `routed_dark xdesc s; s]
  };
 

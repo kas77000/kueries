@@ -32,11 +32,13 @@ shadowDark:{[d0;d1]
   if[not `VENUEMAP in key `.; '"VENUEMAP not here - not the order server"];
   / target_size, not size - workorder has a size column of its own
   tg:`date`id_server`id_target xkey select date,id_server,id_target,algo,
-      target_size:size
+      target_size:"j"$size
     from target where date within (d0;d1), (upper algo)=`SHADOW;
+  / "j"$ - size and make are 32-bit ints, and sum over ints wraps at 2^31
   / t_on_market>0 drops the children that never reached a venue
-  w:select date,time,id_server,id_target,sym,venue,state,size,make,
-      onmkt_adv1t,t_on_market,t_off_market
+  w:select date,time,id_server,id_target,sym,venue,state,
+      size:"j"$size, make:"j"$make, onmkt_adv1t:"j"$onmkt_adv1t,
+      t_on_market,t_off_market
     from workorder
     where date within (d0;d1), t_on_market>0;
   w:w lj `venue xkey select venue,category from VENUEMAP;

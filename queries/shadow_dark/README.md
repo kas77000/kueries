@@ -236,6 +236,12 @@ Anyone reaching for that column to find price chases will be filtering on
 minimum fill size and getting a plausible-looking, meaningless answer. The kill
 reason in `state` is the only place a chase is recorded.
 
+**`size` and `make` are 32-bit ints.** q's `sum` over an int vector returns an
+int, so a total past 2,147,483,647 wraps round to a negative number rather than
+erroring. Per parent order nothing here comes close, but the period version of
+this query hit it in a month of flow, so both scripts now cast with `"j"$` in
+the source select and every sum downstream is 64-bit.
+
 ## Status
 
 Written against the schemas in `no_git/kdb` and the desk's own queries. **Not

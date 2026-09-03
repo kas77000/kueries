@@ -38,8 +38,9 @@ sides and splits them by `VENUEMAP.category`.
 | `routed_lit` | `size` summed over the lit children |
 | **`dark_pct_routed`** | `routed_dark % (routed_dark + routed_lit)` — **share of routing that went dark** |
 | `exec_dark` | `make` summed over the dark children |
+| `exec_lit` | `make` summed over the lit children |
+| **`dark_pct_traded`** | `exec_dark % (exec_dark + exec_lit)` — **share of what we actually traded that was dark** |
 | **`dark_pct_exec`** | `exec_dark % routed_dark` — **fill rate on what we sent to the dark** |
-| `exec_lit` | `make` summed over the lit children, for comparison |
 | `shares_in_dark` | peak shares resting in dark venues, per parent, summed |
 | `mkt_volume` | market volume in those names while we were dark — see below |
 | `dark_pct_vol` | `exec_dark % mkt_volume` — our dark share of the tape |
@@ -77,7 +78,17 @@ was genuinely exposed to dark liquidity; `routed_dark % shares_in_dark` says how
 many times over we re-sent it to get there.
 
 Because the two sides churn at different rates, `dark_pct_routed` overstates
-whichever side rotates harder — normally the dark side. Set
+whichever side rotates harder, and that is always the dark side. On a month of
+real flow it reads **99.9%** — not because SHADOW barely touches lit, but
+because a dark child is re-sent about twelve times and a lit child is not.
+
+`dark_pct_traded` is the same question asked of executions instead of sends:
+each fill is counted once, whatever it took to get it, so no rotation can
+inflate it. On that same month it reads **90.2%**. Quote `dark_pct_traded` when
+someone asks "how much of our SHADOW flow is dark"; quote `dark_pct_routed`
+when the question is about where the algo spends its messages.
+
+Set
 `.shd.keepFilter:1b` to drop the cancels that were the parent moving rather
 than a venue decision, applied to lit and dark alike so the comparison stays
 like-for-like; the reason list is documented in
@@ -135,8 +146,49 @@ and needs no handle.
 `t_on_market > 0` excludes children that never reached a venue — rejected,
 never acked, never transmitted — on both the lit and the dark side.
 
+## A first run, and one trap it caught
+
+A month of SHADOW flow, single row, `.shd.groupBy` empty:
+
+| | |
+| --- | ---: |
+| `targets` | 665 |
+| `target_qty` | 394,759,809 |
+| `children` | 61,165 |
+| `routed_dark` | 4,092,054,048 |
+| `routed_lit` | 4,968,913 |
+| `dark_pct_routed` | 99.88% |
+| `exec_dark` | 33,076,624 |
+| `exec_lit` | 3,574,113 |
+| `dark_pct_traded` | 90.25% |
+| `dark_pct_exec` | 0.81% |
+| `shares_in_dark` | 326,146,641 |
+| `mkt_volume` | 966,999,981 |
+| `dark_pct_vol` | 3.42% |
+
+Read as: **83% of the book was genuinely resting in dark pools**
+(`shares_in_dark % target_qty`), re-sent about **12.5 times over**
+(`routed_dark % shares_in_dark`), and **90% of everything we traded came from
+the dark**. The 0.81% `dark_pct_exec` is a fill rate against that inflated
+denominator — it is per *send*, not per share, and the twelve rotations are
+what make it small.
+
+**`size` and `make` are 32-bit ints, and q's `sum` over an int vector returns
+an int.** The first run of this query returned `routed_dark` as
+−202,913,248 — the true 4,092,054,048 wrapped at 2³² — which then silenced
+`dark_pct_routed` and `dark_pct_exec`, because `.shd.pct` guards on a positive
+denominator. Both scripts now cast with `"j"$` in the source select, so every
+sum downstream is 64-bit. Per-order totals in v1 never came near the limit;
+a period aggregate crosses it in a few days.
+
+Worth a second look on your own data: `routed_lit` is only 1.3% of
+`target_qty`. Either SHADOW really does put almost everything in the dark, or
+some of its lit trading is routed under a different parent and never appears as
+a child of the SHADOW `id_target`. `dark_pct_traded` would be overstated if the
+second is true.
+
 ## Status
 
-Written against the schemas in `no_git/kdb` and the desk's own queries. **Not
-yet run.** The first live run is the test — particularly `.shd.roll`, the
-functional aggregation that makes `.shd.groupBy` work, and the `VENUEMAP` join.
+Run over a month on the order server. `.shd.roll` and the `VENUEMAP` join both
+behave; the `.shd.groupBy` grains other than the default have not been
+exercised yet.
