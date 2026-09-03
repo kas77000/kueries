@@ -45,6 +45,19 @@ sides and splits them by `VENUEMAP.category`.
 | `mkt_volume` | market volume in those names while we were dark — see below |
 | `dark_pct_vol` | `exec_dark % mkt_volume` — our dark share of the tape |
 
+## Which stocks: `.shd.symLike`
+
+```q
+.shd.symLike:"*.JP";      / Japan - the default
+.shd.symLike:"*.HK";      / Hong Kong
+.shd.symLike:"*";         / everything
+```
+
+Matched against `workorder.sym` inside the `where` clause, so the rows are
+never read rather than read and thrown away. Children carry their parent's
+`sym`, so filtering the children is the same as filtering the targets — and
+`targets` in the result counts only parents that have a child in scope.
+
 ## Choosing the rows: `.shd.groupBy`
 
 ```q
@@ -148,7 +161,9 @@ never acked, never transmitted — on both the lit and the dark side.
 
 ## A first run, and one trap it caught
 
-A month of SHADOW flow, single row, `.shd.groupBy` empty:
+A month of SHADOW flow, single row, `.shd.groupBy` empty. This was run
+**before** `.shd.symLike` existed, so it is every region, not Japan — the
+shape of the answer is the point, not the figures:
 
 | | |
 | --- | ---: |

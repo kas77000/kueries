@@ -8,6 +8,9 @@
 
 / ---- CONFIG ---------------------------------------------------------------
 
+/ Which stocks.  "*.JP" = Japan, "*.HK" = Hong Kong, "*" = everything.
+.shd.symLike:"*.JP";
+
 / Rows in the result.  () = one row for the whole period, `sym = per stock,
 / `date = per day, `date`sym = both.
 .shd.groupBy:`symbol$();
@@ -46,7 +49,7 @@ shadowDarkPeriod:{[d0;d1]
       size:"j"$size, make:"j"$make, onmkt_adv1t:"j"$onmkt_adv1t,
       t_on_market,t_off_market
     from workorder
-    where date within (d0;d1), t_on_market>0;
+    where date within (d0;d1), t_on_market>0, sym like .shd.symLike;
   w:w lj `venue xkey select venue,category from VENUEMAP;
   / ij, not lj - a child whose parent is not SHADOW drops out
   w:`date`time xasc (w ij tg);
