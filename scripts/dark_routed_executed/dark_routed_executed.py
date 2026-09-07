@@ -10,6 +10,10 @@ venue, and the two pie charts the report draws from it.
   Executed %    share of dark notional that came BACK from each venue
   Fill Rate     executed / routed, money weighted, per venue
 
+--volume measures all three in SHARES instead, and the pies with them.  Shares
+are not fx converted and a share is not the same quantity in every market, so
+--volume belongs with a --country.
+
 The gap between the two is the point.  A venue taking 47% of the flow and
 returning 88% of the fills is a different venue from one doing 6% and 4%, and
 that is exactly what the two pies side by side show.
@@ -59,6 +63,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+from collections import namedtuple
 import sys
 import time
 from pathlib import Path
@@ -510,35 +515,57 @@ def _safe_div(a, b):
 
 # -----------------------------------------------------------------------------
 # The table
+#
+# TWO WAYS TO MEASURE THE SAME FLOW, and a report uses one of them throughout.
+# Every percentage, the fill rate, the sort, the totals line and both pies read
+# their columns off ONE Basis, so there is no path where half the report is
+# money and half is shares.
+#
+# Shares are NOT fx converted and are not comparable across markets: a 100
+# share JP board lot and a 1 share AU order both count as their raw size.  With
+# --country that does not arise; without it, run() says so.
 # -----------------------------------------------------------------------------
 
-def build_table(acc):
-    """Routed against executed, per group.
+Basis = namedtuple("Basis", "routed executed routed_col executed_col scale suffix")
+
+NOTIONAL = Basis("Routed $m", "Executed $m",
+                 "notional_routed", "notional_executed", 1e6, "")
+VOLUME = Basis("Routed m sh", "Executed m sh",
+               "shares_routed", "shares_executed", 1e6, " (shares)")
+
+
+def build_table(acc, basis=NOTIONAL):
+    """Routed against executed, per group, measured on `basis`.
 
     Every percentage divides the ACCUMULATED totals.  Averaging daily
     percentages would weight a quiet Tuesday the same as a heavy Thursday, and
     the two answers differ by a lot more than rounding whenever the venue mix
     moves during the range."""
-    routed = acc["notional_routed"]
-    executed = acc["notional_executed"]
+    routed = acc[basis.routed_col]
+    executed = acc[basis.executed_col]
     out = pd.DataFrame(index=acc.index)
     out["Routed %"] = 100.0 * routed / routed.sum() if routed.sum() else np.nan
     out["Executed %"] = 100.0 * executed / executed.sum() if executed.sum() else np.nan
     out["Fill Rate"] = _safe_div(100.0 * executed, routed)
     out["Orders"] = acc["orders_routed"]
     out["Filled"] = acc["orders_filled"]
-    out["Routed $m"] = routed / 1e6
-    out["Executed $m"] = executed / 1e6
+    out[basis.routed] = routed / basis.scale
+    out[basis.executed] = executed / basis.scale
     out.index.name = "Venue"
     # heaviest first, the way the q sorts it
-    return out.sort_values("Routed $m", ascending=False)
+    return out.sort_values(basis.routed, ascending=False)
 
 
-TABLE_FMT = (
-    ("Routed %", "{:.1f}"), ("Executed %", "{:.1f}"), ("Fill Rate", "{:.1f}"),
-    ("Orders", "{:,.0f}"), ("Filled", "{:,.0f}"),
-    ("Routed $m", "{:,.1f}"), ("Executed $m", "{:,.1f}"),
-)
+def table_fmt(basis=NOTIONAL):
+    """Column order and the format of each cell, for `basis`."""
+    return (
+        ("Routed %", "{:.1f}"), ("Executed %", "{:.1f}"), ("Fill Rate", "{:.1f}"),
+        ("Orders", "{:,.0f}"), ("Filled", "{:,.0f}"),
+        (basis.routed, "{:,.1f}"), (basis.executed, "{:,.1f}"),
+    )
+
+
+TABLE_FMT = table_fmt(NOTIONAL)
 
 
 def format_table(t, fmt):
@@ -688,12 +715,15 @@ def office_pie(ax, rows, color_map, title, startangle):
     ax.set_ylim(-1.5, 1.5)
 
 
-def write_pies(png_path, routed_rows, executed_rows, startangle=90.0):
+def write_pies(png_path, routed_rows, executed_rows, startangle=90.0, suffix=""):
     """Both pies on one canvas, written as .png and as .pdf beside it.
 
     The .pdf is the one to put in a document - it is vector, so it stays sharp
     at any size.  matplotlib is imported here, not at module level, so the
-    script still runs and still self-tests on a machine without it."""
+    script still runs and still self-tests on a machine without it.
+
+    `suffix` goes in both titles, so a picture measured in shares says so once
+    it is out of this terminal and into a slide."""
     try:
         from matplotlib.backends.backend_agg import FigureCanvasAgg
         from matplotlib.figure import Figure
@@ -710,8 +740,8 @@ def write_pies(png_path, routed_rows, executed_rows, startangle=90.0):
     axes = fig.axes
 
     color_map = build_color_map(routed_rows, executed_rows)
-    office_pie(axes[0], routed_rows, color_map, "Routed %", startangle)
-    office_pie(axes[1], executed_rows, color_map, "Executed %", startangle)
+    office_pie(axes[0], routed_rows, color_map, "Routed %" + suffix, startangle)
+    office_pie(axes[1], executed_rows, color_map, "Executed %" + suffix, startangle)
     fig.subplots_adjust(left=0.02, right=0.98, top=0.90, bottom=0.04)
 
     import os
@@ -855,12 +885,21 @@ def run(args):
             + (f", and {n_failed} date(s) errored - see above" if n_failed else "")
             + "\nrun the same command with --diagnose to see which filter empties it.")
 
-    table = build_table(acc)
+    basis = VOLUME if args.volume else NOTIONAL
+    table = build_table(acc, basis)
     routed_rows = pie_series(table["Routed %"], args.other_below)
     executed_rows = pie_series(table["Executed %"], args.other_below)
 
     print(f"\nDark routed vs executed {args.start} to {args.end}"
-          + (f", country {args.country}" if args.country else ""))
+          + (f", country {args.country}" if args.country else "")
+          + (", measured in SHARES" if args.volume else ""))
+    # raw sizes summed across markets: a JP board lot and a single AU share
+    # both count as their size, so the market mix decides the answer as much
+    # as the flow does.  Money has no such problem, and neither does one market.
+    if args.volume and not args.country:
+        print("\n  --volume with no --country adds share counts across markets, "
+              "and a share is not\n  the same quantity in each.  Add --country "
+              "to compare venues within one market.")
     if unmapped:
         print(f"\n  {len(unmapped)} venue(s) are not in VENUE_GROUPS, so they keep "
               f"their raw kdb name below.\n  Add them to the sheet near the top "
@@ -868,10 +907,11 @@ def run(args):
         for c, v in sorted(unmapped):
             print(f'    ("{c}", "{v}"):')
     print()
-    print(format_table(table, TABLE_FMT).to_string())
-    print(f"\n  Routed $m {table['Routed $m'].sum():,.1f}   "
-          f"Executed $m {table['Executed $m'].sum():,.1f}   "
-          f"overall fill rate {100.0 * acc['notional_executed'].sum() / acc['notional_routed'].sum():.1f}%")
+    print(format_table(table, table_fmt(basis)).to_string())
+    print(f"\n  {basis.routed} {table[basis.routed].sum():,.1f}   "
+          f"{basis.executed} {table[basis.executed].sum():,.1f}   "
+          f"overall fill rate "
+          f"{100.0 * acc[basis.executed_col].sum() / acc[basis.routed_col].sum():.1f}%")
     print(f"\nPie slices, anything under {args.other_below:g}% rolled into {OTHER}\n")
     for title, rows in (("Routed %", routed_rows), ("Executed %", executed_rows)):
         print(f"  {title}: " + ", ".join(f"{n},{v:g}" for n, v in rows))
@@ -889,7 +929,8 @@ def run(args):
             written.append(p)
         if not args.no_pies:
             written.extend(write_pies(os.path.join(args.out_dir, "pies.png"),
-                                      routed_rows, executed_rows))
+                                      routed_rows, executed_rows,
+                                      suffix=basis.suffix))
         print()
         for p in written:
             print(f"written to {p}")
@@ -905,6 +946,11 @@ def main(argv=None):
     p.add_argument("--country", default="",
                    help="market, matched against the sym suffix: AU for *.AU, "
                         "JP for *.JP. Case insensitive; blank for all")
+    p.add_argument("--volume", action="store_true",
+                   help="measure in SHARES rather than USD notional: the "
+                        "percentages, the fill rate and both pies come off "
+                        "shares routed and executed.  Not comparable across "
+                        "markets, so pair it with --country")
     p.add_argument("--other-below", type=float, default=3.0,
                    help="pie slices under this percentage roll into one Other "
                         "slice; 0 keeps every venue as its own slice")
@@ -1112,6 +1158,99 @@ def test_fill_rate_is_money_weighted():
     # a venue that routed nothing valuable gets a blank, not an infinity
     zero = roll.assign(notional_routed=[0.0])
     assert pd.isna(build_table(aggregate(zero)).loc["MS Pool", "Fill Rate"])
+
+
+def test_volume_measures_shares_not_money():
+    """--volume must divide the SHARE totals, not the notional ones.
+
+    The two venues here are built to invert: on shares ONE routed 90% and
+    executed 10%, on money it is the other way round.  A basis that leaked
+    would land on a number from the wrong column and be caught."""
+    roll = pd.DataFrame({
+        "venue": ["ONE_DARK", "TWO_DARK"], "country": ["ZZ", "ZZ"],
+        "orders_routed": [10.0, 10.0], "orders_filled": [5.0, 5.0],
+        "shares_routed": [900.0, 100.0], "shares_executed": [100.0, 900.0],
+        "notional_routed": [100.0, 900.0], "notional_executed": [90.0, 10.0]})
+    acc = aggregate(roll)
+
+    vol = build_table(acc, VOLUME)
+    assert abs(vol.loc["ONE_DARK", "Routed %"] - 90.0) < 1e-12
+    assert abs(vol.loc["ONE_DARK", "Executed %"] - 10.0) < 1e-12
+    assert abs(vol.loc["TWO_DARK", "Routed %"] - 10.0) < 1e-12
+
+    money = build_table(acc, NOTIONAL)
+    assert abs(money.loc["ONE_DARK", "Routed %"] - 10.0) < 1e-12
+    assert abs(money.loc["ONE_DARK", "Executed %"] - 90.0) < 1e-12
+
+    # NOTIONAL is the default, so every existing caller is untouched
+    assert build_table(acc).equals(money)
+
+    # heaviest first is heaviest ON THIS BASIS, so the sort inverts too
+    assert list(vol.index) == ["ONE_DARK", "TWO_DARK"]
+    assert list(money.index) == ["TWO_DARK", "ONE_DARK"]
+
+
+def test_volume_fill_rate_is_share_weighted():
+    """Fill Rate follows the basis: executed shares over routed shares, which
+    is a different number from the money one whenever price and size disagree
+    about which orders mattered."""
+    roll = pd.DataFrame({
+        "venue": ["ONE_DARK"], "country": ["ZZ"],
+        "orders_routed": [100.0], "orders_filled": [1.0],
+        "shares_routed": [900.0], "shares_executed": [100.0],
+        "notional_routed": [100.0], "notional_executed": [90.0]})
+    acc = aggregate(roll)
+    assert abs(build_table(acc, VOLUME).loc["ONE_DARK", "Fill Rate"]
+               - 100.0 / 9.0) < 1e-12
+    assert abs(build_table(acc, NOTIONAL).loc["ONE_DARK", "Fill Rate"]
+               - 90.0) < 1e-12
+    # a venue that routed no shares gets a blank, not an infinity
+    zero = aggregate(roll.assign(shares_routed=[0.0]))
+    assert pd.isna(build_table(zero, VOLUME).loc["ONE_DARK", "Fill Rate"])
+
+
+def test_volume_names_its_own_columns():
+    """The size columns say which basis they are, and the formatter asks for
+    exactly the columns the table has - a mismatch would KeyError rather than
+    print dollars over a share count."""
+    roll = _synth_roll(["ONE_DARK", "TWO_DARK"], country="ZZ")
+    for basis, mine, theirs in ((VOLUME, "Routed m sh", "Routed $m"),
+                                (NOTIONAL, "Routed $m", "Routed m sh")):
+        t = build_table(aggregate(roll), basis)
+        assert mine in t.columns and theirs not in t.columns
+        assert list(format_table(t, table_fmt(basis)).columns) == \
+            [c for c, _ in table_fmt(basis)]
+    assert VOLUME.suffix and not NOTIONAL.suffix
+
+
+def test_volume_survives_a_missing_fx():
+    """target_stock not covering a date nulls both notionals and leaves the
+    share counts standing - which is the one case where --volume reports and
+    the default cannot."""
+    roll = pd.DataFrame({
+        "venue": ["ONE_DARK", "TWO_DARK"], "country": ["ZZ", "ZZ"],
+        "orders_routed": [10.0, 10.0], "orders_filled": [5.0, 5.0],
+        "shares_routed": [750.0, 250.0], "shares_executed": [100.0, 100.0],
+        "notional_routed": [0.0, 0.0], "notional_executed": [0.0, 0.0]})
+    acc = aggregate(roll)
+    assert build_table(acc, NOTIONAL)["Routed %"].isna().all()
+    assert abs(build_table(acc, VOLUME).loc["ONE_DARK", "Routed %"] - 75.0) < 1e-12
+
+
+def test_volume_pies_are_the_volume_percentages():
+    """End to end: the slices drawn under --volume are the share shares, with
+    --other-below rolling up exactly as it does on money."""
+    roll = pd.DataFrame({
+        "venue": ["ONE_DARK", "TWO_DARK", "TINY_DARK"], "country": ["ZZ"] * 3,
+        "orders_routed": [10.0] * 3, "orders_filled": [5.0] * 3,
+        "shares_routed": [800.0, 190.0, 10.0],
+        "shares_executed": [500.0, 490.0, 10.0],
+        "notional_routed": [1.0, 1.0, 1.0], "notional_executed": [1.0, 1.0, 1.0]})
+    t = build_table(aggregate(roll), VOLUME)
+    assert pie_series(t["Routed %"], 3.0) == [("ONE_DARK", 80.0),
+                                              ("TWO_DARK", 19.0), (OTHER, 1.0)]
+    assert pie_series(t["Executed %"], 3.0) == [("ONE_DARK", 50.0),
+                                                ("TWO_DARK", 49.0), (OTHER, 1.0)]
 
 
 def test_other_reproduces_the_published_pie():
