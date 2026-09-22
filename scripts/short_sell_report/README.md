@@ -1,8 +1,9 @@
 # short_sell_report
 
 Every short sell order of the session, its completion and its rejections,
-summarised by market, as a one page PDF and the same page as a PNG — optionally
-mailed to a list of people.
+summarised by market, as a PDF and a PNG per page — optionally mailed to a list
+of people. Page one is the summary; the pages after it list every target that
+raised a `REJECTTOOMANY` alert.
 
 ```
 python scripts/short_sell_report/short_sell_report.py
@@ -84,10 +85,40 @@ Completion runs on a fixed 0–100% scale, so the columns mean the same thing fr
 one month's report to the next; rejections are a count with no natural ceiling,
 so that chart scales to its own data.
 
+### The REJECTTOOMANY table
+
+From page two on, one row per `id_target` that raised a `REJECTTOOMANY` alert:
+
+```
+REJECTTOOMANY alerts
+219 targets · 2026-07-24 18:37 · page 1 of 7
+────────────────────────────────────────────────────────
+id_target   order_qty   exec_qty   alertstr
+3001       27,000,000          0   Short Sell not permitted - no locate
+3002       27,000,000          0   Short Sell not permitted - no locate
+...
+```
+
+- **One row per target, not per order.** An alert belongs to the send that
+  raised it, so `order_qty` is that send's `size` and `exec_qty` what that send
+  filled. A replaced order shows one row for each send that was rejected; use
+  `--chains` or `--orders` to see them as one order.
+- **Every `REJECTTOOMANY`**, whatever its category — the same alerts the
+  Rejections column counts, after the same filters.
+- **`alertstr`** is each distinct text on that target joined with ` | `,
+  commonest first, and cut to fit its column with `…`. `--orders-csv` has
+  the full text.
+- **A month adds a Date column**, because `id_target` repeats across days.
+- **Runs over as many pages as it needs**, about 36 rows a page. A day with
+  no `REJECTTOOMANY` alert gets no second page.
+
+### Files
+
 Written to `--out-dir` (default `scripts/short_sell_report/out/`) as
-`short_sell_report_2026-07-24.pdf` and `.png`; monthly is
-`short_sell_report_2026-07.pdf`. `--out-dir` takes any path the machine can
-reach, a network share included.
+`short_sell_report_2026-07-24.pdf` plus `.png`; monthly is
+`short_sell_report_2026-07.pdf`. When the table adds pages the PNGs become
+`_p1.png`, `_p2.png`, … one per page; the email still attaches only the PDF.
+`--out-dir` takes any path the machine can reach, a network share included.
 
 ---
 
@@ -782,12 +813,15 @@ python scripts/short_sell_report/short_sell_report.py --demo
 ```
 
 Draws **both** layouts from made up numbers and exits — no connection, no pykx,
-no server constants set. Four files land in `--out-dir`:
+no server constants set. Two PDFs land in `--out-dir`, each with a PNG per page:
 
 ```
-short_sell_report_SAMPLE_daily.pdf    .png
-short_sell_report_SAMPLE_monthly.pdf  .png
+short_sell_report_SAMPLE_daily.pdf    _p1.png, _p2.png ...
+short_sell_report_SAMPLE_monthly.pdf  _p1.png, _p2.png ...
 ```
+
+The demo puts an alert on nearly every order, so its REJECTTOOMANY table runs
+long: about 7 pages for the day and about 60 for the month.
 
 The numbers are deterministic, so the preview only moves when the layout does,
 and the daily one reproduces the table at the top of this README exactly. It is
@@ -871,12 +905,12 @@ rendering path runs on a machine with no kdb, no pykx and no q licence:
 python scripts/short_sell_report/short_sell_report.py --self-test
 ```
 
-It rebuilds the page above from synthetic records — 222 checks — covering
+It rebuilds the page above from synthetic records — 372 checks — covering
 parsing tag 9604 out of a real `fixmsg`, the chaining and every guard on it, the
 suffix routing (including the suffixes that are *not* ours, like Tokyo's `.T`),
 the market rollup, the mean-of-markets headline, the Japan exclusion
 (including that the dropped orders' fills and rejections go with them), the
-counting rules (only `make` executes, a cancelled child still contributes what
+REJECTTOOMANY table, the counting rules (only `make` executes, a cancelled child still contributes what
 it filled, only ``` `rejected ``` rejects), the day series, the rendering of
 both layouts, and the email — the bodies, the attachment and the recipient
 parsing — end to end.

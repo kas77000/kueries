@@ -2054,6 +2054,85 @@ def draw(rows, tot, subtitle, footer, days=None):
     return fig
 
 
+# ---- the REJECTTOOMANY table, on the pages after the first -----------------
+#
+# One row per id_target that raised a REJECTTOOMANY alert.  Per TARGET rather
+# than per order, because that is what an alert belongs to: order_qty is that
+# send's size and exec_qty what that send filled.  Page one has no room left,
+# so the table starts on page two and runs over as many pages as it needs.
+
+REJ_TITLE = "REJECTTOOMANY alerts"
+REJ_COLS = (                      # (label, width, right aligned)
+    ("id_target", 0.14, False),
+    ("order_qty", 0.13, True),
+    ("exec_qty", 0.13, True),
+    ("alertstr", 0.60, False),
+)
+REJ_TABLE_TOP = 0.905
+REJ_ROW_H = 0.022
+REJ_TEXT_MAX = 86                 # characters of alertstr that fit its column
+
+
+def reject_table(attempts, splits, rejects) -> list:
+    """One dict per target with a REJECTTOOMANY alert.  Distinct texts are
+    joined commonest first, as order_details() does."""
+    size = {a.key: a.size for a in attempts}
+    made = attempt_fills(splits)
+    texts = {}
+    for r in rejects:
+        seen = texts.setdefault(r.key, {})
+        seen[r.text] = seen.get(r.text, 0) + 1
+    out = []
+    for key, seen in texts.items():
+        out.append({
+            "date": key[0], "id_target": key[2],
+            "order_qty": size.get(key), "exec_qty": made.get(key, 0),
+            "alertstr": " | ".join(t for t, _ in sorted(
+                seen.items(), key=lambda kv: -kv[1]) if t) or DASH})
+    out.sort(key=lambda r: (r["date"] or dt.date.min, r["id_target"]))
+    return out
+
+
+def _clip(text, n) -> str:
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def draw_rejects(table_rows, subtitle, footer) -> list:
+    """The table as extra pages; none when nothing was rejected.  A month
+    reuses id_target across days, so a date column appears when there is more
+    than one date."""
+    if not table_rows:
+        return []
+    dated = len({r["date"] for r in table_rows}) > 1
+    cols = ((("Date", 0.13, False),) + tuple(
+        (lab, w * 0.87, right) for lab, w, right in REJ_COLS)
+        if dated else REJ_COLS)
+    clip = REJ_TEXT_MAX - (10 if dated else 0)
+    per_page = int((REJ_TABLE_TOP - H_TABLE_HEAD - Y_RULE_BOTTOM - 0.012)
+                   / REJ_ROW_H)
+    chunks = [table_rows[i:i + per_page]
+              for i in range(0, len(table_rows), per_page)]
+    pages = []
+    for n, chunk in enumerate(chunks, 1):
+        fig = figure()
+        more = f"  ·  page {n} of {len(chunks)}" if len(chunks) > 1 else ""
+        heading(fig, REJ_TITLE, f"{fmt_int(len(table_rows))} targets  ·  "
+                f"{subtitle}{more}", Y_TITLE, Y_SUBTITLE, Y_RULE_TOP)
+        cells = [([(f"{r['date']:%Y-%m-%d}" if r["date"] else DASH,
+                    INK2, "normal")] if dated else [])
+                 + [(str(r["id_target"]), INK, "normal"),
+                    (DASH if r["order_qty"] is None
+                     else fmt_int(r["order_qty"]), INK, "normal"),
+                    (fmt_int(r["exec_qty"]),
+                     INK if r["exec_qty"] else INK3, "normal"),
+                    (_clip(r["alertstr"], clip), RED, "normal")]
+                 for r in chunk]
+        _table_rows(fig, cols, cells, REJ_TABLE_TOP, REJ_ROW_H, fs=7.5)
+        _footer(fig, footer, Y_RULE_BOTTOM, Y_FOOTER)
+        pages.append(fig)
+    return pages
+
+
 def save(fig, out_dir: Path, stem: str):
     return _save(fig, out_dir, stem, dpi=DPI)
 
@@ -2293,7 +2372,10 @@ def run(args) -> int:
         foot += f"  ·  {len(mk.dead):,} off-limit excluded"
 
     fig = draw(rows, tot, subtitle, foot, days)
-    files = save(fig, Path(args.out_dir), pl.stem)
+    rej_pages = draw_rejects(reject_table(attempts, splits, rejects),
+                             pl.when, foot)
+    files = save([fig] + rej_pages if rej_pages else fig,
+                 Path(args.out_dir), pl.stem)
     if email_configured():
         mail_report(pl.when, files)
     return 0
@@ -2399,19 +2481,27 @@ def demo(out_dir) -> int:
 
     attempts, splits, al = demo_session()
     chs = to_chains(attempts, CHAIN_QTY, splits)
-    rows = by_market(chs, splits, to_rejects(al, attempts))
+    rj = to_rejects(al, attempts)
+    rows = by_market(chs, splits, rj)
     log("demo: daily layout")
     report_stats(chain_stats(attempts, chs))
-    save(draw(rows, totals(rows), "By market  ·  2026-07-24 18:37  ·  SAMPLE",
-              stamp), out, "short_sell_report_SAMPLE_daily")
+    save([draw(rows, totals(rows), "By market  ·  2026-07-24 18:37  ·  SAMPLE",
+               stamp)]
+         + draw_rejects(reject_table(attempts, splits, rj),
+                        "2026-07-24 18:37  ·  SAMPLE", stamp),
+         out, "short_sell_report_SAMPLE_daily")
 
     attempts, splits, al = demo_month()
     chs = to_chains(attempts, CHAIN_QTY, splits)
-    rows = by_market(chs, splits, to_rejects(al, attempts))
+    rj = to_rejects(al, attempts)
+    rows = by_market(chs, splits, rj)
     days = by_day(chs, splits)
     log(f"demo: monthly layout, {len(days)} trading days")
-    save(draw(rows, totals(rows), "By market  ·  July 2026  ·  SAMPLE", stamp,
-              days), out, "short_sell_report_SAMPLE_monthly")
+    save([draw(rows, totals(rows), "By market  ·  July 2026  ·  SAMPLE", stamp,
+               days)]
+         + draw_rejects(reject_table(attempts, splits, rj),
+                        "July 2026  ·  SAMPLE", stamp),
+         out, "short_sell_report_SAMPLE_monthly")
     log("  these are made up numbers - do not circulate them as a report")
     return 0
 
@@ -3602,6 +3692,36 @@ def self_test() -> int:
     buf = io.BytesIO()
     fig.savefig(buf, format="pdf")
     check("the page renders", buf.getvalue()[:5], b"%PDF-")
+
+    #  the REJECTTOOMANY table: one row per TARGET, that send's own qty and fills
+    rt_day = dt.date(2026, 7, 1)
+    rt_att, _ = to_attempts([_a(1, "TH", 100, "CLI-1", t=1, d=rt_day),
+                             _a(2, "TH", 100, "CLI-1", t=2, d=rt_day),
+                             _a(3, "TH", 50, "CLI-3", t=3, d=rt_day)])
+    rt_sp = to_splits([_c(1, 2, 40, "filled", d=rt_day)], rt_att)
+    rt_al = [{"date": rt_day, "id_server": 1, "id_target": i, "sym": "X.TB",
+              "alerttype": t, "alertstr": s, "ntrigger": 1}
+             for i, t, s in ((2, "REJECTTOOMANY", "Short Sell not permitted"),
+                             (2, "REJECTTOOMANY", "Short Sell not permitted"),
+                             (2, "REJECTTOOMANY", "Price outside band"),
+                             (1, "REJECTTOOMANY", "Price outside band"),
+                             (3, "PRICEBAND", "not a rejection"))]
+    rt = reject_table(rt_att, rt_sp, to_rejects(rt_al, rt_att))
+    check("reject table: one row per target that raised one",
+          [r["id_target"] for r in rt], [1, 2])
+    check("reject table: that send's order_qty and exec_qty",
+          [(r["order_qty"], r["exec_qty"]) for r in rt], [(100, 0), (100, 40)])
+    check("reject table: distinct texts, commonest first",
+          rt[1]["alertstr"], "Short Sell not permitted | Price outside band")
+    check("reject table: no rejections, no extra page",
+          draw_rejects([], "x", "x"), [])
+    many = [dict(rt[0], id_target=i) for i in range(100)]
+    rp = draw_rejects(many, "x", "Generated  ·  x")
+    check("reject table: runs over pages rather than off the page",
+          len(rp) > 1, True)
+    buf = io.BytesIO()
+    rp[-1].savefig(buf, format="pdf")
+    check("reject table: the page renders", buf.getvalue()[:5], b"%PDF-")
 
     #  by_day needs dated rows - the realtime side has none, and skipping them
     #  is what keeps a realtime run from inventing a day
