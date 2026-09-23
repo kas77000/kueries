@@ -14,19 +14,23 @@ one row per pair per date, no header, pairs in the order they were asked for
 and dates ascending within each pair.  Only dates the database has a rate for
 appear, so weekends and holidays are simply not there.
 
-WHERE THE NUMBERS COME FROM.  kdb does not store pairs.  It stores ONE rate per
-currency per date, against the dollar, in the fx_last table on the REF process:
+WHERE THE NUMBERS COME FROM.  The curncy table on the REF process, which
+carries QUOTED pairs, one row per Bloomberg ticker per date:
 
-    date        CRNCY  fx_last
-    2024.08.12  EUR    1.0932      USD per 1 EUR
-    2024.08.12  CNY    0.1394      USD per 1 CNY
+    date        IBD              PX_LAST
+    2024.08.12  EURCNY Curncy    7.8418     CNY per 1 EUR
+    2024.08.12  EURGBP Curncy    0.85629    GBP per 1 EUR
 
-(built each night by get_fx_last.q from d_fx_last, which reads equity.fx_last
-by CRNCY).  A pair is the ratio of two of those:
+So EURCNY is read straight off the table - no cross, no arithmetic:
 
-    EURCNY = fx_last[EUR] / fx_last[CNY]      CNY per 1 EUR
+    EURCNY = PX_LAST[`$"EURCNY Curncy"]
 
-Talks to ONE kdb process over PyKX - the REF process holding fx_last.
+The ticker is the pair plus " Curncy".  A pair is always written base first,
+<BASE><QUOTE>, the way the desk asks for it; a pair with no ticker on curncy is
+reported missing rather than crossed through the dollar, so every rate in the
+file is a quote.
+
+Talks to ONE kdb process over PyKX - the REF process holding curncy.
 host:port is a constant below rather than an argument; set it once, before
 first use.
 
@@ -72,8 +76,7 @@ from lib.local_config import apply_local                        # noqa: E402
 
 # -----------------------------------------------------------------------------
 # CONNECTION.  Edit this, or put it in a local_settings.py beside this script -
-# see scripts/lib/README.md.  The REF process: the one get_fx_last.q refreshes
-# after it writes ref/fx_last.
+# see scripts/lib/README.md.  The REF process: the one holding curncy.
 #
 # It is an open process, so host and port is the whole of it - connect() takes
 # no credentials.
@@ -93,6 +96,9 @@ SIG_DIGITS = 5
 CURRENCIES = ["CNH", "CNY", "GBP"]
 BASE = "EUR"
 
+# What turns a pair into an IBD on curncy: EURCNH -> `$"EURCNH Curncy".
+TICKER_SUFFIX = " Curncy"
+
 _PLACEHOLDER = "CHANGEME"
 
 # -----------------------------------------------------------------------------
@@ -107,30 +113,30 @@ DEFAULT_OUT_DIR = Path(__file__).resolve().parent / "out"
 
 
 # -----------------------------------------------------------------------------
-# q source.  Sent as text + typed args - dates and currency codes travel as q
-# values, never interpolated into the text.
+# q source.  Sent as text + typed args - dates and pairs travel as q values,
+# never interpolated into the text.
 #
-# The currencies arrive as ONE char vector, "EUR CNY GBP", and are split and
-# cast on the server.  PyKX sends a python str as a symbol and a list of them
-# as a symbol list, but a single one-element list comes over as something else
-# again; bytes always arrive as chars, so that is the one shape relied on.
+# The pairs arrive as ONE char vector, "EURCNH EURCNY", and the " Curncy" is
+# appended on the server, because an IBD has a space in it and the space is
+# what the list is split on.  PyKX sends a python str as a symbol and a list of
+# them as a symbol list, but a single one-element list comes over as something
+# else again; bytes always arrive as chars, so that is the one shape relied on.
 #
-# A plain select, no join, no pivot: the ratio is taken in python, where
-# --self-test can prove it.
+# A plain select, no join, no pivot: the rate is already the pair.
 # -----------------------------------------------------------------------------
 
 Q_FX = """
-{[d0;d1;c]
-  c:`$" " vs c;
-  select date,CRNCY,fx_last from fx_last where date within (d0;d1), CRNCY in c
+{[d0;d1;p]
+  p:`$(" " vs p),\\:" Curncy";
+  select date,IBD,PX_LAST from curncy where date within (d0;d1), IBD in p
  }
 """
 
-# What IS on file over the range, so a currency that matched nothing can be
-# compared against what was there to match - CNH versus CNY, GBP versus GBp.
+# What IS on file over the range, so a pair that matched nothing can be
+# compared against the tickers that were there to match - EURCNH versus EURCNY.
 Q_AVAILABLE = """
 {[d0;d1]
-  asc exec distinct CRNCY from fx_last where date within (d0;d1)
+  asc exec distinct IBD from curncy where date within (d0;d1)
  }
 """
 
@@ -176,25 +182,25 @@ def _decode(v):
 
 
 def _to_pandas(tbl):
-    """PyKX table -> DataFrame, symbols as str and fx_last as plain float64.
+    """PyKX table -> DataFrame, symbols as str and PX_LAST as plain float64.
 
     PyKX hands symbols back as bytes in some versions and str in others, and a
     numeric column holding a q null comes back MASKED rather than as NaN.  Both
     are flattened here, at the boundary, so nothing below has to know."""
     df = tbl.pd()
-    if "CRNCY" in df:
-        df["CRNCY"] = df["CRNCY"].map(_decode).astype(str)
-    if "fx_last" in df:
-        v = getattr(df["fx_last"], "values", df["fx_last"])
+    if "IBD" in df:
+        df["IBD"] = df["IBD"].map(_decode).astype(str)
+    if "PX_LAST" in df:
+        v = getattr(df["PX_LAST"], "values", df["PX_LAST"])
         if isinstance(v, np.ma.MaskedArray):
             v = v.astype("float64").filled(np.nan)
-        df["fx_last"] = pd.Series(np.asarray(v, dtype="float64"), index=df.index)
+        df["PX_LAST"] = pd.Series(np.asarray(v, dtype="float64"), index=df.index)
     return df
 
 
-def fetch(ho, d0, d1, currencies):
-    """Every (date, CRNCY, fx_last) on file for these currencies and dates."""
-    return _to_pandas(ho(Q_FX, d0, d1, " ".join(currencies).encode()))
+def fetch(ho, d0, d1, codes):
+    """Every (date, IBD, PX_LAST) on file for these pairs and dates."""
+    return _to_pandas(ho(Q_FX, d0, d1, " ".join(codes).encode()))
 
 
 def available(ho, d0, d1):
@@ -246,40 +252,38 @@ def resolve_currencies(cli, configured):
     return list(configured or [])
 
 
-def currencies_needed(pairs):
-    """Every code the query has to bring back, in first-seen order."""
-    return list(dict.fromkeys(c for _, b, q in pairs for c in (b, q)))
+def pair_codes(pairs):
+    """Every pair the query has to ask curncy for, in the order asked."""
+    return [p for p, _, _ in pairs]
 
 
-def build_rows(fx, pairs):
-    """fx rows -> [(pair, yyyymmdd, rate)], plus the pairs that got nothing.
+def pair_of_ticker(ibd):
+    """'EURCNY Curncy' -> 'EURCNY'.  Anything else is left as it came."""
+    return ibd[:-len(TICKER_SUFFIX)] if ibd.endswith(TICKER_SUFFIX) else ibd
 
-    USD is 1.0 on every date the database has, whether or not the table
-    carries a USD row: fx_last is USD per unit, so the dollar against itself
-    needs no lookup.  A zero or null rate is treated as missing - dividing by
-    it would write inf or 0 into a file somebody will price off."""
-    fx = fx.copy()
-    fx["date"] = pd.to_datetime(fx["date"]).dt.normalize()
-    fx = fx[fx["fx_last"].notna() & (fx["fx_last"] > 0)]
-    # one rate per (date, currency): get_fx_last keeps the last, so do the same
-    wide = (fx.drop_duplicates(["date", "CRNCY"], keep="last")
-              .pivot(index="date", columns="CRNCY", values="fx_last")
-              .sort_index())
-    if "USD" not in wide:
-        wide["USD"] = np.nan
-    wide["USD"] = wide["USD"].fillna(1.0)
 
+def build_rows(px, pairs):
+    """curncy rows -> [(pair, yyyymmdd, rate)], plus the pairs that got nothing.
+
+    The rate IS the pair, so there is nothing to divide.  A zero or null
+    PX_LAST is treated as missing - it would otherwise write a 0 into a file
+    somebody will price off."""
+    px = px.copy()
+    px["date"] = pd.to_datetime(px["date"]).dt.normalize()
+    px["pair"] = px["IBD"].map(pair_of_ticker)
+    px = px[px["PX_LAST"].notna() & (px["PX_LAST"] > 0)]
+    # one rate per (date, pair): if curncy carries more than one, keep the last
+    px = px.drop_duplicates(["date", "pair"], keep="last").sort_values("date")
+
+    by_pair = {k: v for k, v in px.groupby("pair", sort=False)}
     rows, empty = [], []
-    for pair, b, q in pairs:
-        if b not in wide or q not in wide:
-            empty.append(pair)
-            continue
-        rate = (wide[b] / wide[q]).dropna()
-        if rate.empty:
+    for pair, _, _ in pairs:
+        got = by_pair.get(pair)
+        if got is None or got.empty:
             empty.append(pair)
             continue
         rows.extend((pair, int(d.strftime("%Y%m%d")), float(r))
-                    for d, r in rate.items())
+                    for d, r in zip(got["date"], got["PX_LAST"]))
     return rows, empty
 
 
@@ -318,30 +322,34 @@ def log(msg=""):
 
 def run(args):
     pairs = parse_pairs(args.currencies, args.base)
-    ccys = currencies_needed(pairs)
+    codes = pair_codes(pairs)
     out = Path(args.out) if args.out else default_out(args.base.upper(),
                                                       args.start, args.end)
 
-    log(f"fx_rates  {args.start} to {args.end}  "
-        f"{', '.join(p for p, _, _ in pairs)}")
+    log(f"fx_rates  {args.start} to {args.end}  {', '.join(codes)}")
     log(f"  ref server  {REF_SERVER} ...")
     ho = connect(REF_SERVER)
 
-    fx = fetch(ho, args.start, args.end, ccys)
-    log(f"  {len(fx):,} currency rows back")
-    rows, empty = build_rows(fx, pairs) if len(fx) else ([], [p for p, _, _ in pairs])
+    px = fetch(ho, args.start, args.end, codes)
+    log(f"  {len(px):,} curncy rows back")
+    rows, empty = build_rows(px, pairs) if len(px) else ([], list(codes))
 
     if empty:
-        have = available(ho, args.start, args.end)
+        have = [pair_of_ticker(t) for t in available(ho, args.start, args.end)]
+        ccys = sorted({c for p, b, q in pairs if p in empty for c in (b, q)})
         log(f"\n  no rates for {', '.join(empty)} between {args.start} and "
             f"{args.end}.")
-        missing = sorted({c for p, b, q in pairs if p in empty for c in (b, q)}
-                         - set(have) - {"USD"})
-        if missing:
-            log(f"  {', '.join(missing)} {'is' if len(missing) == 1 else 'are'} "
-                f"not in fx_last over that range.  What is there:")
-            log("    " + " ".join(have) if have else "    nothing at all - "
-                "check the dates, and that REF_SERVER is the REF process")
+        near = [h for h in have if any(c in h for c in ccys)]
+        if near:
+            log(f"  pairs curncy has over that range touching "
+                f"{', '.join(ccys)}:")
+            log("    " + " ".join(near))
+        elif have:
+            log(f"  nothing on curncy touches {', '.join(ccys)} over that "
+                f"range ({len(have):,} pairs on file).")
+        else:
+            log("    nothing at all - check the dates, and that REF_SERVER is "
+                "the process holding curncy")
 
     if not rows:
         raise SystemExit("\nnothing to write")
@@ -361,7 +369,7 @@ def run(args):
 
 def main(argv=None):
     p = argparse.ArgumentParser(
-        description="Daily FX rates per pair over a date range, from fx_last",
+        description="Daily FX rates per pair over a date range, from curncy",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--start", type=dt.date.fromisoformat,
@@ -403,8 +411,10 @@ def main(argv=None):
 # so the script can be verified on a machine with no kdb.
 # -----------------------------------------------------------------------------
 
-def _fx(rows):
-    return pd.DataFrame(rows, columns=["date", "CRNCY", "fx_last"])
+def _px(rows):
+    """(date, pair, rate) triples -> the frame fetch() returns."""
+    return pd.DataFrame([(d, c + TICKER_SUFFIX, v) for d, c, v in rows],
+                        columns=["date", "IBD", "PX_LAST"])
 
 
 def test_three_letters_pair_with_base_six_are_a_pair():
@@ -438,42 +448,54 @@ def test_a_bad_code_is_an_error_not_a_skip():
         raise AssertionError(f"{bad} should not parse")
 
 
-def test_the_pair_is_base_over_quote():
-    """fx_last is USD per unit, so EURCNY is EUR's rate over CNY's."""
-    fx = _fx([("2024-08-12", "EUR", 1.0932), ("2024-08-12", "CNY", 0.1394)])
-    rows, empty = build_rows(fx, parse_pairs(["CNY"], "EUR"))
+def test_the_ticker_is_the_pair_plus_curncy():
+    assert pair_of_ticker("EURCNY Curncy") == "EURCNY"
+    assert pair_of_ticker("EURCNY") == "EURCNY"       # already stripped
+
+
+def test_the_rate_is_the_quote_not_a_ratio():
+    """curncy stores the pair, so EURCNY is PX_LAST as it stands."""
+    px = _px([("2024-08-12", "EURCNY", 7.8418)])
+    rows, empty = build_rows(px, parse_pairs(["CNY"], "EUR"))
     assert empty == []
-    assert rows[0][:2] == ("EURCNY", 20240812)
-    assert abs(rows[0][2] - 1.0932 / 0.1394) < 1e-12, rows
+    assert rows == [("EURCNY", 20240812, 7.8418)], rows
 
 
-def test_usd_needs_no_row():
-    fx = _fx([("2024-08-12", "JPY", 0.0068)])
-    rows, _ = build_rows(fx, parse_pairs(["USDJPY"], "EUR"))
-    assert abs(rows[0][2] - 1 / 0.0068) < 1e-9, rows
+def test_usd_is_a_ticker_like_any_other():
+    """No dollar special case any more - USDJPY is its own quote."""
+    px = _px([("2024-08-12", "USDJPY", 146.9)])
+    rows, empty = build_rows(px, parse_pairs(["USDJPY"], "EUR"))
+    assert empty == [] and rows == [("USDJPY", 20240812, 146.9)], (rows, empty)
 
 
-def test_a_date_missing_either_side_is_left_out():
-    fx = _fx([("2024-08-12", "EUR", 1.1), ("2024-08-12", "GBP", 1.28),
-              ("2024-08-13", "EUR", 1.1),                          # no GBP
-              ("2024-08-14", "GBP", 1.27),                         # no EUR
-              ("2024-08-15", "EUR", 1.1), ("2024-08-15", "GBP", 0.0)])  # bad
-    rows, _ = build_rows(fx, parse_pairs(["GBP"], "EUR"))
+def test_the_pair_is_always_base_first():
+    """Base first, whether the code was typed short or as a whole pair."""
+    got = [p for p, _, _ in parse_pairs(["CNY", "USDJPY"], "EUR")]
+    assert got == ["EURCNY", "USDJPY"], got
+    px = _px([("2024-08-12", "EURCNY", 7.8418)])
+    rows, _ = build_rows(px, parse_pairs(["CNY"], "EUR"))
+    assert rows[0][0] == "EURCNY", rows
+
+
+def test_a_null_or_zero_rate_is_left_out():
+    px = _px([("2024-08-12", "EURGBP", 0.856), ("2024-08-13", "EURGBP", 0.0),
+              ("2024-08-14", "EURGBP", np.nan)])
+    rows, _ = build_rows(px, parse_pairs(["GBP"], "EUR"))
     assert [d for _, d, _ in rows] == [20240812], rows
 
 
 def test_rows_are_by_pair_in_the_order_asked_then_by_date():
-    fx = _fx([(d, c, v) for d in ("2024-08-13", "2024-08-12")
-              for c, v in (("EUR", 1.1), ("GBP", 1.3), ("CNY", 0.14))])
-    rows, _ = build_rows(fx, parse_pairs(["GBP", "CNY"], "EUR"))
+    px = _px([(d, c, v) for d in ("2024-08-13", "2024-08-12")
+              for c, v in (("EURGBP", 0.85), ("EURCNY", 7.84))])
+    rows, _ = build_rows(px, parse_pairs(["GBP", "CNY"], "EUR"))
     assert [(p, d) for p, d, _ in rows] == [
         ("EURGBP", 20240812), ("EURGBP", 20240813),
         ("EURCNY", 20240812), ("EURCNY", 20240813)], rows
 
 
-def test_a_currency_not_on_file_is_reported_not_dropped_silently():
-    fx = _fx([("2024-08-12", "EUR", 1.1), ("2024-08-12", "CNY", 0.14)])
-    rows, empty = build_rows(fx, parse_pairs(["CNH", "CNY"], "EUR"))
+def test_a_pair_not_on_file_is_reported_not_dropped_silently():
+    px = _px([("2024-08-12", "EURCNY", 7.8418)])
+    rows, empty = build_rows(px, parse_pairs(["CNH", "CNY"], "EUR"))
     assert empty == ["EURCNH"], empty
     assert [p for p, _, _ in rows] == ["EURCNY"]
 
@@ -495,35 +517,37 @@ def test_csv_has_no_header_and_three_columns():
     assert lines == ["EURCNY,20240812,7.8418", "EURGBP,20240812,0.85629"], lines
 
 
-def test_currencies_reach_q_as_chars():
-    """bytes arrive as a char vector, which the q splits with vs."""
+def test_pairs_reach_q_as_chars_without_the_suffix():
+    """bytes arrive as a char vector; the q splits it and appends ' Curncy',
+    because the suffix carries the space the split is on."""
     sent = []
 
     class Result:
         def pd(self):
-            return _fx([])
+            return _px([])
 
     class Handle:
         def __call__(self, qsql, *args):
             sent.append(args)
             return Result()
 
-    fetch(Handle(), dt.date(2024, 8, 12), dt.date(2024, 8, 13), ["EUR", "CNY"])
-    assert sent[0][2] == b"EUR CNY", sent
+    fetch(Handle(), dt.date(2024, 8, 12), dt.date(2024, 8, 13),
+          pair_codes(parse_pairs(["CNH", "CNY"], "EUR")))
+    assert sent[0][2] == b"EURCNH EURCNY", sent
 
 
 def test_a_null_rate_arrives_as_nan():
     class Result:
         def pd(self):
             df = pd.DataFrame({"date": pd.to_datetime(["2024-08-12"] * 2),
-                               "CRNCY": [b"EUR", b"CNY"]})
-            df["fx_last"] = pd.Series(np.ma.array([1.1, 0.0], mask=[False, True]))
+                               "IBD": [b"EURCNY Curncy", b"EURGBP Curncy"]})
+            df["PX_LAST"] = pd.Series(np.ma.array([7.84, 0.0], mask=[False, True]))
             return df
 
     df = _to_pandas(Result())
-    assert df["CRNCY"].tolist() == ["EUR", "CNY"]
-    assert df["fx_last"].dtype == np.float64
-    assert np.isnan(df["fx_last"].iloc[1])
+    assert df["IBD"].tolist() == ["EURCNY Curncy", "EURGBP Curncy"]
+    assert df["PX_LAST"].dtype == np.float64
+    assert np.isnan(df["PX_LAST"].iloc[1])
 
 
 def test_parse_hostport():
@@ -568,18 +592,20 @@ if __name__ == "__main__":
 # =============================================================================
 # WHERE THE JUDGEMENT CALLS ARE
 #
-# 1. THE SOURCE IS fx_last ON REF, one USD rate per currency per date.  The
-#    same numbers are on equity.fx_last per stock, which is where d_fx_last
-#    builds them from; reading the finished table means one row per currency
-#    rather than one per stock.
+# 1. THE SOURCE IS curncy ON REF, one QUOTED pair per ticker per date, read as
+#    `$"EURCNY Curncy".  These are the screen quotes, so they match what the
+#    desk sees; the USD crosses this script used to build out of ref/fx_last
+#    could differ in the last digit.
 #
-# 2. A PAIR IS A RATIO OF TWO DOLLAR RATES - a cross through USD, not a quoted
-#    cross.  EURCNY here can differ from a screen EURCNY in the last digit.
+# 2. THE PAIR IS ALWAYS <BASE><QUOTE>, base first, which is the one direction
+#    the desk file is written in.  The ticker follows from it, and a cross is
+#    never built out of two dollar rates.  Every rate in the file is a quote
+#    somebody publishes; a pair with no ticker is reported missing.
 #
-# 3. MINOR UNITS.  fx_last is keyed on the equity's CRNCY, so GBp (pence) sits
-#    beside GBP at a hundredth of it.  Codes are upper cased on the way in, so
-#    GBP is always the pound; ask for GBp and you get GBP.
+# 3. THE PAIR IS TAKEN AS TYPED.  EURCNH and EURCNY are different tickers, and
+#    the script asks for what it was given rather than guessing the onshore or
+#    offshore one.
 #
-# 4. NO FILLING.  A date with no rate for either side of a pair is left out,
-#    not carried forward.  The file says what the database had.
+# 4. NO FILLING.  A date curncy has no quote for is left out, not carried
+#    forward.  The file says what the database had.
 # =============================================================================

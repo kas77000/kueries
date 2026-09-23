@@ -15,21 +15,31 @@ the database has a rate for appear, so weekends and holidays are not in the file
 
 ## Where the numbers come from
 
-kdb does not store pairs. The `fx_last` table on the **REF** process holds one
-rate per currency per date, **in USD per unit**. `get_fx_last.q` builds it each
-night from `d_fx_last`, which reads `equity.fx_last` by `CRNCY`. A pair is the
-ratio of two of those rates:
+The `curncy` table on the **REF** process, which holds **quoted pairs** — one
+row per Bloomberg ticker per date:
 
 ```
-EURCNY = fx_last[EUR] / fx_last[CNY]        CNY per 1 EUR
+date        IBD              PX_LAST
+2024.08.12  EURCNY Curncy    7.8418     CNY per 1 EUR
+2024.08.12  EURGBP Curncy    0.85629    GBP per 1 EUR
 ```
 
-That makes it a cross through USD. It can differ from a screen quote in the last
-digit. USD is taken as 1.0 whether or not the table has a row for it.
+So the rate is read straight off the table, with nothing computed:
+
+```q
+select PX_LAST from curncy where date=2024.08.12, IBD=`$"EURCNY Curncy"
+```
+
+The ticker is the pair plus `" Curncy"`. A pair is always written base first,
+`<BASE><QUOTE>` — the one direction the desk file uses — so `EUR` + `CNY` is
+always `EURCNY Curncy`. No cross is built out of two dollar rates: every rate in
+the file is a quote somebody publishes, and a pair with no ticker on `curncy` is
+reported missing instead.
 
 ## Running it
 
-Set the REF endpoint and your usual currencies once, in `local_settings.py`
+Set the REF endpoint (the process holding `curncy`) and your usual currencies
+once, in `local_settings.py`
 beside the script (git ignores it):
 
 ```python
@@ -65,14 +75,14 @@ python scripts/fx_rates/fx_rates.py --start 2024-08-12 --end 2024-09-11 --curren
 --self-test       run the built-in tests. Needs no kdb connection.
 ```
 
-If a pair gets no rates at all, the script says so and lists the currencies
-that **are** in `fx_last` over the range, for example CNY where CNH was asked
-for. It still writes the other pairs, then exits with code 1.
+If a pair gets no rates at all, the script says so and lists the tickers that
+**are** on `curncy` over the range touching either of its currencies — for
+example `EURCNY` where `EURCNH` was asked for. It still writes the other pairs,
+then exits with code 1.
 
 ## Caveats
 
-- **GBp.** `fx_last` is keyed on the equities' currency, so pence can sit beside
-  pounds at a hundredth of the value. Codes are upper-cased, so `GBP` always
-  means the pound.
-- **No filling.** A date with no rate for either side of a pair is left out,
-  not carried forward from the day before.
+- **CNH vs CNY.** Offshore and onshore yuan are separate quotes. The script asks
+  for exactly the pair it was given, and never falls back to a cross through USD.
+- **No filling.** A date `curncy` has no quote for is left out, not carried
+  forward from the day before.
