@@ -4,8 +4,15 @@ Live (activated) `.IN` targets of a basket, with their pivoted `target_column`
 values, the average fill price of their work orders, the previous close, and
 whether the fills beat that close.
 
-Run it on the **order server** (qStudio): paste `basket_vs_close.q` and change
-the pattern on the last line (`["*CALPERS*"]`).
+Run it on the **order server** (qStudio): paste `basket_vs_close.q` and set
+the two arguments on the last line, `["*CALPERS*";`::15043]`:
+
+- the basket pattern;
+- the server holding `equity_master`, which is **not** the order server. The
+  lambda opens a handle to it (10s timeout), pulls `sym, PX_LAST` for the
+  basket's syms only, and closes it. `` `::15043 `` is the port the desk's
+  `client_ool_report.q` uses; `::` means the same host as the order server,
+  so give `` `:host:port `` if it lives elsewhere.
 
 ## Columns added
 

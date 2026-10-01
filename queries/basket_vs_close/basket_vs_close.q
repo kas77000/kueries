@@ -1,4 +1,4 @@
-{[s]
+{[s;emsrv]
   / Eligible targets
   t:select from target where basket like s, sym like "*.IN";
 
@@ -38,9 +38,11 @@
   w:select wo_count:count i, wo_qty:sum make, avg_px:make wavg avg_fill_price
     by id_target from w where make>0, avg_fill_price>0;
 
-  / Previous close
-  em:`sym xkey select sym, prev_close:PX_LAST
-    from equity_master where sym in t`sym;
+  / Previous close: equity_master lives on another server
+  h:hopen (emsrv;10000);
+  em:h({select sym, prev_close:PX_LAST from equity_master where sym in x};distinct t`sym);
+  hclose h;
+  em:`sym xkey em;
 
   / Final result
   r:(t lj `id_target xkey tcp) lj `id_target xkey select id_target,exec_qty from ts;
@@ -48,4 +50,4 @@
   / buy below / sell above the close; 0b when there is no fill or no close
   update better_than_close:(avg_px>0)&(prev_close>0)&0<sidesign*prev_close-avg_px
     from r
-  }["*CALPERS*"]
+  }["*CALPERS*";`::15043]
